@@ -593,6 +593,32 @@ class EngineTweakManager:
                 "# Shadow staging buffer wrapper to eliminate intra-frame CPU-GPU sync stalls",
             ])
 
+        state_dedup = None
+        if "state_dedup" in tweaks:
+            state_dedup = tweaks["state_dedup"]
+        elif "synchronization" in tweaks and "state_dedup" in tweaks["synchronization"]:
+            state_dedup = tweaks["synchronization"]["state_dedup"]
+        if state_dedup:
+            lines.extend([
+                "",
+                "[synchronization.state_dedup]",
+                "enabled = true",
+                "# Constant buffer & state spam deduplication to minimize Vulkan command buffer churn",
+            ])
+
+        swapchain_debounce = None
+        if "swapchain_debounce" in tweaks:
+            swapchain_debounce = tweaks["swapchain_debounce"]
+        elif "synchronization" in tweaks and "swapchain_debounce" in tweaks["synchronization"]:
+            swapchain_debounce = tweaks["synchronization"]["swapchain_debounce"]
+        if swapchain_debounce:
+            lines.extend([
+                "",
+                "[synchronization.swapchain_debounce]",
+                "enabled = true",
+                "# Swapchain ResizeBuffers debounce filter to eliminate UI/focus resolution micro-stutters",
+            ])
+
         lines.append("")
         return "\n".join(lines)
 
@@ -636,19 +662,34 @@ class EngineTweakManager:
         # 4. DXVK & Synchronization layer intercepts
         dxvk_items = []
 
-        # Check for Atelier staging buffer sync fix
+        # Check for D3D11 / DXGI intercept wrapper features
         sync_fix_enabled = (
             sync_sec.get("atelier_sync_fix")
             or (isinstance(sync_sec.get("atelier_sync_fix"), dict) and sync_sec["atelier_sync_fix"].get("enabled"))
             or (isinstance(sync_sec, dict) and sync_sec.get("enabled") and "atelier" in str(sync_sec))
             or engine_sec.get("gust", {}).get("atelier_sync_fix")
         )
-        if sync_fix_enabled:
+        state_dedup_enabled = (
+            sync_sec.get("state_dedup")
+            or (isinstance(sync_sec.get("state_dedup"), dict) and sync_sec["state_dedup"].get("enabled"))
+        )
+        swapchain_debounce_enabled = (
+            sync_sec.get("swapchain_debounce")
+            or (isinstance(sync_sec.get("swapchain_debounce"), dict) and sync_sec["swapchain_debounce"].get("enabled"))
+        )
+
+        wrapper_required = sync_fix_enabled or state_dedup_enabled or swapchain_debounce_enabled
+        if wrapper_required:
             dll_ov = env.get("WINEDLLOVERRIDES", "")
             if "d3d11=" not in dll_ov:
                 env["WINEDLLOVERRIDES"] = f"d3d11=n,b;{dll_ov}" if dll_ov else "d3d11=n,b"
-            dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
-            env["PROTOGOBLIN_STAGING_SYNC_FIX"] = "1"
+            if sync_fix_enabled:
+                dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
+                env["PROTOGOBLIN_STAGING_SYNC_FIX"] = "1"
+            if state_dedup_enabled:
+                env["PROTOGOBLIN_STATE_DEDUP"] = "1"
+            if swapchain_debounce_enabled:
+                env["PROTOGOBLIN_SWAPCHAIN_DEBOUNCE"] = "1"
 
             # Check candidate paths for vendored d3d11.dll wrapper
             p_dir = proton_dir or os.environ.get("PROTOGOBLIN_DIR") or os.path.dirname(os.path.abspath(__file__))

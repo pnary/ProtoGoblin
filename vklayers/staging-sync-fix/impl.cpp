@@ -9,13 +9,29 @@ struct StagingResourceTracker {
     UINT subresource = 0;
 };
 
+struct ConstantBufferTracker {
+    UINT byteWidth = 0;
+    bool isConstantBuffer = false;
+    bool hasData = false;
+    std::vector<uint8_t> data;
+};
+
 static std::mutex g_resourceLock;
 static std::unordered_map<ID3D11Resource*, StagingResourceTracker> g_stagingResources;
+
+static std::mutex g_cbLock;
+static std::unordered_map<ID3D11Resource*, ConstantBufferTracker> g_constantBuffers;
 
 class WrappedContext : public ID3D11DeviceContext {
 private:
     ULONG m_refCount;
     ID3D11DeviceContext* m_real;
+
+    // Pipeline State Cache for Deduplication
+    D3D11_PRIMITIVE_TOPOLOGY m_curTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11InputLayout* m_curInputLayout = nullptr;
+    ID3D11Buffer* m_curVSConstantBuffers[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+    ID3D11Buffer* m_curPSConstantBuffers[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
 
 public:
     WrappedContext(ID3D11DeviceContext* real) : m_refCount(1), m_real(real) {}
@@ -171,7 +187,22 @@ public:
     #define DELEGATE_CONTEXT_RET(ret, func, ...) ret STDMETHODCALLTYPE func(__VA_ARGS__) override { return m_real->func(__VA_ARGS__); }
 
     // D3D11 Context pass-through wrappers
-    void STDMETHODCALLTYPE VSSetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers) override { m_real->VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers); }
+    void STDMETHODCALLTYPE VSSetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers) override {
+        if (ppConstantBuffers && StartSlot + NumBuffers <= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+            bool allMatch = true;
+            for (UINT i = 0; i < NumBuffers; ++i) {
+                if (m_curVSConstantBuffers[StartSlot + i] != ppConstantBuffers[i]) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) return;
+            for (UINT i = 0; i < NumBuffers; ++i) {
+                m_curVSConstantBuffers[StartSlot + i] = ppConstantBuffers[i];
+            }
+        }
+        m_real->VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+    }
     void STDMETHODCALLTYPE PSSetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView* const* ppShaderResourceViews) override { m_real->PSSetShaderResources(StartSlot, NumViews, ppShaderResourceViews); }
     void STDMETHODCALLTYPE PSSetShader(ID3D11PixelShader* pPixelShader, ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances) override { m_real->PSSetShader(pPixelShader, ppClassInstances, NumClassInstances); }
     void STDMETHODCALLTYPE PSSetSamplers(UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers) override { m_real->PSSetSamplers(StartSlot, NumSamplers, ppSamplers); }
@@ -188,8 +219,16 @@ public:
     void STDMETHODCALLTYPE GSSetShader(ID3D11GeometryShader* pShader, ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances) override { m_real->GSSetShader(pShader, ppClassInstances, NumClassInstances); }
     void STDMETHODCALLTYPE IASetIndexBuffer(ID3D11Buffer* pIndexBuffer, DXGI_FORMAT Format, UINT Offset) override { m_real->IASetIndexBuffer(pIndexBuffer, Format, Offset); }
     void STDMETHODCALLTYPE IASetVertexBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppVertexBuffers, const UINT* pStrides, const UINT* pOffsets) override { m_real->IASetVertexBuffers(StartSlot, NumBuffers, ppVertexBuffers, pStrides, pOffsets); }
-    void STDMETHODCALLTYPE IASetInputLayout(ID3D11InputLayout* pInputLayout) override { m_real->IASetInputLayout(pInputLayout); }
-    void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY Topology) override { m_real->IASetPrimitiveTopology(Topology); }
+    void STDMETHODCALLTYPE IASetInputLayout(ID3D11InputLayout* pInputLayout) override {
+        if (pInputLayout == m_curInputLayout) return;
+        m_curInputLayout = pInputLayout;
+        m_real->IASetInputLayout(pInputLayout);
+    }
+    void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY Topology) override {
+        if (Topology == m_curTopology) return;
+        m_curTopology = Topology;
+        m_real->IASetPrimitiveTopology(Topology);
+    }
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT NumViews, ID3D11RenderTargetView* const* ppRenderTargetViews, ID3D11DepthStencilView* pDepthStencilView) override { m_real->OMSetRenderTargets(NumViews, ppRenderTargetViews, pDepthStencilView); }
     void STDMETHODCALLTYPE OMSetRenderTargetsAndUnorderedAccessViews(UINT NumRTVs, ID3D11RenderTargetView* const* ppRenderTargetViews, ID3D11DepthStencilView* pDepthStencilView, UINT UAVStartSlot, UINT NumUAVs, ID3D11UnorderedAccessView* const* ppUnorderedAccessViews, const UINT* pUAVInitialCounts) override { m_real->OMSetRenderTargetsAndUnorderedAccessViews(NumRTVs, ppRenderTargetViews, pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts); }
     void STDMETHODCALLTYPE OMSetBlendState(ID3D11BlendState* pBlendState, const FLOAT BlendFactor[4], UINT SampleMask) override { m_real->OMSetBlendState(pBlendState, BlendFactor, SampleMask); }
@@ -223,8 +262,32 @@ public:
     void STDMETHODCALLTYPE DispatchIndirect(ID3D11Buffer* pBufferForArgs, UINT AlignedByteOffsetForArgs) override { m_real->DispatchIndirect(pBufferForArgs, AlignedByteOffsetForArgs); }
     void STDMETHODCALLTYPE CopySubresourceRegion(ID3D11Resource* pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource* pSrcResource, UINT SrcSubresource, const D3D11_BOX* pSrcBox) override { m_real->CopySubresourceRegion(pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox); }
     void STDMETHODCALLTYPE CopyStructureCount(ID3D11Buffer* pDstBuffer, UINT DstAlignedByteOffset, ID3D11UnorderedAccessView* pSrcUAV) override { m_real->CopyStructureCount(pDstBuffer, DstAlignedByteOffset, pSrcUAV); }
-    void STDMETHODCALLTYPE ClearState() override { m_real->ClearState(); }
-    void STDMETHODCALLTYPE UpdateSubresource(ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) override { m_real->UpdateSubresource(pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch); }
+    void STDMETHODCALLTYPE ClearState() override {
+        m_curTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+        m_curInputLayout = nullptr;
+        for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++i) {
+            m_curVSConstantBuffers[i] = nullptr;
+            m_curPSConstantBuffers[i] = nullptr;
+        }
+        m_real->ClearState();
+    }
+    void STDMETHODCALLTYPE UpdateSubresource(ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) override {
+        if (pDstResource && pSrcData && !pDstBox) {
+            std::lock_guard<std::mutex> lock(g_cbLock);
+            auto it = g_constantBuffers.find(pDstResource);
+            if (it != g_constantBuffers.end() && it->second.isConstantBuffer) {
+                if (it->second.hasData && it->second.data.size() == it->second.byteWidth) {
+                    if (memcmp(it->second.data.data(), pSrcData, it->second.byteWidth) == 0) {
+                        // Redundant constant buffer update: drop to prevent Vulkan descriptor / command buffer churn
+                        return;
+                    }
+                }
+                it->second.data.assign((const uint8_t*)pSrcData, (const uint8_t*)pSrcData + it->second.byteWidth);
+                it->second.hasData = true;
+            }
+        }
+        m_real->UpdateSubresource(pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
+    }
     HRESULT STDMETHODCALLTYPE FinishCommandList(BOOL RestoreDeferredContextState, ID3D11CommandList** ppCommandList) override { return m_real->FinishCommandList(RestoreDeferredContextState, ppCommandList); }
     void STDMETHODCALLTYPE VSGetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer** ppConstantBuffers) override { m_real->VSGetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers); }
     void STDMETHODCALLTYPE PSGetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView** ppShaderResourceViews) override { m_real->PSGetShaderResources(StartSlot, NumViews, ppShaderResourceViews); }
@@ -295,7 +358,7 @@ public:
         return ref;
     }
 
-    // Intercept Buffer Creation to track Staging Buffers
+    // Intercept Buffer Creation to track Staging Buffers & Constant Buffers
     HRESULT STDMETHODCALLTYPE CreateBuffer(
         const D3D11_BUFFER_DESC* pDesc,
         const D3D11_SUBRESOURCE_DATA* pInitialData,
@@ -310,6 +373,16 @@ public:
                 tracker.shadowBuffer.resize(pDesc->ByteWidth, 0);
                 if (pInitialData && pInitialData->pSysMem) {
                     memcpy(tracker.shadowBuffer.data(), pInitialData->pSysMem, pDesc->ByteWidth);
+                }
+            }
+            if (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+                std::lock_guard<std::mutex> lock(g_cbLock);
+                auto& cb = g_constantBuffers[*ppBuffer];
+                cb.byteWidth = pDesc->ByteWidth;
+                cb.isConstantBuffer = true;
+                if (pInitialData && pInitialData->pSysMem && pDesc->ByteWidth > 0) {
+                    cb.data.assign((const uint8_t*)pInitialData->pSysMem, (const uint8_t*)pInitialData->pSysMem + pDesc->ByteWidth);
+                    cb.hasData = true;
                 }
             }
         }
@@ -373,5 +446,134 @@ void WrapDeviceAndContext(ID3D11Device** ppDevice, ID3D11DeviceContext** ppConte
     }
     if (ppContext && *ppContext) {
         *ppContext = new WrappedContext(*ppContext);
+    }
+}
+
+class WrappedSwapChain : public IDXGISwapChain {
+private:
+    ULONG m_refCount;
+    IDXGISwapChain* m_real;
+    UINT m_curWidth = 0;
+    UINT m_curHeight = 0;
+    DXGI_FORMAT m_curFormat = DXGI_FORMAT_UNKNOWN;
+    UINT m_curBufferCount = 0;
+    UINT m_curFlags = 0;
+    ULONGLONG m_lastResizeTick = 0;
+
+public:
+    WrappedSwapChain(IDXGISwapChain* real, UINT initialWidth = 0, UINT initialHeight = 0, DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN, UINT bufferCount = 0)
+        : m_refCount(1), m_real(real), m_curWidth(initialWidth), m_curHeight(initialHeight), m_curFormat(format), m_curBufferCount(bufferCount) {
+        m_lastResizeTick = GetTickCount64();
+    }
+    virtual ~WrappedSwapChain() {
+        if (m_real) m_real->Release();
+    }
+
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) || riid == __uuidof(IDXGIDeviceSubObject) || riid == __uuidof(IDXGISwapChain)) {
+            *ppvObject = this;
+            AddRef();
+            return S_OK;
+        }
+        return m_real->QueryInterface(riid, ppvObject);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_refCount); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG ref = InterlockedDecrement(&m_refCount);
+        if (ref == 0) { delete this; return 0; }
+        return ref;
+    }
+
+    // IDXGIObject
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID Name, UINT DataSize, const void* pData) override { return m_real->SetPrivateData(Name, DataSize, pData); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown) override { return m_real->SetPrivateDataInterface(Name, pUnknown); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData) override { return m_real->GetPrivateData(Name, pDataSize, pData); }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** ppParent) override { return m_real->GetParent(riid, ppParent); }
+
+    // IDXGIDeviceSubObject
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppDevice) override { return m_real->GetDevice(riid, ppDevice); }
+
+    // IDXGISwapChain
+    HRESULT STDMETHODCALLTYPE Present(UINT SyncInterval, UINT Flags) override {
+        return m_real->Present(SyncInterval, Flags);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) override {
+        return m_real->GetBuffer(Buffer, riid, ppSurface);
+    }
+
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) override {
+        return m_real->SetFullscreenState(Fullscreen, pTarget);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget) override {
+        return m_real->GetFullscreenState(pFullscreen, ppTarget);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc) override {
+        return m_real->GetDesc(pDesc);
+    }
+
+    HRESULT STDMETHODCALLTYPE ResizeBuffers(
+        UINT BufferCount,
+        UINT Width,
+        UINT Height,
+        DXGI_FORMAT NewFormat,
+        UINT SwapChainFlags
+    ) override {
+        ULONGLONG now = GetTickCount64();
+
+        // 1. Redundant identical resize check: drop if dimensions and format match
+        if (m_curWidth != 0 && m_curHeight != 0) {
+            if (Width == m_curWidth && Height == m_curHeight &&
+                (NewFormat == DXGI_FORMAT_UNKNOWN || NewFormat == m_curFormat) &&
+                (BufferCount == 0 || BufferCount == m_curBufferCount)) {
+                return S_OK;
+            }
+        }
+
+        // 2. High-frequency resize debounce (rapid window DPI / borderless focus jitter < 50ms)
+        if (now - m_lastResizeTick < 50 && m_curWidth != 0 && m_curHeight != 0) {
+            return S_OK;
+        }
+
+        HRESULT hr = m_real->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+        if (SUCCEEDED(hr)) {
+            m_curWidth = Width;
+            m_curHeight = Height;
+            if (NewFormat != DXGI_FORMAT_UNKNOWN) m_curFormat = NewFormat;
+            if (BufferCount != 0) m_curBufferCount = BufferCount;
+            m_curFlags = SwapChainFlags;
+            m_lastResizeTick = now;
+        }
+        return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) override {
+        return m_real->ResizeTarget(pNewTargetParameters);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetContainingOutput(IDXGIOutput** ppOutput) override {
+        return m_real->GetContainingOutput(ppOutput);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) override {
+        return m_real->GetFrameStatistics(pStats);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetLastPresentCount(UINT* pLastPresentCount) override {
+        return m_real->GetLastPresentCount(pLastPresentCount);
+    }
+};
+
+void WrapSwapChain(IDXGISwapChain** ppSwapChain, const DXGI_SWAP_CHAIN_DESC* pDesc) {
+    if (ppSwapChain && *ppSwapChain) {
+        UINT initW = pDesc ? pDesc->BufferDesc.Width : 0;
+        UINT initH = pDesc ? pDesc->BufferDesc.Height : 0;
+        DXGI_FORMAT fmt = pDesc ? pDesc->BufferDesc.Format : DXGI_FORMAT_UNKNOWN;
+        UINT bufCount = pDesc ? pDesc->BufferCount : 0;
+        *ppSwapChain = new WrappedSwapChain(*ppSwapChain, initW, initH, fmt, bufCount);
     }
 }

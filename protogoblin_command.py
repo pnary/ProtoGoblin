@@ -184,6 +184,21 @@ class DiagnosticAdvisor:
                     }
                 )
 
+            if jitter >= 8.0:
+                suggestions.append(
+                    {
+                        "level": "warning",
+                        "title": "Elevated Presentation & SwapChain Jitter Detected",
+                        "description": (
+                            f"Frametime jitter is elevated ({jitter:.1f}ms), typically caused by high-frequency "
+                            "constant buffer state updates or window/swapchain resize spikes."
+                        ),
+                        "action": "Enable D3D11 Constant Buffer Deduplication and SwapChain Resize Debouncing in the synchronization profile.",
+                        "fix_id": "state_dedup_and_debounce",
+                        "fix_button_text": "⚡ Enable State Dedup & Debounce",
+                    }
+                )
+
         # 5. Subsystem Pruning
         unutilized = sub.get("unutilized", [])
         if unutilized:
@@ -1073,6 +1088,8 @@ class ProtoGoblinCommandApp:
         self.var_gfx_reflex = tk.BooleanVar(value=True)
         self.var_sync_ntsync = tk.BooleanVar(value=True)
         self.var_atelier_sync_fix = tk.BooleanVar(value=False)
+        self.var_sync_state_dedup = tk.BooleanVar(value=True)
+        self.var_sync_swapchain_debounce = tk.BooleanVar(value=True)
         self.var_gfx_max_fps = tk.StringVar(value="0")
 
         dxvk_checks = [
@@ -1083,6 +1100,8 @@ class ProtoGoblinCommandApp:
             ("Nvidia Reflex Low-Latency Queueing (dxvk.nvLowLatency2 = true)", self.var_gfx_reflex),
             ("Kernel Fast-Path NT Synchronization (ntsync)", self.var_sync_ntsync),
             ("Gust / Atelier D3D11 Staging Buffer Sync Fix (Shadow staging wrapper override)", self.var_atelier_sync_fix),
+            ("Constant Buffer & State Rebind Deduplication (D3D11 wrapper state filter)", self.var_sync_state_dedup),
+            ("Debounce Rapid SwapChain Resize Choke (DXGI/D3D11 scale-factor filter)", self.var_sync_swapchain_debounce),
         ]
         for text, var in dxvk_checks:
             cb = tk.Checkbutton(
@@ -1940,6 +1959,8 @@ class ProtoGoblinCommandApp:
         self.var_gfx_reflex.set(False)
         self.var_sync_ntsync.set(False)
         self.var_atelier_sync_fix.set(False)
+        self.var_sync_state_dedup.set(False)
+        self.var_sync_swapchain_debounce.set(False)
         self.var_gfx_max_fps.set("0")
 
         if self.current_manifest:
@@ -1996,6 +2017,17 @@ class ProtoGoblinCommandApp:
                 f"• Target frame rate limiter set to {cap} FPS to eliminate frametime jitter.\n\n"
                 f"Saved to profile:\n{path}",
             )
+        elif fix_id == "state_dedup_and_debounce":
+            self.var_sync_state_dedup.set(True)
+            self.var_sync_swapchain_debounce.set(True)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                "State Deduplication & SwapChain Resize Debouncing enabled!\n\n"
+                "• D3D11 Constant Buffer deduplication enabled to prevent Vulkan descriptor thrashing.\n"
+                "• DXGI SwapChain rapid resize debouncing enabled to eliminate UI/render-target presentation stalls.\n\n"
+                f"Saved to profile:\n{path}",
+            )
 
     def generate_profile_toml(self, silent=False):
         if not self.current_manifest:
@@ -2048,6 +2080,8 @@ class ProtoGoblinCommandApp:
             },
             "synchronization": {
                 "ntsync": self.var_sync_ntsync.get(),
+                "state_dedup": self.var_sync_state_dedup.get(),
+                "swapchain_debounce": self.var_sync_swapchain_debounce.get(),
             },
         }
 

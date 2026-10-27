@@ -85,6 +85,7 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
         WrapDeviceAndContext(&pRealDevice, &pRealContext);
         if (ppDevice) *ppDevice = pRealDevice;
         if (ppImmediateContext) *ppImmediateContext = pRealContext;
+        if (ppSwapChain) WrapSwapChain(ppSwapChain, pSwapChainDesc);
     }
     return hr;
 }

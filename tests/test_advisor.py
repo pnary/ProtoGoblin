@@ -92,6 +92,23 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertTrue(any("Significant Frame Pacing Volatility" in t for t in titles))
         self.assertTrue(any("GPU Bound" in t for t in titles))
 
+    def test_frametime_jitter_state_dedup_suggestion(self):
+        manifest = {
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {
+                    "fps_avg": 60.0,
+                    "fps_1_pct_low": 55.0,
+                    "frametime_jitter_ms": 12.4,
+                },
+            }
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        jitter_suggs = [s for s in suggestions if s.get("fix_id") == "state_dedup_and_debounce"]
+        self.assertEqual(len(jitter_suggs), 1)
+        self.assertIn("Elevated Presentation & SwapChain Jitter Detected", jitter_suggs[0]["title"])
+        self.assertIn("Enable State Dedup & Debounce", jitter_suggs[0]["fix_button_text"])
+
     def test_subsystem_pruning_opportunity(self):
         manifest = {
             "subsystems": {
@@ -452,6 +469,49 @@ class TestEngineTweakManager(unittest.TestCase):
             EngineTweakManager.apply_tweaks(profile, {}, ["Atelier_Ryza.exe"], env, proton_dir=td)
             self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
             self.assertEqual(env.get("PROTOGOBLIN_STAGING_SYNC_FIX"), "1")
+            self.assertIn(lib64, env.get("WINEDLLPATH", ""))
+
+    def test_state_dedup_and_swapchain_debounce_pipeline(self):
+        # 1. TOML profile generation with state_dedup and swapchain_debounce
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="2555360",
+            app_id=2555360,
+            target_exe="Game.exe",
+            user_tweaks={
+                "synchronization": {
+                    "state_dedup": True,
+                    "swapchain_debounce": True,
+                }
+            },
+        )
+        self.assertIn("[synchronization.state_dedup]", toml_text)
+        self.assertIn("[synchronization.swapchain_debounce]", toml_text)
+        self.assertIn("enabled = true", toml_text)
+
+        # 2. Applying tweaks injects overrides and flags
+        profile = {
+            "synchronization": {
+                "state_dedup": {"enabled": True},
+                "swapchain_debounce": {"enabled": True},
+            }
+        }
+        env = {}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env)
+        self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
+        self.assertEqual(env.get("PROTOGOBLIN_STATE_DEDUP"), "1")
+        self.assertEqual(env.get("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE"), "1")
+
+    def test_vendored_state_dedup_resolution(self):
+        with tempfile.TemporaryDirectory() as td:
+            lib64 = os.path.join(td, "share", "protogoblin", "lib64")
+            os.makedirs(lib64, exist_ok=True)
+            profile = {
+                "synchronization": {"state_dedup": {"enabled": True}},
+            }
+            env = {}
+            EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env, proton_dir=td)
+            self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
+            self.assertEqual(env.get("PROTOGOBLIN_STATE_DEDUP"), "1")
             self.assertIn(lib64, env.get("WINEDLLPATH", ""))
 
     def test_profile_mode_in_profile_toml(self):
