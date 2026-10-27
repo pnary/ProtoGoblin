@@ -11,6 +11,7 @@ import platform
 import re
 import struct
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,8 +84,6 @@ class PEInfo:
                 if opt_hdr_size > 0:
                     opt_header = f.read(opt_hdr_size)
                     if len(opt_header) >= 2:
-                        opt_magic = struct.unpack_from("<H", opt_header, 0)[0]
-                        # PE32 (0x10b) vs PE32+ (0x20b)
                         # SizeOfImage is at offset 0x38 in both PE32 and PE32+
                         if len(opt_header) >= 0x3C:
                             size_of_image = struct.unpack_from("<I", opt_header, 0x38)[0]
@@ -150,7 +149,6 @@ class AntiCheatDetector:
             if os.path.isdir(d):
                 try:
                     for root, dirs, files in os.walk(d):
-                        # Limit depth to 2 levels to avoid long scanning
                         rel = os.path.relpath(root, d)
                         if rel.count(os.sep) >= 2:
                             continue
@@ -177,12 +175,226 @@ class AntiCheatDetector:
         }
 
 
+class ProcessTreeTracker:
+    """Monitors the active process tree under Linux /proc to identify intermediate launchers and child game binaries."""
+
+    SYSTEM_HELPER_EXES = {
+        "steam.exe",
+        "steamservice.exe",
+        "steamwebhelper.exe",
+        "winedevice.exe",
+        "winedbg.exe",
+        "services.exe",
+        "explorer.exe",
+        "plugplay.exe",
+        "conhost.exe",
+        "rpcss.exe",
+        "rundll32.exe",
+        "start.exe",
+        "cmd.exe",
+        "umu.exe",
+        "wineboot.exe",
+    }
+
+    LAUNCHER_PATTERNS = [
+        r"launcher",
+        r"bootstrapper",
+        r"splash",
+        r"autorun",
+        r"setup",
+        r"updater",
+        r"crashpad",
+        r"crashreport",
+    ]
+
+    def __init__(self, root_pid, prefix_dir=None):
+        self.root_pid = root_pid
+        self.prefix_dir = prefix_dir
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.lock = threading.Lock()
+
+        # Metrics collected during monitoring
+        self.peak_thread_count = 1
+        self.peak_process_count = 1
+        self.all_seen_pids = set([root_pid]) if root_pid else set()
+        # map: resolved_path -> {'peak_threads': int, 'first_seen': float, 'last_seen': float}
+        self.discovered_executables = {}
+
+    def start(self):
+        if not self.root_pid:
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        if self.thread and self.thread.is_alive():
+            self.stop_event.set()
+            self.thread.join(timeout=1.0)
+
+    @staticmethod
+    def resolve_wine_path(win_path, prefix_dir=None):
+        if not win_path:
+            return None
+        clean = win_path.strip('"\'')
+        if os.path.isfile(clean):
+            return os.path.abspath(clean)
+
+        norm = clean.replace("\\", "/")
+        if len(norm) >= 2 and norm[1] == ":":
+            drive = norm[0].lower()
+            subpath = norm[2:].lstrip("/")
+            if drive == "c" and prefix_dir:
+                candidate = os.path.join(prefix_dir, "drive_c", subpath)
+                if os.path.isfile(candidate):
+                    return os.path.abspath(candidate)
+            elif drive == "z":
+                candidate = "/" + subpath
+                if os.path.isfile(candidate):
+                    return os.path.abspath(candidate)
+        return clean
+
+    def _monitor_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self._poll()
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+    def _poll(self):
+        if not os.path.isdir("/proc"):
+            return
+
+        try:
+            pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+        except OSError:
+            return
+
+        parent_map = {}
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    idx = content.rfind(")")
+                    if idx != -1:
+                        rest = content[idx + 2:].split()
+                        ppid = int(rest[1])
+                        parent_map.setdefault(ppid, []).append(pid)
+            except (OSError, IndexError, ValueError):
+                continue
+
+        tree_pids = set()
+        queue = [self.root_pid]
+        while queue:
+            curr = queue.pop(0)
+            tree_pids.add(curr)
+            for child in parent_map.get(curr, []):
+                if child not in tree_pids:
+                    queue.append(child)
+
+        with self.lock:
+            self.all_seen_pids.update(tree_pids)
+            if len(tree_pids) > self.peak_process_count:
+                self.peak_process_count = len(tree_pids)
+
+            total_threads = 0
+            now = time.monotonic()
+
+            for pid in tree_pids:
+                try:
+                    with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.startswith("Threads:"):
+                                total_threads += int(line.split()[1])
+                                break
+                except (OSError, IndexError, ValueError):
+                    pass
+
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        raw = f.read()
+                    parts = raw.split(b"\0")
+                    for part in parts:
+                        try:
+                            token = part.decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            continue
+                        if token.lower().endswith(".exe"):
+                            base = os.path.basename(token).lower()
+                            if base not in self.SYSTEM_HELPER_EXES:
+                                resolved = self.resolve_wine_path(token, self.prefix_dir)
+                                if resolved not in self.discovered_executables:
+                                    self.discovered_executables[resolved] = {
+                                        "first_seen": now,
+                                        "last_seen": now,
+                                        "peak_threads": 1,
+                                    }
+                                else:
+                                    entry = self.discovered_executables[resolved]
+                                    entry["last_seen"] = now
+                                    if total_threads > entry["peak_threads"]:
+                                        entry["peak_threads"] = total_threads
+                except OSError:
+                    continue
+
+            if total_threads > self.peak_thread_count:
+                self.peak_thread_count = total_threads
+
+    def evaluate_executables(self, initial_exe_path):
+        """Analyzes all discovered executables and classifies (launcher_path, target_path)."""
+        with self.lock:
+            disc = dict(self.discovered_executables)
+
+        resolved_initial = self.resolve_wine_path(initial_exe_path, self.prefix_dir) if initial_exe_path else None
+        if resolved_initial and resolved_initial not in disc:
+            disc[resolved_initial] = {"peak_threads": 1, "first_seen": 0, "last_seen": 0}
+
+        candidates = [
+            p for p in disc
+            if os.path.basename(p).lower() not in self.SYSTEM_HELPER_EXES
+        ]
+
+        if not candidates:
+            return None, resolved_initial
+
+        if len(candidates) == 1:
+            return None, candidates[0]
+
+        launchers = [
+            p for p in candidates
+            if any(re.search(pat, os.path.basename(p), re.IGNORECASE) for pat in self.LAUNCHER_PATTERNS)
+        ]
+        non_launchers = [p for p in candidates if p not in launchers]
+
+        if non_launchers:
+            non_launchers.sort(
+                key=lambda p: (
+                    disc[p].get("peak_threads", 0),
+                    disc[p].get("last_seen", 0) - disc[p].get("first_seen", 0)
+                ),
+                reverse=True
+            )
+            target = non_launchers[0]
+            launcher = resolved_initial if resolved_initial != target else (launchers[0] if launchers else None)
+            return launcher, target
+
+        candidates.sort(
+            key=lambda p: (
+                disc[p].get("peak_threads", 0),
+                disc[p].get("last_seen", 0) - disc[p].get("first_seen", 0)
+            ),
+            reverse=True
+        )
+        return (resolved_initial if resolved_initial != candidates[0] else None), candidates[0]
+
+
 class SystemProbe:
     """Probes host and container environment information."""
 
     @staticmethod
     def get_host_os():
-        # Check /run/host/os-release (inside flatpak / pressure-vessel) first, then /etc/os-release
         for path in ["/run/host/os-release", "/etc/os-release"]:
             if os.path.isfile(path):
                 try:
@@ -221,7 +433,6 @@ class SystemProbe:
 
     @staticmethod
     def get_gpu_info():
-        # Baseline fallback info
         device_name = "Vulkan Compatible GPU"
         driver_version = "Unknown"
         vulkan_version = "1.3"
@@ -229,7 +440,6 @@ class SystemProbe:
         if os.environ.get("MESA_LOADER_DRIVER_OVERRIDE"):
             driver_version = f"Mesa ({os.environ['MESA_LOADER_DRIVER_OVERRIDE']})"
 
-        # Attempt to read from /sys/class/drm/card0/device
         return {
             "device_name": device_name,
             "driver_version": driver_version,
@@ -260,26 +470,25 @@ class ProtoGoblinSession:
         self.start_iso = datetime.now(timezone.utc).isoformat()
         self.start_monotonic = time.monotonic()
 
-        # Mode: 'play' by default, or 'profile'
         self.mode = os.environ.get("PROTOGOBLIN_MODE", "play").lower().strip()
         if self.mode not in ["play", "profile"]:
             self.mode = "play"
 
-        # Game ID: SteamAppId or SteamGameId
         self.steam_appid = os.environ.get("SteamGameId") or os.environ.get("SteamAppId")
 
-        # Session data directories
         xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
         game_slug = self.steam_appid or "unknown_game"
         self.session_dir = os.path.join(xdg_data, "protogoblin", "sessions", game_slug, self.session_id)
         self.manifest_path = os.path.join(self.session_dir, "utilization.json")
 
         self.anti_cheat = {"detected": False, "provider": None, "passthrough_enforced": False}
+        self.initial_exe = None
         self.launcher_exe = None
         self.target_exe = None
         self.exit_code = 0
         self.process_tree_count = 1
         self.peak_thread_count = 1
+        self.tracker = None
 
     def _resolve_version(self):
         v_file = os.path.join(self.proton_dir, "VERSION")
@@ -298,32 +507,29 @@ class ProtoGoblinSession:
         except OSError:
             pass
 
-        # Identify target candidate executable from argv
         target_path = None
         for arg in argv:
             if arg.lower().endswith(".exe"):
                 target_path = arg
                 break
 
+        self.initial_exe = target_path
+
         # Anti-cheat scan
         self.anti_cheat = AntiCheatDetector.scan(target_path)
         if self.anti_cheat["detected"]:
-            # If anti-cheat is detected, enforce safe passthrough (no profiling hooks)
             self.mode = "play"
 
-        # Inspect target PE
+        # Initial target info
         if target_path:
             pe_data = PEInfo.inspect(target_path)
-            if pe_data:
-                self.target_exe = pe_data
-            else:
-                self.target_exe = {
-                    "path": target_path,
-                    "sha256": "unknown",
-                    "arch": "x86_64",
-                    "pe_timestamp": None,
-                    "pe_size_of_image": None,
-                }
+            self.target_exe = pe_data or {
+                "path": target_path,
+                "sha256": "unknown",
+                "arch": "x86_64",
+                "pe_timestamp": None,
+                "pe_size_of_image": None,
+            }
         else:
             self.target_exe = {
                 "path": "unknown",
@@ -333,17 +539,42 @@ class ProtoGoblinSession:
                 "pe_size_of_image": None,
             }
 
-        # Initial launcher is recorded if separate
-        if len(argv) > 0 and argv[0].lower().endswith(".exe") and argv[0] != target_path:
-            self.launcher_exe = PEInfo.inspect(argv[0])
+    def start_process_tree_monitor(self, root_pid, prefix_dir=None):
+        """Starts monitoring child processes spawned by root_pid."""
+        self.tracker = ProcessTreeTracker(root_pid, prefix_dir)
+        self.tracker.start()
+
+    def stop_process_tree_monitor(self):
+        """Stops process monitoring and retrieves intermediate launcher / target classification."""
+        if self.tracker:
+            self.tracker.stop()
+            launcher_path, target_path = self.tracker.evaluate_executables(self.initial_exe)
+
+            if launcher_path:
+                self.launcher_exe = PEInfo.inspect(launcher_path) or {
+                    "path": launcher_path,
+                    "sha256": "unknown",
+                    "arch": "x86_64",
+                }
+
+            if target_path:
+                pe_info = PEInfo.inspect(target_path)
+                if pe_info:
+                    self.target_exe = pe_info
+
+            disc_peak = max(
+                (v.get("peak_threads", 1) for v in self.tracker.discovered_executables.values()),
+                default=1,
+            )
+            self.peak_thread_count = max(self.peak_thread_count, self.tracker.peak_thread_count, disc_peak)
+            self.process_tree_count = max(self.process_tree_count, self.tracker.peak_process_count, len(self.tracker.all_seen_pids))
 
     def post_flight(self, exit_code, env):
-        """Finalizes session metadata, parses runtime traces, and generates utilization.json."""
+        """Finalizes session metadata and generates utilization.json."""
         self.exit_code = exit_code
         end_iso = datetime.now(timezone.utc).isoformat()
         duration_seconds = round(time.monotonic() - self.start_monotonic, 3)
 
-        # Synchronization detection
         sync_backend = "wineserver_rpc"
         fast_path = False
         if os.path.exists("/dev/ntsync") or env.get("WINE_USE_NTSYNC") == "1" or env.get("PROTON_USE_NTSYNC") == "1":
@@ -356,7 +587,6 @@ class ProtoGoblinSession:
             sync_backend = "esync"
             fast_path = True
 
-        # Graphics backend detection
         if env.get("PROTON_USE_WINED3D") == "1":
             active_backend = "wined3d"
         elif env.get("PROTON_USE_D7VK") == "1":
@@ -364,7 +594,6 @@ class ProtoGoblinSession:
         else:
             active_backend = "dxvk"
 
-        # DLL overrides
         dll_overrides_raw = env.get("WINEDLLOVERRIDES", "")
         active_overrides = {}
         for entry in dll_overrides_raw.split(";"):
@@ -375,7 +604,6 @@ class ProtoGoblinSession:
                     if dll_clean:
                         active_overrides[dll_clean] = mode.strip()
 
-        # Build utilization manifest conforming to schema
         manifest = {
             "schema_version": self.schema_version,
             "session": {
@@ -453,7 +681,6 @@ class ProtoGoblinSession:
             "roi_telemetry": None,
         }
 
-        # Save manifest
         try:
             os.makedirs(self.session_dir, exist_ok=True)
             with open(self.manifest_path, "w", encoding="utf-8") as f:
@@ -465,5 +692,4 @@ class ProtoGoblinSession:
         return manifest
 
 
-# Global session instance
 g_protogoblin = ProtoGoblinSession()

@@ -2881,7 +2881,13 @@ class Session:
     def run_proc(self, args, local_env=None):
         if local_env is None:
             local_env = self.env
-        return subprocess.call(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
+        prefix_dir = getattr(g_compatdata, "prefix_dir", None) if "g_compatdata" in globals() else None
+        proc = subprocess.Popen(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
+        protogoblin.g_protogoblin.start_process_tree_monitor(proc.pid, prefix_dir)
+        try:
+            return proc.wait()
+        finally:
+            protogoblin.g_protogoblin.stop_process_tree_monitor()
 
     def run(self):
         protogoblin.g_protogoblin.pre_flight(sys.argv[2:], self.env)
