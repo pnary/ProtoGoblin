@@ -346,6 +346,320 @@ class EngineDetector:
         }
 
 
+class EngineTweakManager:
+    """Manages engine-specific visual tweaks, command-line overrides, and graphics layer intercepts."""
+
+    DEFAULTS = {
+        "unreal": {
+            "disable_motion_blur": True,
+            "disable_depth_of_field": True,
+            "disable_chromatic_aberration": True,
+            "disable_film_grain": True,
+            "disable_lens_flare": False,
+            "disable_bloom": False,
+            "disable_volumetric_fog": False,
+            "disable_lumen_reflections": False,
+        },
+        "unity": {
+            "native_gfx_jobs": True,
+            "disable_vr": True,
+            "force_vulkan": False,
+        },
+        "godot": {
+            "rendering_driver": "vulkan",
+            "disable_vsync": True,
+            "max_fps": 0,
+        },
+        "graphics": {
+            "backend": "dxvk",
+            "force_vsync": "off",
+            "max_fps": 0,
+            "anisotropic_filtering": 16,
+            "async_shader_compile": True,
+            "low_latency": True,
+        },
+    }
+
+    UNREAL_CVAR_MAP = {
+        "disable_motion_blur": [
+            "r.MotionBlurQuality 0",
+            "r.MotionBlur.Max 0",
+            "r.DefaultFeature.MotionBlur 0",
+        ],
+        "disable_depth_of_field": ["r.DepthOfFieldQuality 0"],
+        "disable_chromatic_aberration": ["r.SceneColorFringeQuality 0"],
+        "disable_film_grain": ["r.FilmGrain 0"],
+        "disable_lens_flare": ["r.LensFlareQuality 0"],
+        "disable_bloom": ["r.BloomQuality 0"],
+        "disable_volumetric_fog": ["r.VolumetricFog 0"],
+        "disable_lumen_reflections": ["r.Lumen.Reflections.Allow 0"],
+    }
+
+    @classmethod
+    def load_profile(cls, path):
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            try:
+                import tomllib
+                with open(path, "rb") as f:
+                    return tomllib.load(f)
+            except ImportError:
+                return cls._fallback_parse_toml(path)
+        except Exception:
+            return None
+
+    @classmethod
+    def _fallback_parse_toml(cls, path):
+        result = {}
+        curr_section = result
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("[") and line.endswith("]"):
+                        sec_name = line[1:-1].strip()
+                        parts = sec_name.split(".")
+                        curr = result
+                        for p in parts:
+                            curr = curr.setdefault(p, {})
+                        curr_section = curr
+                        continue
+                    if "=" in line:
+                        key, val = [x.strip() for x in line.split("=", 1)]
+                        if val.lower() == "true":
+                            val_parsed = True
+                        elif val.lower() == "false":
+                            val_parsed = False
+                        elif val.isdigit():
+                            val_parsed = int(val)
+                        elif (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                            val_parsed = val[1:-1]
+                        else:
+                            val_parsed = val
+                        curr_section[key] = val_parsed
+        except Exception:
+            pass
+        return result
+
+    @classmethod
+    def generate_profile_toml(cls, game_id, app_id, target_exe, engine_info, sync_backend="ntsync", user_tweaks=None):
+        tweaks = user_tweaks or {}
+        eng_name = engine_info.get("engine", "") if engine_info else ""
+        is_ue = eng_name in ["unreal_4", "unreal_5", "unreal"]
+        is_unity = eng_name == "unity"
+        is_godot = eng_name == "godot"
+
+        ue_cfg = tweaks.get("unreal", cls.DEFAULTS["unreal"])
+        unity_cfg = tweaks.get("unity", cls.DEFAULTS["unity"])
+        godot_cfg = tweaks.get("godot", cls.DEFAULTS["godot"])
+        gfx_cfg = tweaks.get("graphics", cls.DEFAULTS["graphics"])
+
+        lines = [
+            "# ProtoGoblin Per-Game Optimization Profile",
+            f"# Target: {target_exe}",
+            "",
+            "[game]",
+            f'id = "{game_id}"',
+            f'steam_appid = {app_id if str(app_id).isdigit() else 0}',
+            f'target_executable = "{target_exe}"',
+            f'detected_engine = "{eng_name}"',
+            "",
+            "[runtime]",
+            'mode = "play"',
+            "prune_unused_subsystems = true",
+            'anticheat_policy = "passthrough"',
+            "",
+            "[graphics]",
+            f'backend = "{gfx_cfg.get("backend", "dxvk")}"',
+            f'force_vsync = "{gfx_cfg.get("force_vsync", "off")}"',
+            f'max_fps = {gfx_cfg.get("max_fps", 0)}',
+            f'anisotropic_filtering = {gfx_cfg.get("anisotropic_filtering", 16)}',
+            f'async_shader_compile = {"true" if gfx_cfg.get("async_shader_compile", True) else "false"}',
+            f'low_latency = {"true" if gfx_cfg.get("low_latency", True) else "false"}',
+            "",
+            "[synchronization]",
+            f'preferred_backend = "{sync_backend}"',
+        ]
+
+        if is_ue or "unreal" in tweaks:
+            lines.extend([
+                "",
+                "[engine.unreal]",
+                f'disable_motion_blur = {"true" if ue_cfg.get("disable_motion_blur", True) else "false"}',
+                f'disable_depth_of_field = {"true" if ue_cfg.get("disable_depth_of_field", True) else "false"}',
+                f'disable_chromatic_aberration = {"true" if ue_cfg.get("disable_chromatic_aberration", True) else "false"}',
+                f'disable_film_grain = {"true" if ue_cfg.get("disable_film_grain", True) else "false"}',
+                f'disable_lens_flare = {"true" if ue_cfg.get("disable_lens_flare", False) else "false"}',
+                f'disable_bloom = {"true" if ue_cfg.get("disable_bloom", False) else "false"}',
+                f'disable_volumetric_fog = {"true" if ue_cfg.get("disable_volumetric_fog", False) else "false"}',
+                f'disable_lumen_reflections = {"true" if ue_cfg.get("disable_lumen_reflections", False) else "false"}',
+            ])
+
+        if is_unity or "unity" in tweaks:
+            lines.extend([
+                "",
+                "[engine.unity]",
+                f'native_gfx_jobs = {"true" if unity_cfg.get("native_gfx_jobs", True) else "false"}',
+                f'disable_vr = {"true" if unity_cfg.get("disable_vr", True) else "false"}',
+                f'force_vulkan = {"true" if unity_cfg.get("force_vulkan", False) else "false"}',
+            ])
+
+        if is_godot or "godot" in tweaks:
+            lines.extend([
+                "",
+                "[engine.godot]",
+                f'rendering_driver = "{godot_cfg.get("rendering_driver", "vulkan")}"',
+                f'disable_vsync = {"true" if godot_cfg.get("disable_vsync", True) else "false"}',
+                f'max_fps = {godot_cfg.get("max_fps", 0)}',
+            ])
+
+        lines.append("")
+        return "\n".join(lines)
+
+    @classmethod
+    def apply_tweaks(cls, profile, engine_info, argv, env, prefix_dir=None):
+        if not profile:
+            return argv
+
+        eng_name = engine_info.get("engine", "") if engine_info else ""
+        engine_sec = profile.get("engine", {})
+        gfx_sec = profile.get("graphics", {})
+
+        new_argv = list(argv)
+
+        # 1. Unreal Engine command-line cvars
+        ue_cfg = engine_sec.get("unreal", {})
+        cvars = []
+        if ue_cfg or eng_name in ["unreal_4", "unreal_5", "unreal"]:
+            for option_key, active in ue_cfg.items():
+                if active and option_key in cls.UNREAL_CVAR_MAP:
+                    cvars.extend(cls.UNREAL_CVAR_MAP[option_key])
+            if cvars:
+                exec_arg = f'-ExecCmds="{"; ".join(cvars)}"'
+                new_argv.append(exec_arg)
+
+        # 2. Unity command-line flags
+        unity_cfg = engine_sec.get("unity", {})
+        if unity_cfg.get("force_vulkan"):
+            if "-force-vulkan" not in new_argv:
+                new_argv.append("-force-vulkan")
+
+        # 3. Godot command-line flags
+        godot_cfg = engine_sec.get("godot", {})
+        if godot_cfg.get("rendering_driver"):
+            driver = godot_cfg["rendering_driver"]
+            new_argv.extend(["--rendering-driver", driver])
+        if godot_cfg.get("max_fps", 0) > 0:
+            new_argv.append(f"--max-fps={godot_cfg['max_fps']}")
+
+        # 4. DXVK / Graphics layer intercepts
+        dxvk_items = []
+        if gfx_sec.get("force_vsync") == "off":
+            dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
+        elif gfx_sec.get("force_vsync") == "on":
+            dxvk_items.extend(["dxgi.syncInterval = 1", "d3d11.syncInterval = 1"])
+
+        if gfx_sec.get("max_fps", 0) > 0:
+            limit = gfx_sec["max_fps"]
+            dxvk_items.append(f"dxgi.maxFrameRate = {limit}")
+            env["VKD3D_FRAME_RATE"] = str(limit)
+
+        af = gfx_sec.get("anisotropic_filtering")
+        if af and int(af) > 0:
+            dxvk_items.append(f"d3d11.samplerAnisotropy = {af}")
+
+        if gfx_sec.get("async_shader_compile"):
+            env["DXVK_ASYNC"] = "1"
+            dxvk_items.append("dxvk.enableAsync = true")
+
+        if gfx_sec.get("low_latency"):
+            dxvk_items.append("dxvk.lowLatency = true")
+
+        if dxvk_items:
+            existing_dxvk = env.get("DXVK_CONFIG", "").strip()
+            addon = "; ".join(dxvk_items)
+            env["DXVK_CONFIG"] = f"{existing_dxvk}; {addon}" if existing_dxvk else addon
+
+        # 5. Prefix file configuration adjustments
+        if prefix_dir and os.path.isdir(prefix_dir):
+            try:
+                if unity_cfg and (unity_cfg.get("native_gfx_jobs") or unity_cfg.get("disable_vr")):
+                    cls._patch_unity_boot_config(prefix_dir, unity_cfg)
+                if ue_cfg and cvars:
+                    cls._patch_unreal_engine_ini(prefix_dir, cvars)
+            except Exception:
+                pass
+
+        return new_argv
+
+    @classmethod
+    def _patch_unity_boot_config(cls, prefix_dir, unity_cfg):
+        for root, dirs, files in os.walk(prefix_dir):
+            if "boot.config" in files:
+                cfg_path = os.path.join(root, "boot.config")
+                try:
+                    with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    existing = {l.split("=")[0].strip(): l.strip() for l in lines if "=" in l}
+                    modified = False
+                    if unity_cfg.get("native_gfx_jobs") and existing.get("gfx-enable-native-gfx-jobs") != "gfx-enable-native-gfx-jobs=1":
+                        lines.append("gfx-enable-native-gfx-jobs=1\n")
+                        modified = True
+                    if unity_cfg.get("disable_vr") and existing.get("vr-enabled") != "vr-enabled=0":
+                        lines.append("vr-enabled=0\n")
+                        modified = True
+                    if modified:
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            f.writelines(lines)
+                except OSError:
+                    pass
+
+    @classmethod
+    def _patch_unreal_engine_ini(cls, prefix_dir, cvars):
+        local_appdata = os.path.join(prefix_dir, "drive_c", "users", "steamuser", "AppData", "Local")
+        if not os.path.isdir(local_appdata):
+            return
+        for game_dir in os.listdir(local_appdata):
+            saved_dir = os.path.join(local_appdata, game_dir, "Saved", "Config")
+            if os.path.isdir(saved_dir):
+                for sub in os.listdir(saved_dir):
+                    if sub.startswith("Windows"):
+                        ini_path = os.path.join(saved_dir, sub, "Engine.ini")
+                        cls._write_unreal_system_settings(ini_path, cvars)
+
+    @classmethod
+    def _write_unreal_system_settings(cls, ini_path, cvars):
+        try:
+            content = ""
+            if os.path.isfile(ini_path):
+                with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+
+            lines_to_add = []
+            for cv in cvars:
+                parts = cv.split()
+                if len(parts) == 2:
+                    k, v = parts
+                    setting_line = f"{k}={v}"
+                    if setting_line not in content:
+                        lines_to_add.append(setting_line)
+
+            if lines_to_add:
+                if "[SystemSettings]" not in content:
+                    content += "\n\n[SystemSettings]\n" + "\n".join(lines_to_add) + "\n"
+                else:
+                    idx = content.find("[SystemSettings]") + len("[SystemSettings]")
+                    content = content[:idx] + "\n" + "\n".join(lines_to_add) + content[idx:]
+                os.makedirs(os.path.dirname(ini_path), exist_ok=True)
+                with open(ini_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+        except OSError:
+            pass
+
+
 class ProcessTreeTracker:
     """Monitors the active process tree under Linux /proc to identify intermediate launchers and child game binaries."""
 
@@ -936,7 +1250,33 @@ class ProtoGoblinSession:
                 pass
         return "ProtoGoblin-0.01"
 
-    def pre_flight(self, argv, env):
+    def find_game_profile(self):
+        """Locates the per-game optimization profile TOML if one exists."""
+        if os.environ.get("PROTOGOBLIN_PROFILE"):
+            custom = os.environ["PROTOGOBLIN_PROFILE"]
+            if os.path.isfile(custom):
+                return custom
+
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        if self.steam_appid:
+            p = os.path.join(xdg_config, "protogoblin", "games", f"{self.steam_appid}.toml")
+            if os.path.isfile(p):
+                return p
+
+        if self.target_exe and self.target_exe.get("path") and self.target_exe["path"] != "unknown":
+            stem = os.path.splitext(os.path.basename(self.target_exe["path"]))[0]
+            p = os.path.join(xdg_config, "protogoblin", "games", f"{stem}.toml")
+            if os.path.isfile(p):
+                return p
+
+            base_dir = os.path.dirname(os.path.abspath(self.target_exe["path"]))
+            p_local = os.path.join(base_dir, "protogoblin.toml")
+            if os.path.isfile(p_local):
+                return p_local
+
+        return None
+
+    def pre_flight(self, argv, env, prefix_dir=None):
         """Initializes the session directory, probes environment, and runs anti-cheat scan."""
         try:
             os.makedirs(self.session_dir, exist_ok=True)
@@ -1005,6 +1345,21 @@ class ProtoGoblinSession:
                 "confidence": 0.0,
                 "details": {},
             }
+
+        # Apply Game Profile (engine-specific visual & performance overrides)
+        profile_path = self.find_game_profile()
+        if profile_path:
+            profile = EngineTweakManager.load_profile(profile_path)
+            if profile:
+                argv = EngineTweakManager.apply_tweaks(
+                    profile,
+                    self.detected_engine,
+                    argv,
+                    env,
+                    prefix_dir,
+                )
+
+        return argv
 
     def start_process_tree_monitor(self, root_pid, prefix_dir=None):
         """Starts monitoring child processes spawned by root_pid."""

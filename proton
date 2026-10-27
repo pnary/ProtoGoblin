@@ -2894,7 +2894,10 @@ class Session:
             protogoblin.g_protogoblin.stop_process_tree_monitor()
 
     def run(self):
-        protogoblin.g_protogoblin.pre_flight(sys.argv[2:], self.env)
+        prefix_dir = getattr(g_compatdata, "prefix_dir", None) if "g_compatdata" in globals() else None
+        tweaked_argv = protogoblin.g_protogoblin.pre_flight(sys.argv[2:], self.env, prefix_dir)
+        if tweaked_argv and tweaked_argv != sys.argv[2:]:
+            sys.argv = sys.argv[:2] + tweaked_argv
         log("ProtoGoblin session initialized: " + protogoblin.g_protogoblin.session_id)
         umu_without_steam = "UMU_ID" in os.environ and os.environ.get("UMU_USE_STEAM") != "1"
         if umu_without_steam:

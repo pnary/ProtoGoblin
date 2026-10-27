@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from protogoblin import EngineDetector, ProtoGoblinSession
+from protogoblin import EngineDetector, EngineTweakManager, ProtoGoblinSession
 from protogoblin_command import DiagnosticAdvisor
 
 
@@ -212,6 +212,93 @@ class TestProfileBannerHUD(unittest.TestCase):
                 os.environ["PROTOGOBLIN_OVERLAY"] = old_overlay
             else:
                 os.environ.pop("PROTOGOBLIN_OVERLAY", None)
+
+
+class TestEngineTweakManager(unittest.TestCase):
+    def test_unreal_engine_tweak_injection(self):
+        profile = {
+            "engine": {
+                "unreal": {
+                    "disable_motion_blur": True,
+                    "disable_depth_of_field": True,
+                    "disable_chromatic_aberration": True,
+                    "disable_film_grain": True,
+                }
+            }
+        }
+        argv = ["Game-Win64-Shipping.exe"]
+        env = {}
+        new_argv = EngineTweakManager.apply_tweaks(profile, {"engine": "unreal_5"}, argv, env)
+
+        self.assertEqual(len(new_argv), 2)
+        exec_arg = new_argv[1]
+        self.assertTrue(exec_arg.startswith('-ExecCmds="'))
+        self.assertIn("r.MotionBlurQuality 0", exec_arg)
+        self.assertIn("r.DepthOfFieldQuality 0", exec_arg)
+        self.assertIn("r.SceneColorFringeQuality 0", exec_arg)
+        self.assertIn("r.FilmGrain 0", exec_arg)
+
+    def test_unity_and_godot_tweak_injection(self):
+        profile = {
+            "engine": {
+                "unity": {"force_vulkan": True},
+                "godot": {"rendering_driver": "vulkan", "max_fps": 120},
+            }
+        }
+        # Unity
+        u_argv = EngineTweakManager.apply_tweaks(profile, {"engine": "unity"}, ["Game.exe"], {})
+        self.assertIn("-force-vulkan", u_argv)
+
+        # Godot
+        g_argv = EngineTweakManager.apply_tweaks(profile, {"engine": "godot"}, ["Brotato.exe"], {})
+        self.assertIn("--rendering-driver", g_argv)
+        self.assertIn("vulkan", g_argv)
+        self.assertIn("--max-fps=120", g_argv)
+
+    def test_dxvk_graphics_intercepts(self):
+        profile = {
+            "graphics": {
+                "force_vsync": "off",
+                "max_fps": 144,
+                "anisotropic_filtering": 16,
+                "async_shader_compile": True,
+                "low_latency": True,
+            }
+        }
+        env = {}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env)
+
+        self.assertEqual(env.get("DXVK_ASYNC"), "1")
+        self.assertEqual(env.get("VKD3D_FRAME_RATE"), "144")
+        dxvk_cfg = env.get("DXVK_CONFIG", "")
+        self.assertIn("dxgi.syncInterval = 0", dxvk_cfg)
+        self.assertIn("d3d11.samplerAnisotropy = 16", dxvk_cfg)
+        self.assertIn("dxgi.maxFrameRate = 144", dxvk_cfg)
+        self.assertIn("dxvk.enableAsync = true", dxvk_cfg)
+        self.assertIn("dxvk.lowLatency = true", dxvk_cfg)
+
+    def test_generate_and_load_profile_toml(self):
+        with tempfile.TemporaryDirectory() as td:
+            p_file = os.path.join(td, "game.toml")
+            toml_text = EngineTweakManager.generate_profile_toml(
+                game_id="12345",
+                app_id=12345,
+                target_exe="Game.exe",
+                engine_info={"engine": "unreal_5"},
+                sync_backend="ntsync",
+                user_tweaks={
+                    "unreal": {"disable_motion_blur": True},
+                    "graphics": {"force_vsync": "off", "anisotropic_filtering": 16},
+                },
+            )
+            with open(p_file, "w", encoding="utf-8") as f:
+                f.write(toml_text)
+
+            loaded = EngineTweakManager.load_profile(p_file)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded["game"]["steam_appid"], 12345)
+            self.assertTrue(loaded["engine"]["unreal"]["disable_motion_blur"])
+            self.assertEqual(loaded["graphics"]["force_vsync"], "off")
 
 
 if __name__ == "__main__":

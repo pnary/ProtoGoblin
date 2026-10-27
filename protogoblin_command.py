@@ -365,20 +365,25 @@ class ProtoGoblinCommandApp:
         self.tab_diag = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_diag, text="  🩺 Diagnostics & Suggested Fixes  ")
 
-        # Tab 2: Performance & Frame Metrics
+        # Tab 2: Engine & Graphics Tweaks
+        self.tab_tweaks = tk.Frame(self.notebook, bg=self.card_bg)
+        self.notebook.add(self.tab_tweaks, text="  ⚡ Engine & Graphics Tweaks  ")
+
+        # Tab 3: Performance & Frame Metrics
         self.tab_perf = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_perf, text="  📊 Performance & Pacing  ")
 
-        # Tab 3: System & Translation Details
+        # Tab 4: System & Translation Details
         self.tab_sys = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_sys, text="  ⚙️ Graphics & Subsystems  ")
 
-        # Tab 4: Raw JSON Manifest
+        # Tab 5: Raw JSON Manifest
         self.tab_json = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_json, text="  📄 Raw Manifest (JSON)  ")
 
         # Build individual tab views
         self._build_diag_tab()
+        self._build_tweaks_tab()
         self._build_perf_tab()
         self._build_sys_tab()
         self._build_json_tab()
@@ -412,6 +417,181 @@ class ProtoGoblinCommandApp:
 
         self.diag_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         diag_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _build_tweaks_tab(self):
+        # Header in Tweaks tab
+        banner_frame = tk.Frame(self.tab_tweaks, bg=self.card_bg)
+        banner_frame.pack(fill=tk.X, padx=15, pady=(15, 10))
+
+        lbl = tk.Label(
+            banner_frame,
+            text="Engine Command Intercepts & Graphics Tweaks",
+            font=("Segoe UI", 12, "bold"),
+            bg=self.card_bg,
+            fg="#58a6ff",
+        )
+        lbl.pack(anchor=tk.W)
+
+        self.tweaks_game_lbl = tk.Label(
+            banner_frame,
+            text="Toggle common performance drains to inject via launch commands, DXVK, or prefix overrides.",
+            font=("Segoe UI", 9),
+            bg=self.card_bg,
+            fg="#8b949e",
+        )
+        self.tweaks_game_lbl.pack(anchor=tk.W, pady=(2, 0))
+
+        # Scrollable container for tweak categories
+        container = tk.Frame(self.tab_tweaks, bg=self.card_bg)
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        # 1. Unreal Engine Tweaks Card
+        self.ue_frame = tk.LabelFrame(
+            container,
+            text=" Unreal Engine (UE4 / UE5) - Injected via -ExecCmds & Engine.ini ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.ue_frame.pack(fill=tk.X, pady=6)
+
+        self.var_ue_motion_blur = tk.BooleanVar(value=True)
+        self.var_ue_depth_of_field = tk.BooleanVar(value=True)
+        self.var_ue_chromatic_aberration = tk.BooleanVar(value=True)
+        self.var_ue_film_grain = tk.BooleanVar(value=True)
+        self.var_ue_lens_flare = tk.BooleanVar(value=False)
+        self.var_ue_volumetric_fog = tk.BooleanVar(value=False)
+        self.var_ue_lumen = tk.BooleanVar(value=False)
+
+        ue_checks = [
+            ("Disable Motion Blur (r.MotionBlurQuality 0, r.MotionBlur.Max 0)", self.var_ue_motion_blur),
+            ("Disable Depth of Field (r.DepthOfFieldQuality 0)", self.var_ue_depth_of_field),
+            ("Disable Chromatic Aberration (r.SceneColorFringeQuality 0)", self.var_ue_chromatic_aberration),
+            ("Disable Film Grain (r.FilmGrain 0)", self.var_ue_film_grain),
+            ("Disable Lens Flare (r.LensFlareQuality 0)", self.var_ue_lens_flare),
+            ("Disable Volumetric Fog (r.VolumetricFog 0)", self.var_ue_volumetric_fog),
+            ("Disable Lumen Reflections (r.Lumen.Reflections.Allow 0)", self.var_ue_lumen),
+        ]
+        for text, var in ue_checks:
+            cb = tk.Checkbutton(
+                self.ue_frame,
+                text=text,
+                variable=var,
+                bg="#161b22",
+                fg="#c9d1d9",
+                selectcolor="#0d1117",
+                activebackground="#161b22",
+                activeforeground="#58a6ff",
+            )
+            cb.pack(anchor=tk.W, pady=2)
+
+        # 2. Unity & Godot Engine Tweaks Card
+        self.engine_other_frame = tk.LabelFrame(
+            container,
+            text=" Unity & Godot Engine Runtime Overrides ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.engine_other_frame.pack(fill=tk.X, pady=6)
+
+        self.var_unity_native_jobs = tk.BooleanVar(value=True)
+        self.var_unity_disable_vr = tk.BooleanVar(value=True)
+        self.var_unity_vulkan = tk.BooleanVar(value=False)
+        self.var_godot_vsync = tk.BooleanVar(value=True)
+        self.var_godot_vulkan = tk.BooleanVar(value=True)
+
+        other_checks = [
+            ("Unity: Force Native Gfx Jobs (gfx-enable-native-gfx-jobs=1 in boot.config)", self.var_unity_native_jobs),
+            ("Unity: Disable Unused VR Subsystem (vr-enabled=0 in boot.config)", self.var_unity_disable_vr),
+            ("Unity: Force Vulkan Backend (-force-vulkan)", self.var_unity_vulkan),
+            ("Godot: Disable VSync (window/vsync/vsync_mode=0 in override.cfg)", self.var_godot_vsync),
+            ("Godot: Force Vulkan Forward+ Renderer (--rendering-driver vulkan)", self.var_godot_vulkan),
+        ]
+        for text, var in other_checks:
+            cb = tk.Checkbutton(
+                self.engine_other_frame,
+                text=text,
+                variable=var,
+                bg="#161b22",
+                fg="#c9d1d9",
+                selectcolor="#0d1117",
+                activebackground="#161b22",
+                activeforeground="#58a6ff",
+            )
+            cb.pack(anchor=tk.W, pady=2)
+
+        # 3. Translation Layer (DXVK / VKD3D-Proton) Card
+        self.dxvk_frame = tk.LabelFrame(
+            container,
+            text=" Vulkan Translation Layer (DXVK / VKD3D) Overrides ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.dxvk_frame.pack(fill=tk.X, pady=6)
+
+        self.var_gfx_vsync_off = tk.BooleanVar(value=True)
+        self.var_gfx_async_shader = tk.BooleanVar(value=True)
+        self.var_gfx_aniso16 = tk.BooleanVar(value=True)
+        self.var_gfx_low_latency = tk.BooleanVar(value=True)
+        self.var_gfx_max_fps = tk.StringVar(value="0")
+
+        dxvk_checks = [
+            ("Force VSync Off (dxgi.syncInterval = 0 for minimum presentation latency)", self.var_gfx_vsync_off),
+            ("Asynchronous Shader Compilation (DXVK_ASYNC=1 to prevent stutter)", self.var_gfx_async_shader),
+            ("Force 16x Anisotropic Filtering (d3d11.samplerAnisotropy = 16)", self.var_gfx_aniso16),
+            ("Low Latency Queue Mode (dxvk.lowLatency = true)", self.var_gfx_low_latency),
+        ]
+        for text, var in dxvk_checks:
+            cb = tk.Checkbutton(
+                self.dxvk_frame,
+                text=text,
+                variable=var,
+                bg="#161b22",
+                fg="#c9d1d9",
+                selectcolor="#0d1117",
+                activebackground="#161b22",
+                activeforeground="#58a6ff",
+            )
+            cb.pack(anchor=tk.W, pady=2)
+
+        fps_row = tk.Frame(self.dxvk_frame, bg="#161b22")
+        fps_row.pack(fill=tk.X, pady=(4, 0))
+        lbl_fps = tk.Label(fps_row, text="Target Frame Rate Cap (0 = uncapped):", bg="#161b22", fg="#c9d1d9")
+        lbl_fps.pack(side=tk.LEFT)
+        entry_fps = tk.Entry(
+            fps_row,
+            textvariable=self.var_gfx_max_fps,
+            width=8,
+            bg="#0d1117",
+            fg="#c9d1d9",
+            insertbackground="#fff",
+            relief=tk.FLAT,
+        )
+        entry_fps.pack(side=tk.LEFT, padx=10)
+
+        # Save Button in tweaks tab
+        btn_apply = tk.Button(
+            self.tab_tweaks,
+            text="💾 Save & Apply Profile TOML for Selected Game",
+            bg="#238636",
+            fg="#ffffff",
+            activebackground="#2ea043",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT,
+            padx=15,
+            pady=8,
+            command=self.generate_profile_toml,
+        )
+        btn_apply.pack(pady=12)
 
     def _build_perf_tab(self):
         self.perf_text = tk.Text(
@@ -514,10 +694,15 @@ class ProtoGoblinCommandApp:
         # Tab 1: Diagnostics & Suggestions
         t_name = os.path.basename(t_exe.get("path", "Target"))
         eng_info = tgt.get("engine") or {}
-        eng_tag = f" | Engine: {eng_info.get('engine', '').upper()}" if eng_info.get("detected") else ""
+        eng_name = eng_info.get("engine", "generic").upper()
+        eng_tag = f" | Engine: {eng_name}" if eng_info.get("detected") else ""
         self.diag_header_lbl.config(
             text=f"Target: {t_name}{eng_tag} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
         )
+        if hasattr(self, "tweaks_game_lbl"):
+            self.tweaks_game_lbl.config(
+                text=f"Active Game: {t_name} (AppID: {tgt.get('steam_appid') or '-'}, Engine: {eng_name})"
+            )
 
         for widget in self.diag_cards_container.winfo_children():
             widget.destroy()
@@ -723,7 +908,7 @@ class ProtoGoblinCommandApp:
 
         tgt = self.current_manifest.get("target", {})
         t_exe = tgt.get("target_executable", {}) or {}
-        steam_id = tgt.get("steam_appid") or "custom-game"
+        steam_id = str(tgt.get("steam_appid") or "custom-game")
         t_path = os.path.basename(t_exe.get("path", "Game.exe"))
 
         xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -731,36 +916,55 @@ class ProtoGoblinCommandApp:
         os.makedirs(profile_dir, exist_ok=True)
         profile_file = os.path.join(profile_dir, f"{steam_id}.toml")
 
-        toml_content = f"""# ProtoGoblin Per-Game Optimization Profile
-# Auto-generated from session: {self.current_manifest.get('session', {}).get('id')}
+        user_tweaks = {
+            "unreal": {
+                "disable_motion_blur": self.var_ue_motion_blur.get(),
+                "disable_depth_of_field": self.var_ue_depth_of_field.get(),
+                "disable_chromatic_aberration": self.var_ue_chromatic_aberration.get(),
+                "disable_film_grain": self.var_ue_film_grain.get(),
+                "disable_lens_flare": self.var_ue_lens_flare.get(),
+                "disable_bloom": self.var_ue_bloom.get() if hasattr(self, "var_ue_bloom") else False,
+                "disable_volumetric_fog": self.var_ue_volumetric_fog.get(),
+                "disable_lumen_reflections": self.var_ue_lumen.get(),
+            },
+            "unity": {
+                "native_gfx_jobs": self.var_unity_native_jobs.get(),
+                "disable_vr": self.var_unity_disable_vr.get(),
+                "force_vulkan": self.var_unity_vulkan.get(),
+            },
+            "godot": {
+                "rendering_driver": "vulkan" if self.var_godot_vulkan.get() else "opengl3",
+                "disable_vsync": self.var_godot_vsync.get(),
+                "max_fps": 0,
+            },
+            "graphics": {
+                "backend": self.current_manifest.get("graphics", {}).get("active_backend", "dxvk"),
+                "force_vsync": "off" if self.var_gfx_vsync_off.get() else "auto",
+                "max_fps": int(self.var_gfx_max_fps.get()) if self.var_gfx_max_fps.get().isdigit() else 0,
+                "anisotropic_filtering": 16 if self.var_gfx_aniso16.get() else 0,
+                "async_shader_compile": self.var_gfx_async_shader.get(),
+                "low_latency": self.var_gfx_low_latency.get(),
+            },
+        }
 
-[game]
-id = "{steam_id}"
-steam_appid = {steam_id if steam_id.isdigit() else 0}
-target_executable = "{t_path}"
-verified_sha256 = ["{t_exe.get('sha256', '')}"]
-pe_timestamp = "{t_exe.get('pe_timestamp', '')}"
-pe_size_of_image = {t_exe.get('pe_size_of_image', 0)}
+        eng_info = tgt.get("engine") or {}
+        sync_backend = self.current_manifest.get("synchronization", {}).get("sync_backend", "ntsync")
 
-[runtime]
-mode = "play"
-prune_unused_subsystems = true
-anticheat_policy = "passthrough"
-
-[graphics]
-backend = "{self.current_manifest.get('graphics', {}).get('active_backend', 'dxvk')}"
-frame_limit = 0
-
-[synchronization]
-preferred_backend = "{self.current_manifest.get('synchronization', {}).get('sync_backend', 'ntsync')}"
-"""
+        toml_content = protogoblin.EngineTweakManager.generate_profile_toml(
+            game_id=steam_id,
+            app_id=steam_id,
+            target_exe=t_path,
+            engine_info=eng_info,
+            sync_backend=sync_backend,
+            user_tweaks=user_tweaks,
+        )
 
         try:
             with open(profile_file, "w", encoding="utf-8") as pf:
                 pf.write(toml_content)
             messagebox.showinfo(
                 "Profile Created",
-                f"Generated optimization profile at:\n{profile_file}",
+                f"Generated optimization profile with active engine tweaks at:\n{profile_file}",
             )
         except OSError as e:
             messagebox.showerror("Error", f"Failed to save profile: {e}")
