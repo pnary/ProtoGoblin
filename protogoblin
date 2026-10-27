@@ -220,6 +220,28 @@ def cmd_show(args):
     if sh:
         print(f"  Shader Compiles:  {sh.get('count', 0)} ({sh.get('total_time_ms', 0):.1f} ms)")
 
+    # ROI Telemetry
+    roi = data.get("roi_telemetry")
+    if roi and roi.get("roi_enabled"):
+        print(f"\n{bold('[ROI Profiling & Performance]')}")
+        b_class = roi.get("bottleneck_classification", "balanced")
+        b_color = red if b_class in ["cpu_bound", "sync_bound"] else yellow if b_class == "gpu_bound" else green
+        print(f"  Classification:   {b_color(b_class.replace('_', ' ').upper())}")
+        print(f"  Capture Duration: {roi.get('roi_capture_duration_sec', 0):.2f} seconds")
+
+        fm = roi.get("frame_metrics")
+        if fm:
+            print(f"  Average FPS:      {bold(str(fm.get('fps_avg')))} (1% Low: {yellow(str(fm.get('fps_1_pct_low')))}, 0.1% Low: {red(str(fm.get('fps_0_1_pct_low')))})")
+            print(f"  Average FrameTime:{bold(str(fm.get('frametime_avg_ms')))} ms (p95: {fm.get('frametime_p95_ms')} ms, p99: {fm.get('frametime_p99_ms')} ms)")
+            print(f"  Pacing Jitter:    {fm.get('frametime_jitter_ms')} ms")
+            if fm.get("total_frames"):
+                print(f"  Frames Captured:  {fm.get('total_frames'):,}")
+
+        pacing = roi.get("pacing")
+        if pacing:
+            print(f"  CPU Load:         {pacing.get('cpu_busy_pct')}% (Wait: {pacing.get('cpu_wait_pct')}%)")
+            print(f"  GPU Load:         {pacing.get('gpu_busy_pct')}%")
+
     # Environment
     print(f"\n{bold('[Environment]')}")
     print(f"  Host OS:          {env.get('host_os', 'unknown')}")

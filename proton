@@ -2399,6 +2399,10 @@ class Session:
         if "vkbasalt" in self.compat_config:
             append_to_env_str(self.env, "VK_IMPLICIT_LAYER_PATH", g_proton.dist_dir + "share/vkbasalt/implicit_layer.d", ":")
 
+        mangohud_layer_dir = g_proton.dist_dir + "share/mangohud/implicit_layer.d"
+        if os.path.isdir(mangohud_layer_dir):
+            append_to_env_str(self.env, "VK_IMPLICIT_LAYER_PATH", mangohud_layer_dir, ":")
+
         self.check_environment("PYROVEIL", "pyroveil")
         if "pyroveil" in self.compat_config:
             append_to_env_str(self.env, "VK_IMPLICIT_LAYER_PATH", g_proton.dist_dir + "share/pyroveil/implicit_layer.d", ":")

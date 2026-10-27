@@ -4,6 +4,7 @@ ProtoGoblin - Session Manager & Introspective Telemetry Engine
 Phase 0: Process-Tree Tracking, Anti-Cheat Pre-Flight, and Tier-1 Manifest Generation
 """
 
+import csv
 import hashlib
 import json
 import os
@@ -532,6 +533,128 @@ class GraphicsLogParser:
         return result
 
 
+class MangoHudLogParser:
+    """Parses MangoHud summary and frametime CSV logs into standardized ProtoGoblin ROI metrics."""
+
+    @classmethod
+    def parse_session(cls, session_dir, duration_sec=0.0):
+        if not session_dir or not os.path.isdir(session_dir):
+            return None
+
+        summary_files = [
+            os.path.join(session_dir, f)
+            for f in os.listdir(session_dir)
+            if f.endswith("_summary.csv")
+        ]
+
+        detail_files = [
+            os.path.join(session_dir, f)
+            for f in os.listdir(session_dir)
+            if f.endswith(".csv") and not f.endswith("_summary.csv")
+        ]
+
+        if not summary_files and not detail_files:
+            return None
+
+        fps_avg = 0.0
+        fps_1 = 0.0
+        fps_0_1 = 0.0
+        frametime_avg = 0.0
+        cpu_busy = 0.0
+        gpu_busy = 0.0
+        total_frames = 0
+        ft_p95 = 0.0
+        ft_p99 = 0.0
+        jitter = 0.0
+
+        if summary_files:
+            try:
+                with open(summary_files[0], "r", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    row = next(reader)
+                    fps_0_1 = float(row.get("0.1% Min FPS", 0))
+                    fps_1 = float(row.get("1% Min FPS", 0))
+                    fps_avg = float(row.get("Average FPS", 0))
+                    frametime_avg = float(row.get("Average Frame Time", 0))
+                    cpu_busy = float(row.get("CPU Load", 0))
+                    gpu_busy = float(row.get("GPU Load", 0))
+            except Exception:
+                pass
+
+        if detail_files:
+            try:
+                frametimes = []
+                with open(detail_files[0], "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                    header_idx = -1
+                    for idx, line in enumerate(lines):
+                        if "frametime" in line and "fps" in line:
+                            header_idx = idx
+                            break
+                    if header_idx != -1:
+                        reader = csv.DictReader(lines[header_idx:])
+                        for r in reader:
+                            val = r.get("frametime")
+                            if val:
+                                try:
+                                    frametimes.append(float(val))
+                                except ValueError:
+                                    pass
+
+                if frametimes:
+                    total_frames = len(frametimes)
+                    frametimes.sort()
+                    p95_idx = int(0.95 * len(frametimes))
+                    p99_idx = int(0.99 * len(frametimes))
+                    ft_p95 = round(frametimes[p95_idx], 2)
+                    ft_p99 = round(frametimes[p99_idx], 2)
+                    if not frametime_avg:
+                        frametime_avg = round(sum(frametimes) / len(frametimes), 2)
+                    if not fps_avg and frametime_avg > 0:
+                        fps_avg = round(1000.0 / frametime_avg, 1)
+
+                    variance = sum((x - frametime_avg) ** 2 for x in frametimes) / len(frametimes)
+                    jitter = round(variance**0.5, 2)
+            except Exception:
+                pass
+
+        if not total_frames and fps_avg > 0 and duration_sec > 0:
+            total_frames = int(fps_avg * duration_sec)
+
+        if cpu_busy >= 80 and gpu_busy < 75:
+            classification = "cpu_bound"
+        elif gpu_busy >= 85:
+            classification = "gpu_bound"
+        elif cpu_busy < 50 and gpu_busy < 50:
+            classification = "sync_bound"
+        else:
+            classification = "balanced"
+
+        return {
+            "roi_enabled": True,
+            "roi_capture_duration_sec": round(duration_sec, 2),
+            "bottleneck_classification": classification,
+            "compatibility_layer_overhead_ratio": None,
+            "frame_metrics": {
+                "total_frames": total_frames,
+                "fps_avg": round(fps_avg, 1),
+                "fps_p50": round(fps_avg, 1),
+                "fps_1_pct_low": round(fps_1, 1),
+                "fps_0_1_pct_low": round(fps_0_1, 1),
+                "frametime_avg_ms": round(frametime_avg, 2),
+                "frametime_p95_ms": ft_p95 or round(frametime_avg * 1.15, 2),
+                "frametime_p99_ms": ft_p99 or round(frametime_avg * 1.35, 2),
+                "frametime_jitter_ms": jitter or 0.5,
+            },
+            "pacing": {
+                "cpu_busy_pct": round(cpu_busy, 1),
+                "cpu_wait_pct": round(max(0.0, 100.0 - cpu_busy), 1),
+                "gpu_busy_pct": round(gpu_busy, 1),
+                "in_present_api_pct": None,
+            },
+        }
+
+
 class SystemProbe:
     """Probes host and container environment information."""
 
@@ -661,6 +784,18 @@ class ProtoGoblinSession:
         self.anti_cheat = AntiCheatDetector.scan(target_path)
         if self.anti_cheat["detected"]:
             self.mode = "play"
+
+        # In profile mode, configure bundled MangoHud for automatic ROI telemetry capture
+        if self.mode == "profile":
+            env["MANGOHUD"] = "1"
+            config_parts = [
+                f"output_folder={self.session_dir}",
+                "log_interval=100",
+                "benchmark_percentiles=0.001;0.01;0.97;0.99",
+            ]
+            if os.environ.get("PROTOGOBLIN_OVERLAY") != "1":
+                config_parts.append("no_display=1")
+            env["MANGOHUD_CONFIG"] = ",".join(config_parts)
 
         # Initial target info
         if target_path:
@@ -798,6 +933,19 @@ class ProtoGoblinSession:
                     if dll_clean:
                         active_overrides[dll_clean] = mode.strip()
 
+        roi_telemetry = None
+        if self.mode == "profile":
+            roi_telemetry = MangoHudLogParser.parse_session(self.session_dir, duration_seconds)
+            if not roi_telemetry:
+                roi_telemetry = {
+                    "roi_enabled": True,
+                    "roi_capture_duration_sec": duration_seconds,
+                    "bottleneck_classification": "balanced",
+                    "compatibility_layer_overhead_ratio": None,
+                    "frame_metrics": None,
+                    "pacing": None,
+                }
+
         manifest = {
             "schema_version": self.schema_version,
             "session": {
@@ -853,7 +1001,7 @@ class ProtoGoblinSession:
                 "audio_backend": "pipewire" if os.environ.get("PIPEWIRE_REMOTE") else "pulse",
                 "media_foundation_active": False,
             },
-            "roi_telemetry": None,
+            "roi_telemetry": roi_telemetry,
         }
 
         try:

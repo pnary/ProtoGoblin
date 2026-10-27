@@ -136,3 +136,6 @@
 [submodule "dxvk-igdext"]
 	path = dxvk-igdext
 	url = https://github.com/GameTechDev/dxvk-igdext
+[submodule "vklayers/MangoHud"]
+	path = vklayers/MangoHud
+	url = https://github.com/flightlessmango/MangoHud.git
