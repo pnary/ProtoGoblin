@@ -49,14 +49,14 @@ Options:
   -h, --help              Show this help message and exit.
 
 Examples:
+  # Install from existing build folder or build by default if not found:
+  ./install_to_steam.sh
+
   # Quick developer install onto existing Proton:
   ./install_to_steam.sh --dev
 
-  # Full container build and install:
+  # Force full container build and install:
   ./install_to_steam.sh --build --engine=docker
-
-  # Install pre-built dist/ folder:
-  ./install_to_steam.sh
 EOF
 }
 
@@ -145,13 +145,25 @@ detect_engine() {
         echo "$CONTAINER_ENGINE"
         return
     fi
+    # Check if docker daemon is accessible
+    if command -v docker &>/dev/null && docker info &>/dev/null; then
+        echo "docker"
+        return
+    fi
+    # Check if podman is available and functional
+    if command -v podman &>/dev/null && podman info &>/dev/null; then
+        echo "podman"
+        return
+    fi
+    if command -v podman &>/dev/null; then
+        echo "podman"
+        return
+    fi
     if command -v docker &>/dev/null; then
         echo "docker"
-    elif command -v podman &>/dev/null; then
-        echo "podman"
-    else
-        echo ""
+        return
     fi
+    echo ""
 }
 
 # 3. Locate existing Proton for Dev Overlay mode
@@ -187,16 +199,18 @@ find_base_proton() {
 # 4. Perform Build / Sync Logic
 mkdir -p "$COMPAT_DIR"
 
-if [[ "$FORCE_BUILD" == true ]]; then
+build_from_source() {
+    local ENGINE
     ENGINE="$(detect_engine)"
     if [[ -z "$ENGINE" ]]; then
         log_err "Neither docker nor podman found. Install one or run with --dev overlay mode."
         exit 1
     fi
     log_info "Configuring and running full build via $ENGINE..."
-    BUILD_DIR="${SCRIPT_DIR}/build"
+    local BUILD_DIR="${SCRIPT_DIR}/build"
     mkdir -p "$BUILD_DIR"
     pushd "$BUILD_DIR" >/dev/null
+    chmod +x "${SCRIPT_DIR}/configure.sh" 2>/dev/null || true
     "${SCRIPT_DIR}/configure.sh" --build-name="$BUILD_NAME" --target-arch="$TARGET_ARCH" --container-engine="$ENGINE"
     make -j"$(nproc)"
     popd >/dev/null
@@ -204,6 +218,10 @@ if [[ "$FORCE_BUILD" == true ]]; then
     log_info "Installing built binaries to Steam..."
     mkdir -p "$TOOL_DIR"
     rsync --delete -arx "${BUILD_DIR}/dist/" "${TOOL_DIR}/"
+}
+
+if [[ "$FORCE_BUILD" == true ]]; then
+    build_from_source
 
 elif [[ "$DEV_OVERLAY" == true ]]; then
     DETECTED_BASE="$(find_base_proton)"
@@ -246,9 +264,16 @@ else
         mkdir -p "$TOOL_DIR"
         rsync --delete -arx "${SCRIPT_DIR}/dist/" "${TOOL_DIR}/"
     else
-        log_warn "No pre-built dist/ folder found."
-        log_info "Falling back to --dev overlay mode using an existing Proton base..."
-        exec "$0" --dev --name "$BUILD_NAME" --display-name "$DISPLAY_NAME"
+        DETECTED_BASE="$(find_base_proton)"
+        if [[ -n "$DETECTED_BASE" ]]; then
+            log_warn "No pre-built dist/ folder found."
+            log_info "Defaulting to --dev overlay mode using existing Proton base (${DETECTED_BASE})..."
+            exec "$0" --dev --name "$BUILD_NAME" --display-name "$DISPLAY_NAME"
+        else
+            log_warn "No build folder found and no existing Proton base detected."
+            log_info "Building from source..."
+            build_from_source
+        fi
     fi
 fi
 
