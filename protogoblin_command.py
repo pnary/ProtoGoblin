@@ -6,8 +6,10 @@ ProtoGoblin Command - Graphical Optimization & Diagnostic Dashboard
 import glob
 import json
 import os
+import platform
 import sys
 import tkinter as tk
+from datetime import datetime, timezone
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # Ensure local modules can be loaded
@@ -486,8 +488,161 @@ def format_diff_report(diff):
     return "\n".join(lines)
 
 
+def generate_debug_dump(manifest=None, base_dir=None):
+    """Generates a comprehensive diagnostic dictionary for developer debugging."""
+    if not base_dir:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Host info
+    host_info = {
+        "python_version": sys.version.replace("\n", " "),
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "host_os": protogoblin.SystemProbe.get_host_os(),
+        "cpu": protogoblin.SystemProbe.get_cpu_info(),
+        "ram_total_mb": protogoblin.SystemProbe.get_ram_total_mb(),
+        "container_runtime": protogoblin.SystemProbe.get_container_runtime(),
+    }
+
+    # Tool installation info
+    tool_files = {
+        "base_dir": base_dir,
+        "proton": os.path.isfile(os.path.join(base_dir, "proton")),
+        "protogoblin.py": os.path.isfile(os.path.join(base_dir, "protogoblin.py")),
+        "protogoblin_command.py": os.path.isfile(os.path.join(base_dir, "protogoblin_command.py")),
+        "presets_json": os.path.isfile(os.path.join(base_dir, "share", "protogoblin", "protogoblin_presets.json")),
+        "staging_sync_fix_dll_64": os.path.isfile(os.path.join(base_dir, "share", "protogoblin", "lib64", "d3d11.dll")),
+        "staging_sync_fix_source": os.path.isdir(os.path.join(base_dir, "vklayers", "staging-sync-fix")),
+    }
+
+    compat_paths = [
+        os.path.expanduser("~/.local/share/Steam/compatibilitytools.d"),
+        os.path.expanduser("~/.steam/root/compatibilitytools.d"),
+    ]
+    existing_compat = [p for p in compat_paths if os.path.isdir(p)]
+
+    interesting_prefixes = (
+        "PROTOGOBLIN", "STEAM", "Steam", "PROTON", "WINE", "DXVK", "VKD3D", "MANGOHUD", "PRESSURE_VESSEL"
+    )
+    env_dump = {
+        k: v for k, v in sorted(os.environ.items()) if any(k.startswith(pfx) for pfx in interesting_prefixes)
+    }
+
+    session_summary = None
+    if manifest:
+        sess = manifest.get("session") or {}
+        tgt = manifest.get("target") or {}
+        sub = manifest.get("subsystems") or {}
+        gfx = manifest.get("graphics") or {}
+        sync = manifest.get("synchronization") or {}
+        roi = manifest.get("roi_telemetry") or manifest.get("roi") or {}
+
+        session_summary = {
+            "session_id": sess.get("id"),
+            "mode": sess.get("mode"),
+            "dev_mode": sess.get("dev_mode", False),
+            "steam_appid": tgt.get("steam_appid"),
+            "target_executable": tgt.get("target_executable"),
+            "engine": tgt.get("engine"),
+            "subsystems_loaded": sub.get("loaded", []),
+            "subsystems_unutilized": sub.get("unutilized", []),
+            "subsystems_pruned": sub.get("pruned", []),
+            "active_backend": gfx.get("active_backend"),
+            "sync_backend": sync.get("sync_backend"),
+            "bottleneck": roi.get("bottleneck_classification"),
+            "frame_metrics": roi.get("frame_metrics"),
+        }
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "host": host_info,
+        "tool_files": tool_files,
+        "steam_compatibility_dirs": existing_compat,
+        "environment": env_dump,
+        "active_session": session_summary,
+    }
+
+
+def format_debug_dump(dump):
+    """Formats diagnostic dump dictionary into a human-readable ASCII report."""
+    h = dump["host"]
+    t = dump["tool_files"]
+    lines = [
+        "=" * 82,
+        " PROTOGOBLIN DEVELOPER DIAGNOSTIC DUMP",
+        "=" * 82,
+        f" Timestamp:           {dump['timestamp']}",
+        "",
+        " HOST ENVIRONMENT",
+        "-" * 82,
+        f" Host OS:             {h['host_os']}",
+        f" Python:              {h['python_version'][:60]}",
+        f" Python Binary:       {h['python_executable']}",
+        f" Architecture:        {h['platform']} ({h['machine']})",
+        f" CPU Info:            {h['cpu'].get('model')} ({h['cpu'].get('logical_cores')} logical cores)",
+        f" RAM Total:           {h['ram_total_mb']} MB",
+        f" Container Runtime:   {h['container_runtime'] or 'None (Native Host)'}",
+        "",
+        " PROTOGOBLIN INSTALLATION & ASSETS",
+        "-" * 82,
+        f" Repository Root:     {t['base_dir']}",
+        f" Proton Launcher:     {'FOUND' if t['proton'] else 'NOT FOUND'}",
+        f" protogoblin.py:      {'FOUND' if t['protogoblin.py'] else 'NOT FOUND'}",
+        f" Goblin Commander:    {'FOUND' if t['protogoblin_command.py'] else 'NOT FOUND'}",
+        f" Presets Database:    {'FOUND' if t['presets_json'] else 'NOT FOUND'}",
+        f" Staging Sync Wrapper:{'BUILT DLL FOUND' if t['staging_sync_fix_dll_64'] else ('SOURCE FOUND' if t['staging_sync_fix_source'] else 'NOT FOUND')}",
+        f" Steam Compat Dirs:   {', '.join(dump['steam_compatibility_dirs']) or 'None'}",
+        "",
+    ]
+
+    s = dump.get("active_session")
+    if s:
+        lines.extend([
+            " ACTIVE SELECTED SESSION INTERNALS",
+            "-" * 82,
+            f" Session ID:          {s['session_id']} [Dev Mode: {'ON' if s.get('dev_mode') else 'OFF'}]",
+            f" Runtime Mode:        {s['mode']}",
+            f" Steam AppID:         {s['steam_appid']}",
+            f" Target Executable:   {(s.get('target_executable') or {}).get('path', 'Unknown')}",
+            f" Detected Engine:     {s.get('engine', {}).get('engine', 'Unknown')} (confidence: {s.get('engine', {}).get('confidence', 0.0)})",
+            f" Graphics Backend:    {s.get('active_backend', 'Unknown')}",
+            f" Sync Backend:        {s.get('sync_backend', 'Unknown')}",
+            f" Subsystems Loaded:   {', '.join(s.get('subsystems_loaded', []))}",
+            f" Subsystems Pruned:   {', '.join(s.get('subsystems_pruned', [])) or 'None'}",
+            f" Subsystems Unused:   {', '.join(s.get('subsystems_unutilized', []))}",
+            f" Bottleneck:          {s.get('bottleneck') or 'None'}",
+            "",
+        ])
+    else:
+        lines.extend([
+            " ACTIVE SELECTED SESSION INTERNALS",
+            "-" * 82,
+            " No game session currently selected in Goblin Commander.",
+            "",
+        ])
+
+    lines.extend([
+        " ACTIVE ENVIRONMENT VARIABLES",
+        "-" * 82,
+    ])
+    if dump.get("environment"):
+        for k in sorted(dump["environment"].keys()):
+            lines.append(f" {k:<25} = {dump['environment'][k]}")
+    else:
+        lines.append(" No relevant ProtoGoblin / Wine / Proton environment flags set.")
+
+    lines.extend(["=" * 82, ""])
+    return "\n".join(lines)
+
+
 class ProtoGoblinCommandApp:
     """Main Application Window for ProtoGoblin Command GUI."""
+
+    compute_session_diff = staticmethod(compute_session_diff)
+    format_diff_report = staticmethod(format_diff_report)
+    generate_debug_dump = staticmethod(generate_debug_dump)
+    format_debug_dump = staticmethod(format_debug_dump)
 
     def __init__(self, root, initial_session_id=None):
         self.root = root
@@ -570,6 +725,20 @@ class ProtoGoblinCommandApp:
             command=self.toggle_selected_game_mode,
         )
         self.btn_toggle_mode.pack(side=tk.RIGHT, padx=5, pady=10)
+
+        self.dev_mode = False
+        self.btn_dev_mode = tk.Button(
+            header,
+            text="🛠️ Dev Mode: OFF",
+            bg="#21262d",
+            fg="#8b949e",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.toggle_dev_mode,
+        )
+        self.btn_dev_mode.pack(side=tk.RIGHT, padx=5, pady=10)
 
         btn_add_game = tk.Button(
             header,
@@ -692,6 +861,9 @@ class ProtoGoblinCommandApp:
         self.tab_json = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_json, text="  📄 Raw Manifest (JSON)  ")
 
+        # Tab 7: Developer Debug & Internals (hidden until Dev Mode is enabled)
+        self.tab_dev = tk.Frame(self.notebook, bg=self.card_bg)
+
         # Build individual tab views
         self._build_diag_tab()
         self._build_tweaks_tab()
@@ -699,6 +871,7 @@ class ProtoGoblinCommandApp:
         self._build_diff_tab()
         self._build_sys_tab()
         self._build_json_tab()
+        self._build_dev_tab()
 
     def _build_diag_tab(self):
         # Summary Header
@@ -1062,6 +1235,9 @@ class ProtoGoblinCommandApp:
             self.combo_session_b.current(cur_a)
             self.run_session_diff()
 
+        if getattr(self, "dev_mode", False):
+            self.refresh_dev_tab()
+
     def _load_manifest_by_index(self, idx):
         paths = getattr(self, "filtered_manifest_paths", self.manifest_paths)
         if 0 <= idx < len(paths):
@@ -1121,6 +1297,183 @@ class ProtoGoblinCommandApp:
         )
         self.json_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+    def _build_dev_tab(self):
+        ctrl_bar = tk.Frame(self.tab_dev, bg="#161b22", padx=15, pady=10)
+        ctrl_bar.pack(fill=tk.X)
+
+        lbl = tk.Label(
+            ctrl_bar,
+            text="Developer Diagnostic Information & Runtime Internals",
+            font=("Segoe UI", 11, "bold"),
+            bg="#161b22",
+            fg="#a371f7",
+        )
+        lbl.pack(side=tk.LEFT)
+
+        btn_refresh = tk.Button(
+            ctrl_bar,
+            text="🔄 Refresh",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=10,
+            pady=3,
+            command=self.refresh_dev_tab,
+        )
+        btn_refresh.pack(side=tk.RIGHT, padx=4)
+
+        btn_copy = tk.Button(
+            ctrl_bar,
+            text="📋 Copy to Clipboard",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=10,
+            pady=3,
+            command=self.copy_dev_dump_to_clipboard,
+        )
+        btn_copy.pack(side=tk.RIGHT, padx=4)
+
+        btn_export = tk.Button(
+            ctrl_bar,
+            text="💾 Save Dump...",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=10,
+            pady=3,
+            command=self.export_debug_dump,
+        )
+        btn_export.pack(side=tk.RIGHT, padx=4)
+
+        btn_toggle_game_dev = tk.Button(
+            ctrl_bar,
+            text="⚡ Toggle Profile Dev Logging",
+            bg="#6e40c9",
+            fg="#ffffff",
+            activebackground="#8957e5",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=10,
+            pady=3,
+            command=self.toggle_game_profile_dev_mode,
+        )
+        btn_toggle_game_dev.pack(side=tk.RIGHT, padx=4)
+
+        text_container = tk.Frame(self.tab_dev, bg="#0d1117")
+        text_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        scrollbar = tk.Scrollbar(text_container)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.dev_text = tk.Text(
+            text_container,
+            bg="#0d1117",
+            fg="#c9d1d9",
+            font=("Consolas", 10),
+            relief=tk.FLAT,
+            padx=15,
+            pady=15,
+            yscrollcommand=scrollbar.set,
+        )
+        self.dev_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.dev_text.yview)
+
+    def toggle_dev_mode(self):
+        self.dev_mode = not self.dev_mode
+        if self.dev_mode:
+            self.btn_dev_mode.config(text="🛠️ Dev Mode: ON", bg="#6e40c9", fg="#ffffff")
+            tab_ids = [str(t) for t in self.notebook.tabs()]
+            if str(self.tab_dev) not in tab_ids:
+                self.notebook.add(self.tab_dev, text="  🛠️ Dev Debug & Internals  ")
+            self.notebook.select(self.tab_dev)
+            self.refresh_dev_tab()
+        else:
+            self.btn_dev_mode.config(text="🛠️ Dev Mode: OFF", bg="#21262d", fg="#8b949e")
+            try:
+                self.notebook.forget(self.tab_dev)
+            except Exception:
+                pass
+
+    def refresh_dev_tab(self):
+        if not hasattr(self, "dev_text"):
+            return
+        dump = generate_debug_dump(manifest=self.current_manifest)
+        formatted = format_debug_dump(dump)
+        self.dev_text.delete("1.0", tk.END)
+        self.dev_text.insert(tk.END, formatted)
+
+    def copy_dev_dump_to_clipboard(self):
+        if not hasattr(self, "dev_text"):
+            return
+        dump_text = self.dev_text.get("1.0", tk.END).strip()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(dump_text)
+        messagebox.showinfo("Clipboard", "Developer diagnostic dump copied to clipboard!")
+
+    def export_debug_dump(self):
+        dump = generate_debug_dump(manifest=self.current_manifest)
+        fpath = filedialog.asksaveasfilename(
+            title="Save Developer Diagnostic Dump",
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("Text Files", "*.txt"), ("All Files", "*.*")],
+            initialfile=f"protogoblin_debug_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json",
+        )
+        if not fpath:
+            return
+        try:
+            if fpath.endswith(".txt"):
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(format_debug_dump(dump))
+            else:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(dump, f, indent=2)
+            messagebox.showinfo("Export Successful", f"Saved debug dump to:\n{fpath}")
+        except OSError as e:
+            messagebox.showerror("Export Failed", f"Failed to save debug dump: {e}")
+
+    def toggle_game_profile_dev_mode(self):
+        if not self.current_manifest:
+            messagebox.showwarning("Warning", "Select a session first to configure its profile dev mode.")
+            return
+
+        tgt = self.current_manifest.get("target") or {}
+        app_id = tgt.get("steam_appid")
+        t_exe = os.path.basename((tgt.get("target_executable") or {}).get("path", "unknown.exe"))
+
+        if not app_id:
+            messagebox.showwarning("Warning", "Selected session does not have a valid AppID.")
+            return
+
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        p_file = os.path.join(xdg_config, "protogoblin", "games", f"{app_id}.toml")
+
+        current_dev = False
+        if os.path.isfile(p_file):
+            prof = protogoblin.EngineTweakManager.load_profile(p_file)
+            current_dev = bool((prof or {}).get("runtime", {}).get("dev_mode", False))
+
+        new_dev = not current_dev
+        toml_content = protogoblin.EngineTweakManager.generate_profile_toml(
+            game_id=str(app_id),
+            app_id=app_id,
+            target_exe=t_exe,
+            user_tweaks={"dev_mode": new_dev},
+        )
+        os.makedirs(os.path.dirname(p_file), exist_ok=True)
+        with open(p_file, "w", encoding="utf-8") as f:
+            f.write(toml_content)
+
+        state_str = "ENABLED (verbose logs will be written to session directory)" if new_dev else "DISABLED"
+        messagebox.showinfo("Profile Dev Mode", f"Dev mode logging for {t_exe} ({app_id}) is now {state_str}.\nProfile saved to: {p_file}")
+        self.refresh_dev_tab()
+
     def refresh_sessions(self):
         """Scans for all utilization.json files across ProtoGoblin sessions."""
         xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
@@ -1168,6 +1521,9 @@ class ProtoGoblinCommandApp:
                 self.combo_session_b.current(0)
             self.run_session_diff()
 
+        if getattr(self, "dev_mode", False):
+            self.refresh_dev_tab()
+
         if self.sessions_listbox.size() > 0:
             self.sessions_listbox.select_set(0)
             self.on_session_selected(None)
@@ -1197,6 +1553,9 @@ class ProtoGoblinCommandApp:
             else:
                 self.combo_session_a.current(idx)
             self.run_session_diff()
+
+        if getattr(self, "dev_mode", False):
+            self.refresh_dev_tab()
 
     def _render_manifest_data(self, data, path):
         sess = data.get("session", {})

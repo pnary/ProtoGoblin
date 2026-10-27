@@ -22,6 +22,8 @@ from protogoblin_command import (
     DiagnosticAdvisor,
     compute_session_diff,
     format_diff_report,
+    generate_debug_dump,
+    format_debug_dump,
 )
 
 
@@ -712,6 +714,92 @@ class TestSubsystemPruning(unittest.TestCase):
         self.assertIn("mfplat=d", env.get("WINEDLLOVERRIDES", ""))
         self.assertIn("d3d12=d", env.get("WINEDLLOVERRIDES", ""))
         self.assertEqual(env.get("PROTON_NO_VR"), "1")
+
+
+class TestDevModeAndDebugDump(unittest.TestCase):
+    def test_generate_debug_dump(self):
+        dump = generate_debug_dump(manifest=None)
+        self.assertIn("host", dump)
+        self.assertIn("tool_files", dump)
+        self.assertIn("environment", dump)
+        self.assertIn("python_version", dump["host"])
+
+        report = format_debug_dump(dump)
+        self.assertIn("PROTOGOBLIN DEVELOPER DIAGNOSTIC DUMP", report)
+        self.assertIn("HOST ENVIRONMENT", report)
+        self.assertIn("PROTOGOBLIN INSTALLATION & ASSETS", report)
+
+    def test_generate_debug_dump_with_session(self):
+        manifest = {
+            "session": {"id": "test_sess_1", "mode": "play", "dev_mode": True},
+            "target": {
+                "steam_appid": "12345",
+                "target_executable": {"path": "C:\\Games\\TestGame.exe"},
+                "engine": {"engine": "unreal_5", "confidence": 0.95},
+            },
+            "subsystems": {
+                "loaded": ["d3d11", "dxgi"],
+                "unutilized": ["openvr"],
+                "pruned": ["vr"],
+            },
+        }
+        dump = generate_debug_dump(manifest=manifest)
+        self.assertIsNotNone(dump.get("active_session"))
+        self.assertEqual(dump["active_session"]["session_id"], "test_sess_1")
+        self.assertTrue(dump["active_session"]["dev_mode"])
+        self.assertIn("vr", dump["active_session"]["subsystems_pruned"])
+
+        report = format_debug_dump(dump)
+        self.assertIn("ACTIVE SELECTED SESSION INTERNALS", report)
+        self.assertIn("test_sess_1 [Dev Mode: ON]", report)
+        self.assertIn("Subsystems Pruned:   vr", report)
+
+    def test_dev_mode_session_logging_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = td
+            try:
+                sess = ProtoGoblinSession(steam_appid=777, mode="dev")
+                self.assertTrue(sess.dev_mode)
+
+                env = {"WINEDLLOVERRIDES": "d3d11=n,b", "PATH": "/usr/bin"}
+                sess.pre_flight(["MyGame.exe"], env)
+
+                debug_log = os.path.join(sess.session_dir, "protogoblin_debug.log")
+                debug_env = os.path.join(sess.session_dir, "debug_env.json")
+                debug_argv = os.path.join(sess.session_dir, "debug_cmdline.json")
+
+                self.assertTrue(os.path.isfile(debug_log))
+                self.assertTrue(os.path.isfile(debug_env))
+                self.assertTrue(os.path.isfile(debug_argv))
+
+                with open(debug_log, "r", encoding="utf-8") as f:
+                    log_content = f.read()
+                self.assertIn("ProtoGoblin Dev Debug Log", log_content)
+                self.assertIn("Session ID:", log_content)
+                self.assertIn("MyGame.exe", log_content)
+
+                manifest = sess.post_flight(exit_code=0, env=env)
+                self.assertTrue(manifest["session"]["dev_mode"])
+
+                with open(debug_log, "r", encoding="utf-8") as f:
+                    updated_log = f.read()
+                self.assertIn("Post-Flight Completion", updated_log)
+                self.assertIn("Exit Code:", updated_log)
+            finally:
+                if old_xdg:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+
+    def test_generate_profile_toml_dev_mode(self):
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="88888",
+            app_id=88888,
+            target_exe="Game.exe",
+            user_tweaks={"dev_mode": True},
+        )
+        self.assertIn("dev_mode = true", toml_text)
 
 
 if __name__ == "__main__":

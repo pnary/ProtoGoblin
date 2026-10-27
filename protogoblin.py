@@ -507,6 +507,11 @@ class EngineTweakManager:
             or tweaks.get("protogoblin", {}).get("mode")
             or "play"
         )
+        dev_mode = bool(
+            tweaks.get("dev_mode")
+            or tweaks.get("runtime", {}).get("dev_mode")
+            or False
+        )
 
         lines = [
             "# ProtoGoblin Per-Game Optimization Profile",
@@ -520,6 +525,7 @@ class EngineTweakManager:
             "",
             "[runtime]",
             f'mode = "{runtime_mode}"',
+            f'dev_mode = {"true" if dev_mode else "false"}',
             "prune_unused_subsystems = true",
             'anticheat_policy = "passthrough"',
             "",
@@ -1350,6 +1356,10 @@ class ProtoGoblinSession:
         self.peak_thread_count = 1
         self.tracker = None
         self.pruned_subsystems = []
+        self.dev_mode = (
+            mode == "dev"
+            or os.environ.get("PROTOGOBLIN_DEV", "0").lower() in ["1", "true", "yes"]
+        )
 
     def _resolve_version(self):
         v_file = os.path.join(self.proton_dir, "VERSION")
@@ -1587,9 +1597,38 @@ class ProtoGoblinSession:
                     if a not in argv:
                         argv.append(a)
 
+        if profile and profile.get("runtime", {}).get("dev_mode"):
+            self.dev_mode = True
+
         # Active Subsystem Pruning in Play Mode based on prior profiling telemetry
         if not is_raw:
             self.prune_subsystems(env, profile=profile)
+
+        # Developer Debug Logging & Artifact Dump
+        if self.dev_mode:
+            env["PROTOGOBLIN_DEV"] = "1"
+            try:
+                os.makedirs(self.session_dir, exist_ok=True)
+                with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "w", encoding="utf-8") as f:
+                    f.write("=== ProtoGoblin Dev Debug Log ===\n")
+                    f.write(f"Session ID:         {self.session_id}\n")
+                    f.write(f"Timestamp:          {self.start_iso}\n")
+                    f.write(f"Steam AppID:        {self.steam_appid}\n")
+                    f.write(f"Target Executable:  {target_path}\n")
+                    f.write(f"Engine Detected:    {self.detected_engine.get('engine')} (confidence: {self.detected_engine.get('confidence')})\n")
+                    f.write(f"Anti-Cheat Policy:  {self.anti_cheat}\n")
+                    f.write(f"Pruned Subsystems:  {self.pruned_subsystems}\n")
+                    f.write(f"Final Arguments:    {argv}\n")
+                    f.write("\n--- Environment Overrides ---\n")
+                    for k, v in sorted(env.items()):
+                        if any(k.startswith(pfx) for pfx in ["PROTOGOBLIN", "WINEDLL", "DXVK", "VKD3D", "PROTON", "MANGOHUD"]):
+                            f.write(f"{k}={v}\n")
+                with open(os.path.join(self.session_dir, "debug_env.json"), "w", encoding="utf-8") as f:
+                    json.dump(dict(env), f, indent=2)
+                with open(os.path.join(self.session_dir, "debug_cmdline.json"), "w", encoding="utf-8") as f:
+                    json.dump({"argv": argv}, f, indent=2)
+            except Exception:
+                pass
 
         return argv
 
@@ -1736,6 +1775,7 @@ class ProtoGoblinSession:
             "session": {
                 "id": self.session_id,
                 "mode": self.mode,
+                "dev_mode": self.dev_mode,
                 "start_time": self.start_iso,
                 "end_time": end_iso,
                 "duration_seconds": duration_seconds,
@@ -1798,6 +1838,17 @@ class ProtoGoblinSession:
             sys.stderr.write(f"[ProtoGoblin] Emitted Tier-1 manifest: {self.manifest_path}\n")
         except OSError as e:
             sys.stderr.write(f"[ProtoGoblin] Failed to write manifest: {e}\n")
+
+        if self.dev_mode:
+            try:
+                with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "a", encoding="utf-8") as f:
+                    f.write("\n=== Post-Flight Completion ===\n")
+                    f.write(f"Exit Code:        {exit_code}\n")
+                    f.write(f"Duration:         {duration_seconds:.2f}s\n")
+                    f.write(f"Process Count:    {self.process_tree_count}\n")
+                    f.write(f"Peak Threads:     {self.peak_thread_count}\n")
+            except Exception:
+                pass
 
         return manifest
 
