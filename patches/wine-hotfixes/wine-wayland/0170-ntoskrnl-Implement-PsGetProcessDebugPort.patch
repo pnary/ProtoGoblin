@@ -1,0 +1,63 @@
+From d5bfa47faeaed550a9628eae76734733dbe84994 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Sun, 28 Jun 2026 20:48:33 -0400
+Subject: [PATCH 170/285] ntoskrnl: Implement PsGetProcessDebugPort.
+
+---
+
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index 6e94d17..f7f086d 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -2519,6 +2519,9 @@ static void *create_process_object( HANDLE handle )
+     status = NtQueryInformationProcess( handle, ProcessWow64Information, &process->peb32, sizeof(process->peb32), NULL );
+     if (status) process->peb32 = NULL;
+ 
++    status = NtQueryInformationProcess( handle, ProcessDebugPort, &process->debug_port, sizeof(process->debug_port), NULL );
++    if (status) process->debug_port = 0;
++
+     return process;
+ }
+ 
+@@ -2615,6 +2618,15 @@ const char *WINAPI PsGetProcessImageFileName( PEPROCESS process )
+     return process->image_name;
+ }
+ 
++/*********************************************************************
++ *           PsGetProcessDebugPort    (NTOSKRNL.@)
++ */
++DWORD_PTR WINAPI PsGetProcessDebugPort( PEPROCESS process )
++{
++    TRACE("%p\n", process);
++    return process->debug_port;
++}
++
+ /*********************************************************************
+  *           PsGetProcessExitStatus    (NTOSKRNL.@)
+  */
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index 3b34f13..fcefabe 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -927,7 +927,7 @@
+ @ stub PsGetJobSessionId
+ @ stub PsGetJobUIRestrictionsClass
+ @ stdcall PsGetProcessCreateTimeQuadPart(ptr)
+-@ stub PsGetProcessDebugPort
++@ stdcall PsGetProcessDebugPort(ptr)
+ @ stub PsGetProcessExitProcessCalled
+ @ stdcall PsGetProcessExitStatus(ptr)
+ @ stub PsGetProcessExitTime
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl_private.h b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+index 01a2958..3f5181e 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl_private.h
++++ b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+@@ -57,6 +57,7 @@ struct _EPROCESS
+     PROCESS_BASIC_INFORMATION info;
+     KERNEL_USER_TIMES times;
+     PEB32 *peb32;
++    DWORD_PTR debug_port;
+     ULONG session_id;
+     char image_name[15];
+ };

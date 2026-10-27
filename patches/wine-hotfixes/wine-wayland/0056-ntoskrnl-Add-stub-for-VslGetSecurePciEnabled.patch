@@ -1,0 +1,37 @@
+From 8e1a708d2011f4bcb972691d6890687269ff3681 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Tue, 22 Jul 2025 15:22:55 -0400
+Subject: [PATCH 056/285] ntoskrnl: Add stub for VslGetSecurePciEnabled.
+
+---
+
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index 9db2f89..23f7fe2 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -5053,6 +5053,12 @@ PEPROCESS WINAPI IoThreadToProcess(PETHREAD thread)
+     return thread->kthread.process;
+ }
+ 
++BOOL WINAPI VslGetSecurePciEnabled(void)
++{
++    FIXME("stub!\n");
++    return TRUE;
++}
++
+ /*****************************************************
+  *           DllMain
+  */
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index c9faa61..a56411e 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -1393,6 +1393,7 @@
+ @ stub VfFailDriver
+ @ stub VfFailSystemBIOS
+ @ stub VfIsVerificationEnabled
++@ stdcall VslGetSecurePciEnabled()
+ @ stub WRITE_REGISTER_BUFFER_UCHAR
+ @ stub WRITE_REGISTER_BUFFER_ULONG
+ @ stub WRITE_REGISTER_BUFFER_USHORT
