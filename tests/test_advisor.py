@@ -11,7 +11,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from protogoblin import EngineDetector, EngineTweakManager, ProtoGoblinSession
+from protogoblin import (
+    EngineDetector,
+    EngineTweakManager,
+    PresetDatabase,
+    ProtoGoblinSession,
+)
 from protogoblin_command import DiagnosticAdvisor
 
 
@@ -106,6 +111,33 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         m_godot = {"target": {"engine": {"detected": True, "engine": "godot"}}}
         s_godot = DiagnosticAdvisor.analyze(m_godot)
         self.assertTrue(any("Godot Engine Detected" in s["title"] for s in s_godot))
+
+    def test_intra_frame_staging_sync_stall_detection(self):
+        # Simulation of Gust / Atelier staging sync flaw: low GPU and low CPU despite active gameplay
+        manifest = {
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "sync_bound",
+                "frame_metrics": {"fps_avg": 34.0, "fps_1_pct_low": 18.0},
+                "pacing": {"gpu_busy_pct": 32.0, "cpu_busy_pct": 28.0},
+            }
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        titles = [s["title"] for s in suggestions]
+        self.assertTrue(any("Intra-Frame CPU-GPU Staging Synchronization Stall" in t for t in titles))
+        self.assertTrue(any(s["level"] == "error" for s in suggestions))
+
+    def test_preset_database_and_gust_flaw_flag(self):
+        # Check PresetDatabase loads Atelier Ryza (1121560)
+        preset = PresetDatabase.get_preset("1121560")
+        self.assertIsNotNone(preset)
+        self.assertIn("gust_d3d11_staging_sync_stall", preset.get("known_issues", []))
+
+        # Check DiagnosticAdvisor flags the documented flaw for this Steam AppID
+        manifest = {"target": {"steam_appid": 1121560}}
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        titles = [s["title"] for s in suggestions]
+        self.assertTrue(any("Documented Gust Engine D3D11 Sync Stall" in t for t in titles))
 
 
 class TestEngineDetector(unittest.TestCase):

@@ -119,14 +119,26 @@ class DiagnosticAdvisor:
                     }
                 )
             elif b_class == "sync_bound":
-                suggestions.append(
-                    {
-                        "level": "warning",
-                        "title": "Thread Starvation / Synchronization Waits",
-                        "description": "Both CPU and GPU reported low utilization despite active gameplay. Threads are likely blocked on internal locks or waiting on timer intervals.",
-                        "action": "Test adaptive wait policies or check if frame rate limiter is set below monitor refresh rate.",
-                    }
-                )
+                gpu_load = pacing.get("gpu_busy_pct", 0)
+                cpu_load = pacing.get("cpu_busy_pct", 0)
+                if gpu_load < 50 and cpu_load < 55:
+                    suggestions.append(
+                        {
+                            "level": "error",
+                            "title": "Intra-Frame CPU-GPU Staging Synchronization Stall",
+                            "description": f"Severe GPU under-utilization ({gpu_load}%) and low CPU utilization ({cpu_load}%) observed during active rendering. This signature indicates recurring intra-frame staging buffer readbacks (Map/CopyResource cycles) where the render thread repeatedly flushes and stalls on GPU fences multiple times per frame. (Common engine flaw in Gust/Koei Tecmo titles and naive D3D9->D3D11 ports).",
+                            "action": "Deploy shadow staging buffer wrapper (Atelier Sync Fix) and force dxgi.syncInterval = 0 in profile.toml.",
+                        }
+                    )
+                else:
+                    suggestions.append(
+                        {
+                            "level": "warning",
+                            "title": "Thread Starvation / Synchronization Waits",
+                            "description": "Both CPU and GPU reported low utilization despite active gameplay. Threads are likely blocked on internal locks or waiting on timer intervals.",
+                            "action": "Test adaptive wait policies or check if frame rate limiter is set below monitor refresh rate.",
+                        }
+                    )
 
             # Frame Pacing & 1% Lows
             fps_avg = fm.get("fps_avg", 0)
@@ -200,6 +212,36 @@ class DiagnosticAdvisor:
                     "action": "Apply Godot-specific launch options in profile.toml.",
                 }
             )
+
+        # 8. ProtonDB Preset Community Recommendations & Known Flaws
+        app_id = tgt.get("steam_appid")
+        preset = protogoblin.PresetDatabase.get_preset(app_id) if app_id else None
+        if preset:
+            known_issues = preset.get("known_issues", [])
+            tier = preset.get("tier", "unknown")
+            recs = preset.get("recommended_tweaks", {})
+            if "gust_d3d11_staging_sync_stall" in known_issues:
+                suggestions.append(
+                    {
+                        "level": "error",
+                        "title": "Documented Gust Engine D3D11 Sync Stall (ProtonDB)",
+                        "description": "ProtonDB reports confirm this title has the severe Gust D3D11 staging buffer sync defect. Without a shadow staging wrapper, the GPU sits mostly idle and FPS drops heavily.",
+                        "action": "Apply Atelier Sync Fix (doitsujin/TellowKrinkle) and set dxgi.syncInterval = 0.",
+                    }
+                )
+            if recs.get("env") or recs.get("args"):
+                opts_summary = []
+                for k, v in recs.get("env", {}).items():
+                    opts_summary.append(f"{k}={v}")
+                opts_summary.extend(recs.get("args", []))
+                suggestions.append(
+                    {
+                        "level": "info",
+                        "title": f"ProtonDB Community Profile Available (Rating: {tier.upper()})",
+                        "description": f"Mined from {preset.get('reports', 1)} community reports. Recommended parameters: {' '.join(opts_summary)}.",
+                        "action": "Click 'Generate Profile TOML' to automatically merge community launch options into game config.",
+                    }
+                )
 
         return suggestions
 

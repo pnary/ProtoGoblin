@@ -17,6 +17,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 class PEInfo:
     """Helper to inspect Windows PE binaries without external dependencies."""
@@ -344,6 +346,42 @@ class EngineDetector:
             "confidence": 0.0,
             "details": {},
         }
+
+
+class PresetDatabase:
+    """Provides ProtonDB community presets, ratings, and known fixes for Steam AppIDs."""
+
+    _CACHE = None
+
+    @classmethod
+    def get_preset(cls, app_id):
+        if not app_id:
+            return None
+        db = cls.get_all()
+        return db.get(str(app_id))
+
+    @classmethod
+    def get_all(cls):
+        if cls._CACHE is not None:
+            return cls._CACHE
+
+        cls._CACHE = {}
+        candidate_paths = [
+            os.path.join(SCRIPT_DIR, "share", "protogoblin", "protogoblin_presets.json"),
+            os.path.join(SCRIPT_DIR, "..", "share", "protogoblin", "protogoblin_presets.json"),
+            os.path.join(SCRIPT_DIR, "protogoblin_presets.json"),
+            os.path.expanduser("~/.local/share/protogoblin/protogoblin_presets.json"),
+            "/usr/share/protogoblin/protogoblin_presets.json",
+        ]
+        for p in candidate_paths:
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        cls._CACHE = json.load(f)
+                    break
+                except Exception:
+                    pass
+        return cls._CACHE
 
 
 class EngineTweakManager:

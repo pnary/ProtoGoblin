@@ -1838,6 +1838,13 @@ DIST_COPY_TARGETS := $(FILELOCK_TARGET) $(PROTON_PY_TARGET) \
                      $(PROTOGOBLIN_COMMAND_TARGET) \
                      $(PROTON37_TRACKED_FILES_TARGET) $(USER_SETTINGS_PY_TARGET)
 
+PROTOGOBLIN_PRESETS_TARGET := $(DST_DIR)/share/protogoblin/protogoblin_presets.json
+$(PROTOGOBLIN_PRESETS_TARGET): $(SRCDIR)/share/protogoblin/protogoblin_presets.json | $(DST_DIR)
+	mkdir -p $(DST_DIR)/share/protogoblin
+	cp -a $< $@
+
+all-dist: $(PROTOGOBLIN_PRESETS_TARGET)
+
 ifeq ($(ENABLE_WOW64),1)
 USER_SETTINGS_WOW64_PY_TARGET := $(addprefix $(DST_BASE)/,user_settings.py)
 $(USER_SETTINGS_WOW64_PY_TARGET): | $(DST_DIR)
