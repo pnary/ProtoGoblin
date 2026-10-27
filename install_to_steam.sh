@@ -239,7 +239,16 @@ elif [[ "$DEV_OVERLAY" == true ]]; then
     cp -f "${SCRIPT_DIR}/proton" "${TOOL_DIR}/proton"
     cp -f "${SCRIPT_DIR}/protogoblin.py" "${TOOL_DIR}/protogoblin.py"
     cp -f "${SCRIPT_DIR}/protogoblin_command.py" "${TOOL_DIR}/protogoblin_command.py"
-    chmod +x "${TOOL_DIR}/proton" "${TOOL_DIR}/protogoblin.py" "${TOOL_DIR}/protogoblin_command.py"
+    cp -f "${SCRIPT_DIR}/protogoblin" "${TOOL_DIR}/protogoblin"
+    cp -f "${SCRIPT_DIR}/utilities.py" "${TOOL_DIR}/utilities.py"
+    cp -f "${SCRIPT_DIR}/vulkan.py" "${TOOL_DIR}/vulkan.py"
+    if [[ -f "${SCRIPT_DIR}/filelock.py" ]]; then
+        cp -f "${SCRIPT_DIR}/filelock.py" "${TOOL_DIR}/filelock.py"
+    fi
+    if [[ -f "${SCRIPT_DIR}/default_pfx.py" ]]; then
+        cp -f "${SCRIPT_DIR}/default_pfx.py" "${TOOL_DIR}/default_pfx.py"
+    fi
+    chmod +x "${TOOL_DIR}/proton" "${TOOL_DIR}/protogoblin.py" "${TOOL_DIR}/protogoblin_command.py" "${TOOL_DIR}/protogoblin"
 
     # Install presets database
     mkdir -p "${TOOL_DIR}/share/protogoblin"
@@ -304,6 +313,9 @@ if [[ -f "${TOOL_DIR}/protogoblin.py" ]]; then
 fi
 if [[ -f "${TOOL_DIR}/protogoblin_command.py" ]]; then
     chmod +x "${TOOL_DIR}/protogoblin_command.py"
+fi
+if [[ -f "${TOOL_DIR}/protogoblin" ]]; then
+    chmod +x "${TOOL_DIR}/protogoblin"
 fi
 
 echo ""
