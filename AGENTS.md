@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Development Scope & Compatibility Philosophy
+
+Until stated otherwise by the project owner, ProtoGoblin is a **forward-only project**. We do **NOT** care about backward compatibility. Do not retain legacy shims, obsolete Proton/Wine workarounds, or deprecated interfaces unless explicitly required for the target forward implementation.
+
 ## Project Structure & Module Organization
 
 GE-Proton combines Wine, graphics translation layers, and game compatibility fixes. The root `proton` Python launcher and supporting `.py` files manage runtime behavior. Native integration code lives in `steam_helper/`, `lsteamclient/`, `umu_helper/`, and `wineopenxr/`. Dependencies such as `wine/`, `dxvk/`, `vkd3d-proton/`, and `protonfixes/` are Git submodules. Keep dependency changes scoped and intentional.
