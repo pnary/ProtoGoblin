@@ -179,6 +179,11 @@ def cmd_show(args):
     print(f"  Steam AppID:      {tgt.get('steam_appid') or dim('None')}")
     t_exe = tgt.get("target_executable", {}) or {}
     print(f"  Target Executable: {green(t_exe.get('path', 'unknown'))}")
+    engine = tgt.get("engine") or {}
+    if engine.get("detected"):
+        eng_name = engine.get("engine", "unknown").upper()
+        ver_str = f" {engine.get('version')}" if engine.get("version") else ""
+        print(f"  Game Engine:      {cyan(eng_name + ver_str)}")
     print(f"  Architecture:     {cyan(t_exe.get('arch', 'unknown'))}")
     print(f"  SHA-256:          {t_exe.get('sha256', 'unknown')}")
     if t_exe.get("pe_timestamp"):
@@ -278,6 +283,7 @@ def cmd_inspect(args):
         return 1
 
     ac = protogoblin.AntiCheatDetector.scan(path)
+    engine = protogoblin.EngineDetector.detect(path)
 
     print(bold(f"\nPE Inspection: {path}"))
     print(dim("─" * 60))
@@ -286,6 +292,18 @@ def cmd_inspect(args):
     print(f"  PE Timestamp:     {pe.get('pe_timestamp') or 'None'}")
     if pe.get("pe_size_of_image"):
         print(f"  PE Image Size:    {pe.get('pe_size_of_image'):,} bytes")
+
+    print(f"\n{bold('Game Engine Detection:')}")
+    if engine.get("detected"):
+        eng_name = engine.get("engine", "unknown").upper()
+        ver = f" ({engine.get('version')})" if engine.get("version") else ""
+        print(f"  Detected Engine:  {cyan(eng_name + ver)}")
+        details = engine.get("details", {})
+        if details:
+            dt_str = ", ".join(f"{k}={v}" for k, v in details.items())
+            print(f"  Details:          {dim(dt_str)}")
+    else:
+        print(f"  Detected Engine:  {dim('Custom / In-house')}")
 
     print(f"\n{bold('Anti-Cheat Scan:')}")
     if ac.get("detected"):

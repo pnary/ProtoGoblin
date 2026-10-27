@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Unit tests for ProtoGoblin Command DiagnosticAdvisor
+Unit tests for ProtoGoblin Command DiagnosticAdvisor and EngineDetector
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from protogoblin import EngineDetector, ProtoGoblinSession
 from protogoblin_command import DiagnosticAdvisor
 
 
@@ -87,6 +90,128 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         titles = [s["title"] for s in suggestions]
         self.assertTrue(any("Subsystem Pruning Available" in t for t in titles))
         self.assertTrue(any(s["level"] == "info" for s in suggestions))
+
+    def test_engine_recommendations(self):
+        # Unreal Engine 5
+        m_ue5 = {"target": {"engine": {"detected": True, "engine": "unreal_5"}}}
+        s_ue5 = DiagnosticAdvisor.analyze(m_ue5)
+        self.assertTrue(any("Unreal Engine 5 Optimization Profile" in s["title"] for s in s_ue5))
+
+        # Unity
+        m_unity = {"target": {"engine": {"detected": True, "engine": "unity", "details": {"backend": "il2cpp"}}}}
+        s_unity = DiagnosticAdvisor.analyze(m_unity)
+        self.assertTrue(any("Unity Engine Detected (il2cpp)" in s["title"] for s in s_unity))
+
+        # Godot
+        m_godot = {"target": {"engine": {"detected": True, "engine": "godot"}}}
+        s_godot = DiagnosticAdvisor.analyze(m_godot)
+        self.assertTrue(any("Godot Engine Detected" in s["title"] for s in s_godot))
+
+
+class TestEngineDetector(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_detect_unity(self):
+        game_exe = os.path.join(self.test_dir, "MyGame.exe")
+        with open(game_exe, "wb") as f:
+            f.write(b"MZ\x90\x00" + b"\x00" * 100)
+
+        # Create Unity _Data directory with il2cpp_data
+        data_dir = os.path.join(self.test_dir, "MyGame_Data", "il2cpp_data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        res = EngineDetector.detect(game_exe)
+        self.assertTrue(res["detected"])
+        self.assertEqual(res["engine"], "unity")
+        self.assertEqual(res["details"]["backend"], "il2cpp")
+
+    def test_detect_godot(self):
+        game_exe = os.path.join(self.test_dir, "Brotato.exe")
+        with open(game_exe, "wb") as f:
+            f.write(b"MZ\x90\x00" + b"\x00" * 100)
+
+        # Sibling PCK file
+        pck_file = os.path.join(self.test_dir, "Brotato.pck")
+        with open(pck_file, "wb") as f:
+            f.write(b"GDPC\x00\x00\x00\x00")
+
+        res = EngineDetector.detect(game_exe)
+        self.assertTrue(res["detected"])
+        self.assertEqual(res["engine"], "godot")
+        self.assertEqual(res["details"]["pck_file"], "Brotato.pck")
+
+    def test_detect_unreal_engine_5(self):
+        # UE directory hierarchy: <GameRoot>/Binaries/Win64/<Game>-Win64-Shipping.exe
+        bin_dir = os.path.join(self.test_dir, "Game", "Binaries", "Win64")
+        paks_dir = os.path.join(self.test_dir, "Game", "Content", "Paks")
+        os.makedirs(bin_dir, exist_ok=True)
+        os.makedirs(paks_dir, exist_ok=True)
+
+        game_exe = os.path.join(bin_dir, "Game-Win64-Shipping.exe")
+        with open(game_exe, "wb") as f:
+            f.write(b"MZ\x90\x00" + b"\x00" * 100 + b"FEngineLoop" + b"\x00" * 50)
+
+        # Create UE5 Zen Store container file
+        with open(os.path.join(paks_dir, "global.ucas"), "wb") as f:
+            f.write(b"UCAS")
+
+        res = EngineDetector.detect(game_exe)
+        self.assertTrue(res["detected"])
+        self.assertEqual(res["engine"], "unreal_5")
+        self.assertTrue(res["details"]["has_zen_store"])
+
+
+class TestProfileBannerHUD(unittest.TestCase):
+    def test_profile_mode_mangohud_banner(self):
+        old_mode = os.environ.get("PROTOGOBLIN_MODE")
+        old_overlay = os.environ.get("PROTOGOBLIN_OVERLAY")
+        try:
+            os.environ["PROTOGOBLIN_MODE"] = "profile"
+            os.environ.pop("PROTOGOBLIN_OVERLAY", None)
+            session = ProtoGoblinSession()
+            env = {}
+            session.pre_flight(["dummy.exe"], env)
+
+            self.assertEqual(env.get("MANGOHUD"), "1")
+            config = env.get("MANGOHUD_CONFIG", "")
+            self.assertIn("custom_text=Goblin-ing", config)
+            self.assertIn("position=top-right", config)
+            self.assertIn("text_color=39FF14", config)
+        finally:
+            if old_mode is not None:
+                os.environ["PROTOGOBLIN_MODE"] = old_mode
+            else:
+                os.environ.pop("PROTOGOBLIN_MODE", None)
+            if old_overlay is not None:
+                os.environ["PROTOGOBLIN_OVERLAY"] = old_overlay
+
+    def test_profile_mode_overlay_disabled(self):
+        old_mode = os.environ.get("PROTOGOBLIN_MODE")
+        old_overlay = os.environ.get("PROTOGOBLIN_OVERLAY")
+        try:
+            os.environ["PROTOGOBLIN_MODE"] = "profile"
+            os.environ["PROTOGOBLIN_OVERLAY"] = "0"
+            session = ProtoGoblinSession()
+            env = {}
+            session.pre_flight(["dummy.exe"], env)
+
+            self.assertEqual(env.get("MANGOHUD"), "1")
+            config = env.get("MANGOHUD_CONFIG", "")
+            self.assertIn("no_display=1", config)
+            self.assertNotIn("custom_text=Goblin-ing", config)
+        finally:
+            if old_mode is not None:
+                os.environ["PROTOGOBLIN_MODE"] = old_mode
+            else:
+                os.environ.pop("PROTOGOBLIN_MODE", None)
+            if old_overlay is not None:
+                os.environ["PROTOGOBLIN_OVERLAY"] = old_overlay
+            else:
+                os.environ.pop("PROTOGOBLIN_OVERLAY", None)
 
 
 if __name__ == "__main__":

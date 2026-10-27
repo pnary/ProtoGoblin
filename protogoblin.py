@@ -176,6 +176,176 @@ class AntiCheatDetector:
         }
 
 
+class EngineDetector:
+    """Detects commercial and open-source game engines (UE4, UE5, Unity, Godot, Source 2)."""
+
+    @classmethod
+    def detect(cls, target_path, search_dirs=None):
+        if not target_path or not os.path.exists(target_path):
+            return {
+                "detected": False,
+                "engine": "unknown",
+                "version": None,
+                "confidence": 0.0,
+                "details": {},
+            }
+
+        target_path = os.path.abspath(target_path)
+        base_dir = os.path.dirname(target_path)
+        base_name = os.path.basename(target_path)
+        stem = os.path.splitext(base_name)[0]
+
+        # 1. Check Unity
+        unity_data_dirs = [
+            os.path.join(base_dir, f"{stem}_Data"),
+            os.path.join(base_dir, "Data"),
+        ]
+        unity_player_dll = os.path.join(base_dir, "UnityPlayer.dll")
+        unity_player_x64 = os.path.join(base_dir, "UnityPlayer_Win64.dll")
+        unity_crash = os.path.join(base_dir, "UnityCrashHandler64.exe")
+
+        is_unity = (
+            any(os.path.isdir(d) for d in unity_data_dirs)
+            or os.path.isfile(unity_player_dll)
+            or os.path.isfile(unity_player_x64)
+            or os.path.isfile(unity_crash)
+        )
+        if is_unity:
+            backend = "unknown"
+            has_il2cpp = False
+            for d in unity_data_dirs:
+                if os.path.isdir(os.path.join(d, "il2cpp_data")) or os.path.isfile(
+                    os.path.join(d, "il2cpp_data", "Metadata", "global-metadata.dat")
+                ):
+                    has_il2cpp = True
+                    backend = "il2cpp"
+                    break
+                elif os.path.isdir(os.path.join(d, "Managed")) or os.path.isdir(
+                    os.path.join(base_dir, "MonoBleedingEdge")
+                ):
+                    backend = "mono"
+            return {
+                "detected": True,
+                "engine": "unity",
+                "version": None,
+                "confidence": 1.0,
+                "details": {
+                    "backend": backend,
+                    "has_il2cpp": has_il2cpp,
+                },
+            }
+
+        # 2. Check Godot
+        sibling_pck = os.path.join(base_dir, f"{stem}.pck")
+        sibling_zip = os.path.join(base_dir, f"{stem}.zip")
+        is_godot = os.path.isfile(sibling_pck) or os.path.isfile(sibling_zip)
+
+        godot_magic = False
+        godot_str = False
+        try:
+            size = os.path.getsize(target_path)
+            with open(target_path, "rb") as f:
+                if size > 1024:
+                    f.seek(size - 1024)
+                    tail = f.read(1024)
+                    if b"GDPC" in tail:
+                        godot_magic = True
+                f.seek(0)
+                head = f.read(min(size, 2 * 1024 * 1024))
+                if b"Godot Engine" in head or b"GDPC" in head:
+                    godot_str = True
+        except Exception:
+            pass
+
+        if is_godot or godot_magic or godot_str:
+            return {
+                "detected": True,
+                "engine": "godot",
+                "version": None,
+                "confidence": 0.95 if (godot_magic or is_godot) else 0.8,
+                "details": {
+                    "pck_file": os.path.basename(sibling_pck) if os.path.isfile(sibling_pck) else None,
+                    "embedded_pck": godot_magic,
+                },
+            }
+
+        # 3. Check Unreal Engine (UE4 / UE5)
+        is_ue = False
+        ue_ver = "unreal"
+        has_zen_store = False
+        paks_found = False
+
+        norm_path = target_path.replace("\\", "/")
+        if "/binaries/win64" in norm_path.lower() or "/binaries/win32" in norm_path.lower():
+            is_ue = True
+
+        parent_1 = os.path.dirname(base_dir)
+        parent_2 = os.path.dirname(parent_1)
+        for search_root in [base_dir, parent_1, parent_2]:
+            paks_dir = os.path.join(search_root, "Content", "Paks")
+            if os.path.isdir(paks_dir):
+                is_ue = True
+                paks_found = True
+                try:
+                    for f in os.listdir(paks_dir):
+                        if f.endswith(".ucas") or f.endswith(".utoc"):
+                            has_zen_store = True
+                            ue_ver = "unreal_5"
+                            break
+                        elif f.endswith(".pak") and ue_ver != "unreal_5":
+                            ue_ver = "unreal_4"
+                except OSError:
+                    pass
+                break
+
+        if not is_ue or ue_ver == "unreal":
+            try:
+                with open(target_path, "rb") as f:
+                    content = f.read(min(os.path.getsize(target_path), 4 * 1024 * 1024))
+                    if b"FEngineLoop" in content or b"Epic Games, Inc." in content or b"UnrealEngine" in content:
+                        is_ue = True
+                        if b"UE5" in content or b"UnrealEditor-5" in content or has_zen_store:
+                            ue_ver = "unreal_5"
+                        elif ue_ver == "unreal":
+                            ue_ver = "unreal_4"
+            except Exception:
+                pass
+
+        if is_ue:
+            if has_zen_store:
+                ue_ver = "unreal_5"
+            elif ue_ver == "unreal":
+                ue_ver = "unreal_4"
+            return {
+                "detected": True,
+                "engine": ue_ver,
+                "version": "5.x" if ue_ver == "unreal_5" else "4.x",
+                "confidence": 0.95,
+                "details": {
+                    "has_zen_store": has_zen_store,
+                    "has_paks": paks_found,
+                },
+            }
+
+        # 4. Check Source 2 / Source
+        if os.path.isfile(os.path.join(base_dir, "tier0.dll")) and os.path.isfile(os.path.join(base_dir, "vscript.dll")):
+            return {
+                "detected": True,
+                "engine": "source2",
+                "version": None,
+                "confidence": 0.95,
+                "details": {},
+            }
+
+        return {
+            "detected": False,
+            "engine": "unknown",
+            "version": None,
+            "confidence": 0.0,
+            "details": {},
+        }
+
+
 class ProcessTreeTracker:
     """Monitors the active process tree under Linux /proc to identify intermediate launchers and child game binaries."""
 
@@ -747,6 +917,7 @@ class ProtoGoblinSession:
         self.manifest_path = os.path.join(self.session_dir, "utilization.json")
 
         self.anti_cheat = {"detected": False, "provider": None, "passthrough_enforced": False}
+        self.detected_engine = {"detected": False, "engine": "unknown", "version": None, "confidence": 0.0, "details": {}}
         self.initial_exe = None
         self.launcher_exe = None
         self.target_exe = None
@@ -785,7 +956,7 @@ class ProtoGoblinSession:
         if self.anti_cheat["detected"]:
             self.mode = "play"
 
-        # In profile mode, configure bundled MangoHud for automatic ROI telemetry capture
+        # In profile mode, configure bundled MangoHud for automatic ROI telemetry capture and HUD status
         if self.mode == "profile":
             env["MANGOHUD"] = "1"
             config_parts = [
@@ -793,11 +964,22 @@ class ProtoGoblinSession:
                 "log_interval=100",
                 "benchmark_percentiles=0.001;0.01;0.97;0.99",
             ]
-            if os.environ.get("PROTOGOBLIN_OVERLAY") != "1":
+            if os.environ.get("PROTOGOBLIN_OVERLAY") == "0":
                 config_parts.append("no_display=1")
+            else:
+                config_parts.extend([
+                    "legacy_layout=0",
+                    "position=top-right",
+                    "custom_text=Goblin-ing",
+                    "text_color=39FF14",
+                    "font_size=26",
+                    "background_alpha=0.0",
+                    "text_outline=1",
+                    "text_outline_color=000000",
+                ])
             env["MANGOHUD_CONFIG"] = ",".join(config_parts)
 
-        # Initial target info
+        # Initial target info and engine detection
         if target_path:
             pe_data = PEInfo.inspect(target_path)
             self.target_exe = pe_data or {
@@ -807,6 +989,7 @@ class ProtoGoblinSession:
                 "pe_timestamp": None,
                 "pe_size_of_image": None,
             }
+            self.detected_engine = EngineDetector.detect(target_path)
         else:
             self.target_exe = {
                 "path": "unknown",
@@ -814,6 +997,13 @@ class ProtoGoblinSession:
                 "arch": "x86_64",
                 "pe_timestamp": None,
                 "pe_size_of_image": None,
+            }
+            self.detected_engine = {
+                "detected": False,
+                "engine": "unknown",
+                "version": None,
+                "confidence": 0.0,
+                "details": {},
             }
 
     def start_process_tree_monitor(self, root_pid, prefix_dir=None):
@@ -946,6 +1136,14 @@ class ProtoGoblinSession:
                     "pacing": None,
                 }
 
+        # Refine detected engine if process tree monitor identified a child payload
+        if self.target_exe and self.target_exe.get("path") and self.target_exe.get("path") != "unknown":
+            resolved = self.target_exe.get("path")
+            if resolved != self.initial_exe:
+                refined_engine = EngineDetector.detect(resolved)
+                if refined_engine.get("detected"):
+                    self.detected_engine = refined_engine
+
         manifest = {
             "schema_version": self.schema_version,
             "session": {
@@ -960,6 +1158,7 @@ class ProtoGoblinSession:
                 "steam_appid": self.steam_appid,
                 "launcher_executable": self.launcher_exe,
                 "target_executable": self.target_exe,
+                "engine": self.detected_engine,
                 "exit_code": exit_code,
                 "process_tree_count": self.process_tree_count,
                 "peak_thread_count": self.peak_thread_count,

@@ -167,6 +167,40 @@ class DiagnosticAdvisor:
                 }
             )
 
+        # 7. Engine-Specific Optimization Profiles
+        engine = tgt.get("engine") or {}
+        eng_name = engine.get("engine", "")
+        if eng_name in ["unreal_4", "unreal_5"]:
+            ver_label = "Unreal Engine 5" if eng_name == "unreal_5" else "Unreal Engine 4"
+            suggestions.append(
+                {
+                    "level": "info",
+                    "title": f"{ver_label} Optimization Profile Available",
+                    "description": f"Game runs on {ver_label}. ProtoGoblin can tune internal Scalability/Engine.ini variables (e.g. r.Nanite, r.Lumen, r.ScreenPercentage) and apply DXVK asynchronous pipeline compilation.",
+                    "action": "Use profile.toml [engine.unreal] section to adjust engine-specific Cvars.",
+                }
+            )
+        elif eng_name == "unity":
+            details = engine.get("details", {})
+            backend = details.get("backend", "runtime")
+            suggestions.append(
+                {
+                    "level": "info",
+                    "title": f"Unity Engine Detected ({backend})",
+                    "description": f"Game runs on Unity ({backend}). Prefix boot.config can be tuned to enable native graphics jobs and bypass unused runtime debugger checks.",
+                    "action": "Ensure gfx-enable-native-gfx-jobs=1 is configured in prefix boot.config.",
+                }
+            )
+        elif eng_name == "godot":
+            suggestions.append(
+                {
+                    "level": "info",
+                    "title": "Godot Engine Detected",
+                    "description": "Game runs on Godot Engine. Custom override.cfg or CLI launch arguments can directly enforce Vulkan renderers or fixed physics framerates.",
+                    "action": "Apply Godot-specific launch options in profile.toml.",
+                }
+            )
+
         return suggestions
 
 
@@ -479,8 +513,10 @@ class ProtoGoblinCommandApp:
 
         # Tab 1: Diagnostics & Suggestions
         t_name = os.path.basename(t_exe.get("path", "Target"))
+        eng_info = tgt.get("engine") or {}
+        eng_tag = f" | Engine: {eng_info.get('engine', '').upper()}" if eng_info.get("detected") else ""
         self.diag_header_lbl.config(
-            text=f"Target: {t_name} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
+            text=f"Target: {t_name}{eng_tag} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
         )
 
         for widget in self.diag_cards_container.winfo_children():
@@ -663,9 +699,15 @@ class ProtoGoblinCommandApp:
 
         pe = protogoblin.PEInfo.inspect(f)
         ac = protogoblin.AntiCheatDetector.scan(f)
+        engine = protogoblin.EngineDetector.detect(f)
+
+        eng_str = engine.get("engine", "Unknown").upper() if engine.get("detected") else "Custom / In-house"
+        if engine.get("version"):
+            eng_str += f" ({engine['version']})"
 
         msg = (
             f"File: {f}\n\n"
+            f"Game Engine: {eng_str}\n"
             f"Architecture: {pe.get('arch', 'unknown')}\n"
             f"SHA256: {pe.get('sha256', 'unknown')}\n"
             f"PE Timestamp: {pe.get('pe_timestamp') or 'None'}\n"
