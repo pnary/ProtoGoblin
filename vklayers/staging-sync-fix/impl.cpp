@@ -22,6 +22,94 @@ static std::unordered_map<ID3D11Resource*, StagingResourceTracker> g_stagingReso
 static std::mutex g_cbLock;
 static std::unordered_map<ID3D11Resource*, ConstantBufferTracker> g_constantBuffers;
 
+// Diagnostic & Introspective Live Telemetry Counters
+static std::atomic<uint64_t> g_cbUpdatesTotal{0};
+static std::atomic<uint64_t> g_cbUpdatesRedundant{0};
+static std::atomic<uint64_t> g_stateBindsTotal{0};
+static std::atomic<uint64_t> g_stateBindsRedundant{0};
+static std::atomic<uint64_t> g_swapchainResizesTotal{0};
+static std::atomic<uint64_t> g_swapchainResizesIdentical{0};
+static std::atomic<uint64_t> g_swapchainResizesRapid{0};
+
+static bool IsStateDedupEnabled() {
+    static int s_val = -1;
+    if (s_val == -1) {
+        char buf[16] = {0};
+        if (GetEnvironmentVariableA("PROTOGOBLIN_STATE_DEDUP", buf, sizeof(buf))) {
+            s_val = (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y') ? 1 : 0;
+        } else {
+            s_val = 0;
+        }
+    }
+    return s_val == 1;
+}
+
+static bool IsSwapchainDebounceEnabled() {
+    static int s_val = -1;
+    if (s_val == -1) {
+        char buf[16] = {0};
+        if (GetEnvironmentVariableA("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE", buf, sizeof(buf))) {
+            s_val = (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y') ? 1 : 0;
+        } else {
+            s_val = 0;
+        }
+    }
+    return s_val == 1;
+}
+
+static void FlushStatsInternal() {
+    char sessionDir[MAX_PATH] = {0};
+    if (!GetEnvironmentVariableA("PROTOGOBLIN_SESSION_DIR", sessionDir, sizeof(sessionDir))) {
+        return;
+    }
+
+    char outPath[MAX_PATH];
+    snprintf(outPath, sizeof(outPath), "%s\\protogoblin_d3d11_stats.json", sessionDir);
+
+    FILE* fp = fopen(outPath, "w");
+    if (!fp) return;
+
+    uint64_t cbTotal = g_cbUpdatesTotal.load(std::memory_order_relaxed);
+    uint64_t cbRedundant = g_cbUpdatesRedundant.load(std::memory_order_relaxed);
+    double cbRate = cbTotal > 0 ? (double)cbRedundant * 100.0 / (double)cbTotal : 0.0;
+
+    uint64_t stateTotal = g_stateBindsTotal.load(std::memory_order_relaxed);
+    uint64_t stateRedundant = g_stateBindsRedundant.load(std::memory_order_relaxed);
+    double stateRate = stateTotal > 0 ? (double)stateRedundant * 100.0 / (double)stateTotal : 0.0;
+
+    uint64_t scTotal = g_swapchainResizesTotal.load(std::memory_order_relaxed);
+    uint64_t scIdentical = g_swapchainResizesIdentical.load(std::memory_order_relaxed);
+    uint64_t scRapid = g_swapchainResizesRapid.load(std::memory_order_relaxed);
+
+    bool stateDedup = IsStateDedupEnabled();
+    bool scDebounce = IsSwapchainDebounceEnabled();
+
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"state_dedup_active\": %s,\n", stateDedup ? "true" : "false");
+    fprintf(fp, "  \"swapchain_debounce_active\": %s,\n", scDebounce ? "true" : "false");
+    fprintf(fp, "  \"constant_buffers\": {\n");
+    fprintf(fp, "    \"updates_total\": %llu,\n", (unsigned long long)cbTotal);
+    fprintf(fp, "    \"updates_redundant\": %llu,\n", (unsigned long long)cbRedundant);
+    fprintf(fp, "    \"redundancy_rate_pct\": %.2f\n", cbRate);
+    fprintf(fp, "  },\n");
+    fprintf(fp, "  \"pipeline_states\": {\n");
+    fprintf(fp, "    \"binds_total\": %llu,\n", (unsigned long long)stateTotal);
+    fprintf(fp, "    \"binds_redundant\": %llu,\n", (unsigned long long)stateRedundant);
+    fprintf(fp, "    \"redundancy_rate_pct\": %.2f\n", stateRate);
+    fprintf(fp, "  },\n");
+    fprintf(fp, "  \"swapchain\": {\n");
+    fprintf(fp, "    \"resizes_total\": %llu,\n", (unsigned long long)scTotal);
+    fprintf(fp, "    \"resizes_identical\": %llu,\n", (unsigned long long)scIdentical);
+    fprintf(fp, "    \"resizes_rapid\": %llu\n", (unsigned long long)scRapid);
+    fprintf(fp, "  }\n");
+    fprintf(fp, "}\n");
+    fclose(fp);
+}
+
+void FlushStats() {
+    FlushStatsInternal();
+}
+
 class WrappedContext : public ID3D11DeviceContext {
 private:
     ULONG m_refCount;
@@ -188,6 +276,7 @@ public:
 
     // D3D11 Context pass-through wrappers
     void STDMETHODCALLTYPE VSSetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers) override {
+        g_stateBindsTotal.fetch_add(1, std::memory_order_relaxed);
         if (ppConstantBuffers && StartSlot + NumBuffers <= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
             bool allMatch = true;
             for (UINT i = 0; i < NumBuffers; ++i) {
@@ -196,9 +285,13 @@ public:
                     break;
                 }
             }
-            if (allMatch) return;
-            for (UINT i = 0; i < NumBuffers; ++i) {
-                m_curVSConstantBuffers[StartSlot + i] = ppConstantBuffers[i];
+            if (allMatch) {
+                g_stateBindsRedundant.fetch_add(1, std::memory_order_relaxed);
+                if (IsStateDedupEnabled()) return;
+            } else {
+                for (UINT i = 0; i < NumBuffers; ++i) {
+                    m_curVSConstantBuffers[StartSlot + i] = ppConstantBuffers[i];
+                }
             }
         }
         m_real->VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
@@ -206,6 +299,27 @@ public:
     void STDMETHODCALLTYPE PSSetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView* const* ppShaderResourceViews) override { m_real->PSSetShaderResources(StartSlot, NumViews, ppShaderResourceViews); }
     void STDMETHODCALLTYPE PSSetShader(ID3D11PixelShader* pPixelShader, ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances) override { m_real->PSSetShader(pPixelShader, ppClassInstances, NumClassInstances); }
     void STDMETHODCALLTYPE PSSetSamplers(UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers) override { m_real->PSSetSamplers(StartSlot, NumSamplers, ppSamplers); }
+    void STDMETHODCALLTYPE PSSetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers) override {
+        g_stateBindsTotal.fetch_add(1, std::memory_order_relaxed);
+        if (ppConstantBuffers && StartSlot + NumBuffers <= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+            bool allMatch = true;
+            for (UINT i = 0; i < NumBuffers; ++i) {
+                if (m_curPSConstantBuffers[StartSlot + i] != ppConstantBuffers[i]) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) {
+                g_stateBindsRedundant.fetch_add(1, std::memory_order_relaxed);
+                if (IsStateDedupEnabled()) return;
+            } else {
+                for (UINT i = 0; i < NumBuffers; ++i) {
+                    m_curPSConstantBuffers[StartSlot + i] = ppConstantBuffers[i];
+                }
+            }
+        }
+        m_real->PSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+    }
     void STDMETHODCALLTYPE VSSetShader(ID3D11VertexShader* pVertexShader, ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances) override { m_real->VSSetShader(pVertexShader, ppClassInstances, NumClassInstances); }
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT IndexCountPerInstance, UINT InstanceCount, UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation) override { m_real->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); }
     void STDMETHODCALLTYPE DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation) override { m_real->DrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); }
@@ -220,12 +334,20 @@ public:
     void STDMETHODCALLTYPE IASetIndexBuffer(ID3D11Buffer* pIndexBuffer, DXGI_FORMAT Format, UINT Offset) override { m_real->IASetIndexBuffer(pIndexBuffer, Format, Offset); }
     void STDMETHODCALLTYPE IASetVertexBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppVertexBuffers, const UINT* pStrides, const UINT* pOffsets) override { m_real->IASetVertexBuffers(StartSlot, NumBuffers, ppVertexBuffers, pStrides, pOffsets); }
     void STDMETHODCALLTYPE IASetInputLayout(ID3D11InputLayout* pInputLayout) override {
-        if (pInputLayout == m_curInputLayout) return;
+        g_stateBindsTotal.fetch_add(1, std::memory_order_relaxed);
+        if (pInputLayout == m_curInputLayout) {
+            g_stateBindsRedundant.fetch_add(1, std::memory_order_relaxed);
+            if (IsStateDedupEnabled()) return;
+        }
         m_curInputLayout = pInputLayout;
         m_real->IASetInputLayout(pInputLayout);
     }
     void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY Topology) override {
-        if (Topology == m_curTopology) return;
+        g_stateBindsTotal.fetch_add(1, std::memory_order_relaxed);
+        if (Topology == m_curTopology) {
+            g_stateBindsRedundant.fetch_add(1, std::memory_order_relaxed);
+            if (IsStateDedupEnabled()) return;
+        }
         m_curTopology = Topology;
         m_real->IASetPrimitiveTopology(Topology);
     }
@@ -276,10 +398,12 @@ public:
             std::lock_guard<std::mutex> lock(g_cbLock);
             auto it = g_constantBuffers.find(pDstResource);
             if (it != g_constantBuffers.end() && it->second.isConstantBuffer) {
+                g_cbUpdatesTotal.fetch_add(1, std::memory_order_relaxed);
                 if (it->second.hasData && it->second.data.size() == it->second.byteWidth) {
                     if (memcmp(it->second.data.data(), pSrcData, it->second.byteWidth) == 0) {
-                        // Redundant constant buffer update: drop to prevent Vulkan descriptor / command buffer churn
-                        return;
+                        // Redundant constant buffer update: track metric and drop if dedup enabled
+                        g_cbUpdatesRedundant.fetch_add(1, std::memory_order_relaxed);
+                        if (IsStateDedupEnabled()) return;
                     }
                 }
                 it->second.data.assign((const uint8_t*)pSrcData, (const uint8_t*)pSrcData + it->second.byteWidth);
@@ -441,6 +565,11 @@ public:
 };
 
 void WrapDeviceAndContext(ID3D11Device** ppDevice, ID3D11DeviceContext** ppContext) {
+    static std::once_flag s_once;
+    std::call_once(s_once, []() {
+        std::atexit(FlushStats);
+    });
+
     if (ppDevice && *ppDevice) {
         *ppDevice = new WrappedDevice(*ppDevice);
     }
@@ -497,6 +626,11 @@ public:
 
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT SyncInterval, UINT Flags) override {
+        static std::atomic<uint32_t> s_presentCount{0};
+        uint32_t p = s_presentCount.fetch_add(1, std::memory_order_relaxed);
+        if ((p & 511) == 511) {
+            FlushStatsInternal();
+        }
         return m_real->Present(SyncInterval, Flags);
     }
 
@@ -523,6 +657,7 @@ public:
         DXGI_FORMAT NewFormat,
         UINT SwapChainFlags
     ) override {
+        g_swapchainResizesTotal.fetch_add(1, std::memory_order_relaxed);
         ULONGLONG now = GetTickCount64();
 
         // 1. Redundant identical resize check: drop if dimensions and format match
@@ -530,13 +665,15 @@ public:
             if (Width == m_curWidth && Height == m_curHeight &&
                 (NewFormat == DXGI_FORMAT_UNKNOWN || NewFormat == m_curFormat) &&
                 (BufferCount == 0 || BufferCount == m_curBufferCount)) {
-                return S_OK;
+                g_swapchainResizesIdentical.fetch_add(1, std::memory_order_relaxed);
+                if (IsSwapchainDebounceEnabled()) return S_OK;
             }
         }
 
         // 2. High-frequency resize debounce (rapid window DPI / borderless focus jitter < 50ms)
         if (now - m_lastResizeTick < 50 && m_curWidth != 0 && m_curHeight != 0) {
-            return S_OK;
+            g_swapchainResizesRapid.fetch_add(1, std::memory_order_relaxed);
+            if (IsSwapchainDebounceEnabled()) return S_OK;
         }
 
         HRESULT hr = m_real->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);

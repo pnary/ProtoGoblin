@@ -109,6 +109,86 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertIn("Elevated Presentation & SwapChain Jitter Detected", jitter_suggs[0]["title"])
         self.assertIn("Enable State Dedup & Debounce", jitter_suggs[0]["fix_button_text"])
 
+    def test_direct_d3d11_wrapper_stats_cb_spam(self):
+        # 1. Unoptimized case: state_dedup_active = False -> warning + fix action
+        m_unopt = {
+            "graphics": {
+                "d3d11_wrapper_stats": {
+                    "state_dedup_active": False,
+                    "swapchain_debounce_active": False,
+                    "constant_buffers": {
+                        "updates_total": 6000,
+                        "updates_redundant": 4200,
+                        "redundancy_rate_pct": 70.0,
+                    },
+                }
+            }
+        }
+        suggs = DiagnosticAdvisor.analyze(m_unopt)
+        spam_suggs = [s for s in suggs if "Constant Buffer State Spam" in s["title"]]
+        self.assertEqual(len(spam_suggs), 1)
+        self.assertEqual(spam_suggs[0]["level"], "warning")
+        self.assertEqual(spam_suggs[0]["fix_id"], "state_dedup_and_debounce")
+
+        # 2. Optimized case: state_dedup_active = True -> success metric
+        m_opt = {
+            "graphics": {
+                "d3d11_wrapper_stats": {
+                    "state_dedup_active": True,
+                    "swapchain_debounce_active": False,
+                    "constant_buffers": {
+                        "updates_total": 6000,
+                        "updates_redundant": 4200,
+                        "redundancy_rate_pct": 70.0,
+                    },
+                }
+            }
+        }
+        suggs_opt = DiagnosticAdvisor.analyze(m_opt)
+        active_suggs = [s for s in suggs_opt if "Constant Buffer Deduplication Active" in s["title"]]
+        self.assertEqual(len(active_suggs), 1)
+        self.assertEqual(active_suggs[0]["level"], "success")
+
+    def test_direct_d3d11_wrapper_stats_swapchain_choke(self):
+        # 1. Unoptimized case -> warning
+        m_unopt = {
+            "graphics": {
+                "d3d11_wrapper_stats": {
+                    "state_dedup_active": False,
+                    "swapchain_debounce_active": False,
+                    "swapchain": {
+                        "resizes_total": 10,
+                        "resizes_identical": 7,
+                        "resizes_rapid": 2,
+                    },
+                }
+            }
+        }
+        suggs = DiagnosticAdvisor.analyze(m_unopt)
+        choke_suggs = [s for s in suggs if "SwapChain Resize Choke Detected" in s["title"]]
+        self.assertEqual(len(choke_suggs), 1)
+        self.assertEqual(choke_suggs[0]["level"], "warning")
+        self.assertEqual(choke_suggs[0]["fix_id"], "state_dedup_and_debounce")
+
+        # 2. Optimized case -> success
+        m_opt = {
+            "graphics": {
+                "d3d11_wrapper_stats": {
+                    "state_dedup_active": False,
+                    "swapchain_debounce_active": True,
+                    "swapchain": {
+                        "resizes_total": 10,
+                        "resizes_identical": 7,
+                        "resizes_rapid": 2,
+                    },
+                }
+            }
+        }
+        suggs_opt = DiagnosticAdvisor.analyze(m_opt)
+        active_suggs = [s for s in suggs_opt if "SwapChain Debounce Active" in s["title"]]
+        self.assertEqual(len(active_suggs), 1)
+        self.assertEqual(active_suggs[0]["level"], "success")
+
     def test_subsystem_pruning_opportunity(self):
         manifest = {
             "subsystems": {
@@ -513,6 +593,47 @@ class TestEngineTweakManager(unittest.TestCase):
             self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
             self.assertEqual(env.get("PROTOGOBLIN_STATE_DEDUP"), "1")
             self.assertIn(lib64, env.get("WINEDLLPATH", ""))
+
+    def test_post_flight_ingests_d3d11_wrapper_stats(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_base = os.environ.get("PROTOGOBLIN_SESSIONS_DIR")
+            os.environ["PROTOGOBLIN_SESSIONS_DIR"] = td
+            try:
+                sess = ProtoGoblinSession(steam_appid=12345)
+                env = {}
+                sess.pre_flight(["Game.exe"], env)
+                self.assertEqual(env.get("PROTOGOBLIN_SESSION_DIR"), sess.session_dir)
+
+                # Simulate D3D11 wrapper emitting stats file
+                stats_path = os.path.join(sess.session_dir, "protogoblin_d3d11_stats.json")
+                wrapper_stats = {
+                    "state_dedup_active": True,
+                    "swapchain_debounce_active": True,
+                    "constant_buffers": {
+                        "updates_total": 5000,
+                        "updates_redundant": 3000,
+                        "redundancy_rate_pct": 60.0,
+                    },
+                    "swapchain": {
+                        "resizes_total": 5,
+                        "resizes_identical": 4,
+                        "resizes_rapid": 1,
+                    },
+                }
+                with open(stats_path, "w", encoding="utf-8") as f:
+                    json.dump(wrapper_stats, f)
+
+                manifest = sess.post_flight(0, env=env)
+                self.assertIsNotNone(manifest)
+                d3d11_metrics = manifest.get("graphics", {}).get("d3d11_wrapper_stats")
+                self.assertIsNotNone(d3d11_metrics)
+                self.assertTrue(d3d11_metrics["state_dedup_active"])
+                self.assertEqual(d3d11_metrics["constant_buffers"]["updates_redundant"], 3000)
+            finally:
+                if old_base:
+                    os.environ["PROTOGOBLIN_SESSIONS_DIR"] = old_base
+                else:
+                    os.environ.pop("PROTOGOBLIN_SESSIONS_DIR", None)
 
     def test_profile_mode_in_profile_toml(self):
         with tempfile.TemporaryDirectory() as td:

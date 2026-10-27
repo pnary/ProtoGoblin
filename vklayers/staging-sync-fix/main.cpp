@@ -96,6 +96,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             DisableThreadLibraryCalls(hinstDLL);
             break;
         case DLL_PROCESS_DETACH:
+            FlushStats();
             if (g_realD3D11) {
                 FreeLibrary(g_realD3D11);
                 g_realD3D11 = nullptr;

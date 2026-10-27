@@ -199,6 +199,77 @@ class DiagnosticAdvisor:
                     }
                 )
 
+        # 4b. D3D11 / DXGI Wrapper Introspective Live Telemetry
+        w_stats = gfx.get("d3d11_wrapper_stats")
+        if w_stats:
+            cb = w_stats.get("constant_buffers", {})
+            cb_total = cb.get("updates_total", 0)
+            cb_redundant = cb.get("updates_redundant", 0)
+            cb_rate = cb.get("redundancy_rate_pct", 0.0)
+            state_active = w_stats.get("state_dedup_active", False)
+
+            if cb_total >= 500 and cb_rate >= 35.0:
+                if not state_active:
+                    suggestions.append(
+                        {
+                            "level": "warning",
+                            "title": f"Constant Buffer State Spam Detected ({cb_rate:.1f}% Redundant)",
+                            "description": (
+                                f"Game issued {cb_total:,} constant buffer updates, but {cb_redundant:,} ({cb_rate:.1f}%) "
+                                "were identical to prior payloads. This causes redundant Vulkan descriptor set thrashing."
+                            ),
+                            "action": "Enable D3D11 Constant Buffer Deduplication in profile.toml [synchronization.state_dedup].",
+                            "fix_id": "state_dedup_and_debounce",
+                            "fix_button_text": "⚡ Enable State Dedup & Debounce",
+                        }
+                    )
+                else:
+                    suggestions.append(
+                        {
+                            "level": "success",
+                            "title": f"Constant Buffer Deduplication Active ({cb_redundant:,} calls pruned)",
+                            "description": (
+                                f"ProtoGoblin D3D11 wrapper dropped {cb_redundant:,} of {cb_total:,} constant buffer updates "
+                                f"({cb_rate:.1f}% bandwidth reduction), eliminating driver descriptor updates."
+                            ),
+                            "action": "Optimal constant buffer state caching is active.",
+                        }
+                    )
+
+            sc = w_stats.get("swapchain", {})
+            sc_total = sc.get("resizes_total", 0)
+            sc_identical = sc.get("resizes_identical", 0)
+            sc_rapid = sc.get("resizes_rapid", 0)
+            sc_active = w_stats.get("swapchain_debounce_active", False)
+
+            if (sc_identical + sc_rapid) >= 3:
+                if not sc_active:
+                    suggestions.append(
+                        {
+                            "level": "warning",
+                            "title": f"SwapChain Resize Choke Detected ({sc_identical + sc_rapid} redundant resizes)",
+                            "description": (
+                                f"Observed {sc_total} swapchain resize requests ({sc_identical} identical dimensions, "
+                                f"{sc_rapid} rapid bursts <50ms). Each unmitigated resize causes vkDeviceWaitIdle micro-stutters."
+                            ),
+                            "action": "Enable DXGI SwapChain Resize Debouncing in profile.toml [synchronization.swapchain_debounce].",
+                            "fix_id": "state_dedup_and_debounce",
+                            "fix_button_text": "⚡ Enable State Dedup & Debounce",
+                        }
+                    )
+                else:
+                    suggestions.append(
+                        {
+                            "level": "success",
+                            "title": f"SwapChain Debounce Active ({sc_identical + sc_rapid} stalls prevented)",
+                            "description": (
+                                f"Filtered {sc_identical} identical-dimension resizes and {sc_rapid} rapid-burst spikes, "
+                                "preserving smooth presentation without swapchain recreation stalls."
+                            ),
+                            "action": "Optimal swapchain presentation pacing is active.",
+                        }
+                    )
+
         # 5. Subsystem Pruning
         unutilized = sub.get("unutilized", [])
         if unutilized:
@@ -1758,6 +1829,23 @@ class ProtoGoblinCommandApp:
                     "ROI Telemetry: Not recorded (Session was launched in PLAY mode).",
                     "To collect frame percentiles and latency breakdown, launch with:",
                     "  PROTOGOBLIN_MODE=profile %command%",
+                ]
+            )
+
+        d3d11_stats = sess.get("graphics", {}).get("d3d11_wrapper_stats")
+        if d3d11_stats:
+            cb = d3d11_stats.get("constant_buffers", {})
+            st = d3d11_stats.get("pipeline_states", {})
+            sc = d3d11_stats.get("swapchain", {})
+            p_lines.extend(
+                [
+                    "",
+                    "D3D11 / DXGI WRAPPER INTROSPECTION METRICS",
+                    "-" * 60,
+                    f"Constant Buffer Updates: {cb.get('updates_total', 0):,} total | {cb.get('updates_redundant', 0):,} redundant ({cb.get('redundancy_rate_pct', 0.0):.1f}% spam)",
+                    f"Pipeline State Binds:   {st.get('binds_total', 0):,} total | {st.get('binds_redundant', 0):,} redundant ({st.get('redundancy_rate_pct', 0.0):.1f}% rebinds)",
+                    f"SwapChain Resizes:       {sc.get('resizes_total', 0)} total | {sc.get('resizes_identical', 0)} identical drops | {sc.get('resizes_rapid', 0)} rapid bursts",
+                    f"Deduplication Active:   State Dedup: {'YES' if d3d11_stats.get('state_dedup_active') else 'NO'} | Debounce: {'YES' if d3d11_stats.get('swapchain_debounce_active') else 'NO'}",
                 ]
             )
 

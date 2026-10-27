@@ -1528,6 +1528,8 @@ class ProtoGoblinSession:
         except OSError:
             pass
 
+        env["PROTOGOBLIN_SESSION_DIR"] = self.session_dir
+
         target_path = None
         for arg in argv:
             if arg.lower().endswith(".exe"):
@@ -1811,6 +1813,16 @@ class ProtoGoblinSession:
                 if refined_engine.get("detected"):
                     self.detected_engine = refined_engine
 
+        # Ingest D3D11 / DXGI wrapper telemetry if emitted during session
+        d3d11_stats_file = os.path.join(self.session_dir, "protogoblin_d3d11_stats.json")
+        d3d11_wrapper_stats = None
+        if os.path.exists(d3d11_stats_file):
+            try:
+                with open(d3d11_stats_file, "r", encoding="utf-8") as f:
+                    d3d11_wrapper_stats = json.load(f)
+            except Exception:
+                pass
+
         manifest = {
             "schema_version": self.schema_version,
             "session": {
@@ -1859,6 +1871,7 @@ class ProtoGoblinSession:
                     "vram_budget_mb": None,
                     "process_rss_mb": None,
                 },
+                "d3d11_wrapper_stats": d3d11_wrapper_stats,
             },
             "synchronization": {
                 "sync_backend": sync_backend,
