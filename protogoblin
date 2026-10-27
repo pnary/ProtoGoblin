@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+ProtoGoblin CLI - Introspective Telemetry & Session Management Tool
+"""
+
+import argparse
+import glob
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Add script directory to module search path to import protogoblin
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+import protogoblin
+
+
+# ANSI color helpers
+def colorize(text, color_code, bold=False):
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    b = "1;" if bold else ""
+    return f"\033[{b}{color_code}m{text}\033[0m"
+
+
+def bold(text):
+    return colorize(text, "0", bold=True)
+
+
+def green(text):
+    return colorize(text, "32", bold=True)
+
+
+def red(text):
+    return colorize(text, "31", bold=True)
+
+
+def yellow(text):
+    return colorize(text, "33", bold=True)
+
+
+def cyan(text):
+    return colorize(text, "36", bold=True)
+
+
+def dim(text):
+    return colorize(text, "90")
+
+
+def get_sessions_dir():
+    xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(xdg_data, "protogoblin", "sessions")
+
+
+def find_manifests():
+    """Finds all utilization.json files in the sessions directory, sorted latest first."""
+    base = get_sessions_dir()
+    if not os.path.isdir(base):
+        return []
+
+    pattern = os.path.join(base, "*", "*", "utilization.json")
+    files = glob.glob(pattern)
+    # Sort by file modification time, descending
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files
+
+
+def cmd_list(args):
+    """Lists recorded game sessions."""
+    manifest_files = find_manifests()
+    if not manifest_files:
+        print(yellow("No recorded ProtoGoblin sessions found in: ") + dim(get_sessions_dir()))
+        return 0
+
+    print(bold(f"\nRecorded ProtoGoblin Sessions ({len(manifest_files)} found):"))
+    print(dim("─" * 90))
+    print(
+        f"{bold('SESSION ID'):<26} {bold('APP ID'):<10} {bold('TARGET BINARY'):<24} {bold('MODE'):<8} {bold('SYNC'):<10} {bold('DURATION')}"
+    )
+    print(dim("─" * 90))
+
+    count = 0
+    for path in manifest_files:
+        if args.limit and count >= args.limit:
+            break
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        session_id = data.get("session", {}).get("id", "unknown")
+        app_id = str(data.get("target", {}).get("steam_appid", "-"))
+        target_info = data.get("target", {}).get("target_executable", {}) or {}
+        target_path = target_info.get("path", "unknown")
+        target_name = os.path.basename(target_path) if target_path != "unknown" else "unknown"
+
+        mode = data.get("session", {}).get("mode", "play")
+        mode_str = cyan(mode) if mode == "profile" else green(mode)
+
+        sync = data.get("synchronization", {}).get("sync_backend", "unknown")
+        duration = data.get("session", {}).get("duration_seconds", 0.0)
+        dur_str = f"{duration:.1f}s"
+
+        print(f"{session_id:<26} {app_id:<10} {target_name:<24} {mode_str:<17} {sync:<10} {dur_str}")
+        count += 1
+
+    print(dim("─" * 90))
+    print(dim("Use 'protogoblin show [SESSION_ID]' to view full manifest details.\n"))
+    return 0
+
+
+def cmd_show(args):
+    """Displays detailed utilization manifest for a given session."""
+    manifest_files = find_manifests()
+    if not manifest_files:
+        print(red("No recorded sessions found."))
+        return 1
+
+    selected_file = None
+
+    if args.session_id:
+        # Search by exact or partial session ID or AppID
+        for mf in manifest_files:
+            if args.session_id in mf:
+                selected_file = mf
+                break
+        if not selected_file:
+            print(red(f"Error: Session matching '{args.session_id}' not found."))
+            return 1
+    else:
+        # Default to latest session
+        selected_file = manifest_files[0]
+
+    try:
+        with open(selected_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(red(f"Error reading manifest: {e}"))
+        return 1
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+
+    # Formatted display
+    sess = data.get("session", {})
+    tgt = data.get("target", {})
+    env = data.get("environment", {})
+    ac = data.get("anti_cheat", {})
+    sync = data.get("synchronization", {})
+    gfx = data.get("graphics", {})
+    sub = data.get("subsystems", {})
+
+    print(bold("\n======================================================="))
+    print(bold(f"  ProtoGoblin Session Report: {sess.get('id', 'unknown')}"))
+    print(bold("======================================================="))
+
+    # Session Status
+    mode = sess.get("mode", "play")
+    mode_str = cyan("PROFILE") if mode == "profile" else green("PLAY")
+    clean = sess.get("clean_shutdown", False)
+    clean_str = green("Yes (Exit code 0)") if clean else red(f"No (Exit code {tgt.get('exit_code')})")
+
+    print(f"\n{bold('[Session Overview]')}")
+    print(f"  Mode:             {mode_str}")
+    print(f"  Duration:         {sess.get('duration_seconds', 0):.2f} seconds")
+    print(f"  Clean Exit:       {clean_str}")
+    print(f"  Start Time:       {sess.get('start_time')}")
+    print(f"  End Time:         {sess.get('end_time')}")
+    print(f"  Manifest:         {dim(selected_file)}")
+
+    # Target & Launcher
+    print(f"\n{bold('[Target Binary Execution]')}")
+    print(f"  Steam AppID:      {tgt.get('steam_appid') or dim('None')}")
+    t_exe = tgt.get("target_executable", {}) or {}
+    print(f"  Target Executable: {green(t_exe.get('path', 'unknown'))}")
+    print(f"  Architecture:     {cyan(t_exe.get('arch', 'unknown'))}")
+    print(f"  SHA-256:          {t_exe.get('sha256', 'unknown')}")
+    if t_exe.get("pe_timestamp"):
+        print(f"  PE Timestamp:     {t_exe.get('pe_timestamp')}")
+    if t_exe.get("pe_size_of_image"):
+        print(f"  PE Image Size:    {t_exe.get('pe_size_of_image'):,} bytes")
+
+    l_exe = tgt.get("launcher_executable")
+    if l_exe:
+        print(f"  Launcher Detected: {yellow(l_exe.get('path', 'unknown'))}")
+        print(f"  Launcher Arch:    {l_exe.get('arch', 'unknown')}")
+
+    print(f"  Process Count:    {tgt.get('process_tree_count', 1)} in process tree")
+    print(f"  Peak Threads:     {tgt.get('peak_thread_count', 1)}")
+
+    # Anti-Cheat
+    print(f"\n{bold('[Anti-Cheat Status]')}")
+    if ac.get("detected"):
+        print(f"  Detected:         {red('YES')}")
+        print(f"  Provider:         {red(ac.get('provider', 'Unknown'))}")
+        print(f"  Passthrough:      {yellow('Enforced (no profiling hooks applied)')}")
+    else:
+        print(f"  Detected:         {green('None')}")
+
+    # Synchronization
+    print(f"\n{bold('[Synchronization Backend]')}")
+    sync_name = sync.get("sync_backend", "unknown")
+    fast = sync.get("fast_path_enabled", False)
+    fast_str = green("Enabled") if fast else yellow("Disabled (Fallback to wineserver RPC)")
+    print(f"  Backend:          {cyan(sync_name.upper())}")
+    print(f"  Fast Path:        {fast_str}")
+
+    # Graphics & Translation
+    print(f"\n{bold('[Graphics Translation]')}")
+    print(f"  Backend:          {cyan(gfx.get('active_backend', 'unknown').upper())}")
+    print(f"  APIs Detected:    {', '.join(gfx.get('d3d_api_versions', []))}")
+    print(f"  Presentation:     {gfx.get('presentation_model', 'unknown')} ({gfx.get('present_mode', 'unknown')})")
+    sh = gfx.get("shader_compiles", {})
+    if sh:
+        print(f"  Shader Compiles:  {sh.get('count', 0)} ({sh.get('total_time_ms', 0):.1f} ms)")
+
+    # Environment
+    print(f"\n{bold('[Environment]')}")
+    print(f"  Host OS:          {env.get('host_os', 'unknown')}")
+    print(f"  Kernel:           {env.get('kernel', 'unknown')}")
+    print(f"  CPU:              {env.get('cpu', {}).get('model', 'unknown')} ({env.get('cpu', {}).get('logical_cores', 1)} cores)")
+    print(f"  GPU:              {env.get('gpu', {}).get('device_name', 'unknown')} (Driver: {env.get('gpu', {}).get('driver_version', 'unknown')})")
+    print(f"  RAM:              {env.get('ram_total_mb', 0)} MB")
+    if env.get("container_runtime"):
+        print(f"  Container:        {env.get('container_runtime')}")
+
+    # Subsystems
+    print(f"\n{bold('[Subsystems]')}")
+    print(f"  Loaded:           {', '.join(sub.get('loaded', []))}")
+    print(f"  Unutilized:       {dim(', '.join(sub.get('unutilized', [])))}")
+    overrides = sub.get("active_dll_overrides", {})
+    if overrides:
+        ov_str = ", ".join(f"{k}={v}" for k, v in overrides.items())
+        print(f"  DLL Overrides:    {ov_str}")
+
+    print(bold("=======================================================\n"))
+    return 0
+
+
+def cmd_inspect(args):
+    """Inspects a Windows PE binary offline."""
+    path = args.path
+    if not os.path.isfile(path):
+        print(red(f"Error: File '{path}' does not exist."))
+        return 1
+
+    pe = protogoblin.PEInfo.inspect(path)
+    if not pe:
+        print(red(f"Error: Unable to inspect '{path}' as PE binary."))
+        return 1
+
+    ac = protogoblin.AntiCheatDetector.scan(path)
+
+    print(bold(f"\nPE Inspection: {path}"))
+    print(dim("─" * 60))
+    print(f"  Architecture:     {cyan(pe.get('arch', 'unknown'))}")
+    print(f"  SHA-256:          {pe.get('sha256', 'unknown')}")
+    print(f"  PE Timestamp:     {pe.get('pe_timestamp') or 'None'}")
+    if pe.get("pe_size_of_image"):
+        print(f"  PE Image Size:    {pe.get('pe_size_of_image'):,} bytes")
+
+    print(f"\n{bold('Anti-Cheat Scan:')}")
+    if ac.get("detected"):
+        print(f"  Detected:         {red('YES')} ({ac.get('provider')})")
+    else:
+        print(f"  Detected:         {green('Clean (None detected)')}")
+    print(dim("─" * 60) + "\n")
+    return 0
+
+
+def cmd_version(args):
+    v_file = os.path.join(SCRIPT_DIR, "VERSION")
+    version = "ProtoGoblin-0.01"
+    if os.path.isfile(v_file):
+        try:
+            with open(v_file, "r") as f:
+                version = f.read().strip()
+        except OSError:
+            pass
+    print(bold(f"ProtoGoblin version: {green(version)}"))
+    print(dim("Cross-Platform Game Compatibility, Profiling, and Optimization Runtime"))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="protogoblin",
+        description="ProtoGoblin CLI - Introspective Telemetry & Session Management",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to run")
+
+    # list
+    list_p = subparsers.add_parser("list", help="List recorded gameplay sessions")
+    list_p.add_argument("-n", "--limit", type=int, default=20, help="Maximum sessions to display (default 20)")
+    list_p.set_defaults(func=cmd_list)
+
+    # show
+    show_p = subparsers.add_parser("show", help="Show detailed utilization manifest for a session")
+    show_p.add_argument("session_id", nargs="?", default=None, help="Session ID or AppID (default: latest session)")
+    show_p.add_argument("--json", action="store_true", help="Output raw JSON manifest")
+    show_p.set_defaults(func=cmd_show)
+
+    # inspect
+    inspect_p = subparsers.add_parser("inspect", help="Inspect a Windows binary offline (PE metadata, Anti-Cheat scan)")
+    inspect_p.add_argument("path", help="Path to Windows .exe or .dll")
+    inspect_p.set_defaults(func=cmd_inspect)
+
+    # version
+    ver_p = subparsers.add_parser("version", help="Show ProtoGoblin version")
+    ver_p.set_defaults(func=cmd_version)
+
+    args = parser.parse_args()
+    if not args.subcommand:
+        parser.print_help()
+        return 0
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
