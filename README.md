@@ -2,6 +2,11 @@
 
 **Cross-Platform Game Compatibility, Profiling, and Optimization Runtime**
 
+> [!WARNING]
+> **Project Status: Early Architecture & Planning Phase**
+> 
+> **Nothing works yet.** ProtoGoblin is currently under active initial development (Phase 0). Features, wrappers, and telemetry hooks are in design/prototyping and are not yet functional for general gameplay.
+
 ProtoGoblin is an open-source, locally controlled compatibility and runtime optimization framework for running Windows games on Linux through a custom Steam Proton compatibility tool (with a standalone Windows launcher planned for future phases).
 
 Unlike traditional external profilers or opaque compatibility wrappers, ProtoGoblin's distinguishing feature is **introspective telemetry**: because it sits directly in the application's execution path as the compatibility and API translation layer (Wine, DXVK, vkd3d-proton), it monitors its own internal utilization alongside platform counters in user space—without requiring game source code, binary modification, or elevated kernel privileges.
