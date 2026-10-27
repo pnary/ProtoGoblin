@@ -390,6 +390,148 @@ class ProcessTreeTracker:
         return (resolved_initial if resolved_initial != candidates[0] else None), candidates[0]
 
 
+class GraphicsLogParser:
+    """Parses DXVK and VKD3D-Proton runtime logs to extract live graphics telemetry."""
+
+    @classmethod
+    def scan_and_parse(cls, target_path=None, launcher_path=None, prefix_dir=None, env=None):
+        search_dirs = []
+        if env and env.get("DXVK_LOG_PATH"):
+            search_dirs.append(env["DXVK_LOG_PATH"])
+
+        if target_path and os.path.exists(target_path):
+            search_dirs.append(os.path.dirname(os.path.abspath(target_path)))
+
+        if launcher_path and os.path.exists(launcher_path):
+            search_dirs.append(os.path.dirname(os.path.abspath(launcher_path)))
+
+        if env and env.get("STEAM_COMPAT_INSTALL_PATH"):
+            search_dirs.append(env["STEAM_COMPAT_INSTALL_PATH"])
+
+        search_dirs.append(os.getcwd())
+
+        if prefix_dir and os.path.isdir(prefix_dir):
+            search_dirs.append(prefix_dir)
+            drive_c = os.path.join(prefix_dir, "drive_c")
+            if os.path.isdir(drive_c):
+                search_dirs.append(drive_c)
+
+        log_files = []
+        checked = set()
+        for d in search_dirs:
+            if d and os.path.isdir(d):
+                norm_d = os.path.abspath(d)
+                if norm_d in checked:
+                    continue
+                checked.add(norm_d)
+                try:
+                    for f in os.listdir(norm_d):
+                        if f.lower().endswith(("_dxgi.log", "_d3d11.log", "_d3d12.log", "_d3d9.log", "_d3d10core.log")):
+                            log_files.append(os.path.join(norm_d, f))
+                except OSError:
+                    continue
+
+        if not log_files:
+            return None
+
+        result = {
+            "active_backend": None,
+            "d3d_api_versions": set(),
+            "device_name": None,
+            "driver_version": None,
+            "vulkan_version": None,
+            "present_mode": None,
+            "resolution": None,
+            "presentation_model": "flip",
+            "shader_compiles": {
+                "count": 0,
+                "total_time_ms": 0.0,
+                "pipeline_cache_hit_rate": 1.0,
+            },
+            "vram_used_mb": None,
+        }
+
+        total_pipelines = 0
+        total_time_ms = 0.0
+        hit_rates = []
+
+        for log_path in log_files:
+            fname = os.path.basename(log_path).lower()
+            if "_d3d12" in fname:
+                result["d3d_api_versions"].add("d3d12")
+                result["active_backend"] = "vkd3d-proton"
+            if "_d3d11" in fname:
+                result["d3d_api_versions"].add("d3d11")
+                if not result["active_backend"]:
+                    result["active_backend"] = "dxvk"
+            if "_dxgi" in fname:
+                result["d3d_api_versions"].add("dxgi")
+                if not result["active_backend"]:
+                    result["active_backend"] = "dxvk"
+            if "_d3d9" in fname:
+                result["d3d_api_versions"].add("d3d9")
+                if not result["active_backend"]:
+                    result["active_backend"] = "dxvk"
+            if "_d3d10" in fname:
+                result["d3d_api_versions"].add("d3d10")
+                if not result["active_backend"]:
+                    result["active_backend"] = "dxvk"
+
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+
+                dev = re.search(r"(?:Vulkan device|Device):\s+(.+)", content)
+                if dev and not result["device_name"]:
+                    result["device_name"] = dev.group(1).strip()
+
+                drv = re.search(r"(?:Driver version|Driver):\s+(.+)", content)
+                if drv and not result["driver_version"]:
+                    result["driver_version"] = drv.group(1).strip()
+
+                vk = re.search(r"Vulkan(?:\s+API\s+version)?:\s+([\d\.]+)", content)
+                if vk and not result["vulkan_version"]:
+                    result["vulkan_version"] = vk.group(1).strip()
+
+                pm = re.search(r"Present mode:\s+(VK_PRESENT_MODE_\w+)", content)
+                if pm:
+                    result["present_mode"] = pm.group(1).strip()
+
+                res = re.search(r"(?:Buffer|Swapchain)\s+size:\s+(\d+x\d+)", content)
+                if res and not result["resolution"]:
+                    result["resolution"] = res.group(1).strip()
+
+                compiles = re.findall(r"Compiled\s+(\d+)\s+pipelines\s+in\s+([\d\.]+)\s*ms", content)
+                for count_str, time_str in compiles:
+                    total_pipelines += int(count_str)
+                    total_time_ms += float(time_str)
+
+                vkd3d_pipes = re.findall(r"Created\s+(\d+)\s+pipelines", content)
+                for c in vkd3d_pipes:
+                    total_pipelines += int(c)
+
+                hr = re.search(r"cache hit rate:\s+([\d\.]+)%", content)
+                if hr:
+                    hit_rates.append(float(hr.group(1)) / 100.0)
+
+                vram_matches = re.findall(r"Allocating\s+(\d+)\s+MB\s+of\s+memory", content)
+                if vram_matches:
+                    vram_mb = sum(int(m) for m in vram_matches)
+                    if not result["vram_used_mb"] or vram_mb > result["vram_used_mb"]:
+                        result["vram_used_mb"] = vram_mb
+
+            except OSError:
+                continue
+
+        result["d3d_api_versions"] = sorted(list(result["d3d_api_versions"]))
+        result["shader_compiles"]["count"] = total_pipelines
+        result["shader_compiles"]["total_time_ms"] = round(total_time_ms, 2)
+        if hit_rates:
+            result["shader_compiles"]["pipeline_cache_hit_rate"] = round(sum(hit_rates) / len(hit_rates), 3)
+
+        return result
+
+
 class SystemProbe:
     """Probes host and container environment information."""
 
@@ -594,6 +736,58 @@ class ProtoGoblinSession:
         else:
             active_backend = "dxvk"
 
+        d3d_api_versions = ["d3d11", "dxgi"]
+        present_mode = "VK_PRESENT_MODE_FIFO_KHR"
+        resolution = "unknown"
+        shader_compiles = {
+            "count": 0,
+            "total_time_ms": 0.0,
+            "pipeline_cache_hit_rate": 1.0,
+        }
+        vram_used_mb = None
+        gpu_info = SystemProbe.get_gpu_info()
+
+        # Parse live graphics logs from DXVK / VKD3D
+        target_path = self.target_exe.get("path") if self.target_exe else None
+        launcher_path = self.launcher_exe.get("path") if self.launcher_exe else None
+        prefix_dir = getattr(self.tracker, "prefix_dir", None) if self.tracker else None
+
+        parsed_gfx = GraphicsLogParser.scan_and_parse(
+            target_path=target_path,
+            launcher_path=launcher_path,
+            prefix_dir=prefix_dir,
+            env=env,
+        )
+
+        if parsed_gfx:
+            if parsed_gfx["active_backend"]:
+                active_backend = parsed_gfx["active_backend"]
+            if parsed_gfx["d3d_api_versions"]:
+                d3d_api_versions = parsed_gfx["d3d_api_versions"]
+            if parsed_gfx["present_mode"]:
+                present_mode = parsed_gfx["present_mode"]
+            if parsed_gfx["resolution"]:
+                resolution = parsed_gfx["resolution"]
+            if parsed_gfx["device_name"]:
+                gpu_info["device_name"] = parsed_gfx["device_name"]
+            if parsed_gfx["driver_version"]:
+                gpu_info["driver_version"] = parsed_gfx["driver_version"]
+            if parsed_gfx["vulkan_version"]:
+                gpu_info["vulkan_version"] = parsed_gfx["vulkan_version"]
+            shader_compiles = parsed_gfx["shader_compiles"]
+            vram_used_mb = parsed_gfx["vram_used_mb"]
+
+        loaded_subsystems = ["kernel32", "ntdll", "user32", "gdi32", "ws2_32"]
+        unutilized_subsystems = ["dinput8", "openvr", "wineopenxr", "mfplat"]
+
+        for api in d3d_api_versions:
+            if api not in loaded_subsystems:
+                loaded_subsystems.append(api)
+
+        for candidate in ["d3d12", "d3d9"]:
+            if candidate not in d3d_api_versions and candidate not in unutilized_subsystems:
+                unutilized_subsystems.append(candidate)
+
         dll_overrides_raw = env.get("WINEDLLOVERRIDES", "")
         active_overrides = {}
         for entry in dll_overrides_raw.split(";"):
@@ -628,43 +822,24 @@ class ProtoGoblinSession:
                 "container_runtime": SystemProbe.get_container_runtime(),
                 "protogoblin_version": self._resolve_version(),
                 "cpu": SystemProbe.get_cpu_info(),
-                "gpu": SystemProbe.get_gpu_info(),
+                "gpu": gpu_info,
                 "ram_total_mb": SystemProbe.get_ram_total_mb(),
             },
             "anti_cheat": self.anti_cheat,
             "subsystems": {
-                "loaded": [
-                    "kernel32",
-                    "ntdll",
-                    "user32",
-                    "gdi32",
-                    "dxgi",
-                    "d3d11",
-                    "ws2_32",
-                ],
-                "unutilized": [
-                    "d3d12",
-                    "d3d9",
-                    "mfplat",
-                    "dinput8",
-                    "openvr",
-                    "wineopenxr",
-                ],
+                "loaded": loaded_subsystems,
+                "unutilized": unutilized_subsystems,
                 "active_dll_overrides": active_overrides,
             },
             "graphics": {
                 "active_backend": active_backend,
-                "d3d_api_versions": ["d3d11", "dxgi"],
+                "d3d_api_versions": d3d_api_versions,
                 "presentation_model": "flip",
-                "present_mode": "VK_PRESENT_MODE_FIFO_KHR",
-                "resolution": "unknown",
-                "shader_compiles": {
-                    "count": 0,
-                    "total_time_ms": 0.0,
-                    "pipeline_cache_hit_rate": 1.0,
-                },
+                "present_mode": present_mode,
+                "resolution": resolution,
+                "shader_compiles": shader_compiles,
                 "memory": {
-                    "vram_used_mb": None,
+                    "vram_used_mb": vram_used_mb,
                     "vram_budget_mb": None,
                     "process_rss_mb": None,
                 },
