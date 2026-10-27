@@ -239,6 +239,27 @@ class DiagnosticAdvisor:
                         "fix_button_text": "⚡ Apply Staging Buffer Sync Fix & VSync Off",
                     }
                 )
+            if "ue5_fsr_frame_gen_crash" in known_issues:
+                suggestions.append(
+                    {
+                        "level": "warning",
+                        "title": "FSR3 Frame Generation Crash Trap (UE5 / Proton)",
+                        "description": "ProtonDB reports alert that toggling in-game FSR3 Frame Generation causes immediate freezes and persistent startup crash-loops via VKD3D-Proton swapchains. Standard FSR upscaling without frame gen works fine.",
+                        "action": "Disable Frame Generation in GameUserSettings.ini or keep standard FSR upscaling active without frame gen.",
+                    }
+                )
+            if "ue5_nanite_lumen_heavy_load" in known_issues:
+                suggestions.append(
+                    {
+                        "level": "info",
+                        "title": "Heavy UE5 Nanite & Lumen Translation Overhead",
+                        "description": "Virtualized Nanite geometry and Lumen software/hardware raytracing place intense demand on VKD3D-Proton and VRAM. Without pacing limits, 1% low FPS dips dramatically.",
+                        "action": "Cap frame rate to 60 FPS (VKD3D_FRAME_RATE=60) and disable Motion Blur/Depth of Field via -ExecCmds in profile.toml.",
+                        "fix_id": "cap_framerate",
+                        "fix_button_text": "⚡ Apply 60 FPS Cap & UE5 Cleanups",
+                        "cap_target": 60,
+                    }
+                )
             if recs.get("env") or recs.get("args"):
                 opts_summary = []
                 for k, v in recs.get("env", {}).items():

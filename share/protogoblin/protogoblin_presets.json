@@ -54669,9 +54669,20 @@
   "2009100": {
     "title": "Immortals of Aveum\u2122",
     "reports": 16,
-    "tier": "yes",
-    "known_issues": [],
-    "recommended_tweaks": {}
+    "tier": "gold",
+    "known_issues": [
+      "ue5_fsr_frame_gen_crash",
+      "ue5_nanite_lumen_heavy_load",
+      "ue5_vram_leak_long_session"
+    ],
+    "recommended_tweaks": {
+      "env": {
+        "VKD3D_FRAME_RATE": "60"
+      },
+      "args": [
+        "-ExecCmds=\"r.MotionBlurQuality 0;r.DepthOfFieldQuality 0;r.FilmGrain 0\""
+      ]
+    }
   },
   "2008980": {
     "title": "XENOTILT: HOSTILE PINBALL ACTION",
@@ -71145,5 +71156,23 @@
     "tier": "yes",
     "known_issues": [],
     "recommended_tweaks": {}
+  },
+  "2555360": {
+    "title": "Immortals of Aveum\u2122 Demo",
+    "reports": 16,
+    "tier": "gold",
+    "known_issues": [
+      "ue5_fsr_frame_gen_crash",
+      "ue5_nanite_lumen_heavy_load",
+      "ue5_vram_leak_long_session"
+    ],
+    "recommended_tweaks": {
+      "env": {
+        "VKD3D_FRAME_RATE": "60"
+      },
+      "args": [
+        "-ExecCmds=\"r.MotionBlurQuality 0;r.DepthOfFieldQuality 0;r.FilmGrain 0\""
+      ]
+    }
   }
 }

@@ -139,6 +139,19 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         titles = [s["title"] for s in suggestions]
         self.assertTrue(any("Documented Gust Engine D3D11 Sync Stall" in t for t in titles))
 
+    def test_immortals_of_aveum_demo_preset_and_advisor(self):
+        # Immortals of Aveum Demo AppID 2555360
+        preset = PresetDatabase.get_preset("2555360")
+        self.assertIsNotNone(preset)
+        self.assertIn("ue5_fsr_frame_gen_crash", preset.get("known_issues", []))
+        self.assertIn("ue5_nanite_lumen_heavy_load", preset.get("known_issues", []))
+
+        manifest = {"target": {"steam_appid": 2555360}}
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        titles = [s["title"] for s in suggestions]
+        self.assertTrue(any("FSR3 Frame Generation Crash Trap" in t for t in titles))
+        self.assertTrue(any("Heavy UE5 Nanite & Lumen Translation Overhead" in t for t in titles))
+
 
 class TestEngineDetector(unittest.TestCase):
     def setUp(self):
