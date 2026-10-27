@@ -111,6 +111,16 @@ class DiagnosticAdvisor:
                             "action": "Ensure Linux CPU governor is set to 'performance'.",
                         }
                     )
+                suggestions.append(
+                    {
+                        "level": "info",
+                        "title": "CPU Draw Call Overhead (Vulkan Descriptor Buffers)",
+                        "description": "DXVK 2.7+ Vulkan descriptor buffers bypass driver descriptor pool allocation overhead, cutting CPU draw call submission latency.",
+                        "action": "Enable dxvk.enableDescriptorBuffer = true in profile.toml.",
+                        "fix_id": "enable_descriptor_buffer",
+                        "fix_button_text": "⚡ Enable Vulkan Descriptor Buffers (DXVK 2.7)",
+                    }
+                )
             elif b_class == "gpu_bound":
                 suggestions.append(
                     {
@@ -141,6 +151,16 @@ class DiagnosticAdvisor:
                             "title": "Thread Starvation / Synchronization Waits",
                             "description": "Both CPU and GPU reported low utilization despite active gameplay. Threads are likely blocked on internal locks or waiting on timer intervals.",
                             "action": "Test adaptive wait policies or check if frame rate limiter is set below monitor refresh rate.",
+                        }
+                    )
+
+                if sync_backend != "ntsync" and not os.path.exists("/dev/ntsync"):
+                    suggestions.append(
+                        {
+                            "level": "info",
+                            "title": "Kernel NT Synchronization (ntsync) Driver Inactive",
+                            "description": "Session relied on slower wineserver RPC/eventfd waits. Upgrading to a kernel with the /dev/ntsync driver (Linux 6.13+) provides native Windows NT synchronization primitives to eliminate thread wait overhead.",
+                            "action": "Ensure ntsync kernel module is active or upgrade to Linux 6.13+.",
                         }
                     )
 
@@ -682,6 +702,9 @@ class ProtoGoblinCommandApp:
         self.var_gfx_async_shader = tk.BooleanVar(value=True)
         self.var_gfx_aniso16 = tk.BooleanVar(value=True)
         self.var_gfx_low_latency = tk.BooleanVar(value=True)
+        self.var_gfx_descriptor_buffer = tk.BooleanVar(value=True)
+        self.var_gfx_reflex = tk.BooleanVar(value=True)
+        self.var_sync_ntsync = tk.BooleanVar(value=True)
         self.var_atelier_sync_fix = tk.BooleanVar(value=False)
         self.var_gfx_max_fps = tk.StringVar(value="0")
 
@@ -689,7 +712,9 @@ class ProtoGoblinCommandApp:
             ("Force VSync Off (dxgi.syncInterval = 0 for minimum presentation latency)", self.var_gfx_vsync_off),
             ("Asynchronous Shader Compilation (DXVK_ASYNC=1 to prevent stutter)", self.var_gfx_async_shader),
             ("Force 16x Anisotropic Filtering (d3d11.samplerAnisotropy = 16)", self.var_gfx_aniso16),
-            ("Low Latency Queue Mode (dxvk.lowLatency = true)", self.var_gfx_low_latency),
+            ("Vulkan Descriptor Buffers (dxvk.enableDescriptorBuffer = true for DXVK 2.7+)", self.var_gfx_descriptor_buffer),
+            ("Nvidia Reflex Low-Latency Queueing (dxvk.nvLowLatency2 = true)", self.var_gfx_reflex),
+            ("Kernel Fast-Path NT Synchronization (ntsync)", self.var_sync_ntsync),
             ("Gust / Atelier D3D11 Staging Buffer Sync Fix (Shadow staging wrapper override)", self.var_atelier_sync_fix),
         ]
         for text, var in dxvk_checks:
@@ -1219,6 +1244,9 @@ class ProtoGoblinCommandApp:
         self.var_gfx_async_shader.set(False)
         self.var_gfx_aniso16.set(False)
         self.var_gfx_low_latency.set(False)
+        self.var_gfx_descriptor_buffer.set(False)
+        self.var_gfx_reflex.set(False)
+        self.var_sync_ntsync.set(False)
         self.var_atelier_sync_fix.set(False)
         self.var_gfx_max_fps.set("0")
 
@@ -1237,7 +1265,16 @@ class ProtoGoblinCommandApp:
             messagebox.showwarning("Notice", "Select a session first to apply suggested fix.")
             return
 
-        if fix_id == "atelier_sync_fix":
+        if fix_id == "enable_descriptor_buffer":
+            self.var_gfx_descriptor_buffer.set(True)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                "Vulkan Descriptor Buffers enabled (dxvk.enableDescriptorBuffer = true)!\n\n"
+                "• Cuts driver descriptor allocation overhead in CPU-bound draw-call heavy workloads.\n\n"
+                f"Saved to profile:\n{path}",
+            )
+        elif fix_id == "atelier_sync_fix":
             self.var_atelier_sync_fix.set(True)
             self.var_gfx_vsync_off.set(True)
             path = self.generate_profile_toml(silent=True)
@@ -1314,6 +1351,11 @@ class ProtoGoblinCommandApp:
                 "anisotropic_filtering": 16 if self.var_gfx_aniso16.get() else 0,
                 "async_shader_compile": self.var_gfx_async_shader.get(),
                 "low_latency": self.var_gfx_low_latency.get(),
+                "descriptor_buffer": self.var_gfx_descriptor_buffer.get(),
+                "nv_reflex": self.var_gfx_reflex.get(),
+            },
+            "synchronization": {
+                "ntsync": self.var_sync_ntsync.get(),
             },
         }
 

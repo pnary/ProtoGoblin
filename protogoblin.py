@@ -415,6 +415,11 @@ class EngineTweakManager:
             "anisotropic_filtering": 16,
             "async_shader_compile": True,
             "low_latency": True,
+            "descriptor_buffer": True,
+            "nv_reflex": True,
+        },
+        "synchronization": {
+            "prefer_ntsync": True,
         },
     }
 
@@ -524,9 +529,12 @@ class EngineTweakManager:
             f'anisotropic_filtering = {gfx_cfg.get("anisotropic_filtering", 16)}',
             f'async_shader_compile = {"true" if gfx_cfg.get("async_shader_compile", True) else "false"}',
             f'low_latency = {"true" if gfx_cfg.get("low_latency", True) else "false"}',
+            f'descriptor_buffer = {"true" if gfx_cfg.get("descriptor_buffer", True) else "false"}',
+            f'nv_reflex = {"true" if gfx_cfg.get("nv_reflex", True) else "false"}',
             "",
             "[synchronization]",
             f'preferred_backend = "{sync_backend}"',
+            f'ntsync = {"true" if tweaks.get("synchronization", {}).get("ntsync", True) else "false"}',
         ]
 
         if is_ue or "unreal" in tweaks:
@@ -652,8 +660,18 @@ class EngineTweakManager:
             env["DXVK_ASYNC"] = "1"
             dxvk_items.append("dxvk.enableAsync = true")
 
-        if gfx_sec.get("low_latency"):
+        if gfx_sec.get("low_latency") or gfx_sec.get("nv_reflex"):
             dxvk_items.append("dxvk.lowLatency = true")
+            dxvk_items.append("dxvk.nvLowLatency2 = true")
+            env["DXVK_NVAPI_ENABLE_REFLEX"] = "1"
+
+        if gfx_sec.get("descriptor_buffer"):
+            dxvk_items.append("dxvk.enableDescriptorBuffer = true")
+
+        if sync_sec.get("ntsync") or sync_sec.get("preferred_backend") == "ntsync":
+            if os.path.exists("/dev/ntsync") and os.environ.get("PROTON_NO_NTSYNC") != "1":
+                env["PROTON_USE_NTSYNC"] = "1"
+                env["WINE_USE_NTSYNC"] = "1"
 
         if dxvk_items:
             existing_dxvk = env.get("DXVK_CONFIG", "").strip()
@@ -1386,6 +1404,11 @@ class ProtoGoblinSession:
         self.anti_cheat = AntiCheatDetector.scan(target_path)
         if self.anti_cheat["detected"]:
             self.mode = "play"
+
+        # Upstream ntsync auto-detection: if /dev/ntsync is exposed by host kernel (Linux 6.13+)
+        if os.path.exists("/dev/ntsync") and os.environ.get("PROTON_NO_NTSYNC") != "1":
+            env.setdefault("PROTON_USE_NTSYNC", "1")
+            env.setdefault("WINE_USE_NTSYNC", "1")
 
         # In profile mode, configure bundled MangoHud for automatic ROI telemetry capture and HUD status
         if self.mode == "profile":

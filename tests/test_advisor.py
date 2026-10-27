@@ -347,6 +347,34 @@ class TestEngineTweakManager(unittest.TestCase):
         self.assertIn("dxvk.enableAsync = true", dxvk_cfg)
         self.assertIn("dxvk.lowLatency = true", dxvk_cfg)
 
+    def test_dxvk_27_descriptor_buffer_and_reflex(self):
+        profile = {
+            "graphics": {
+                "descriptor_buffer": True,
+                "nv_reflex": True,
+            }
+        }
+        env = {}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env)
+        dxvk_cfg = env.get("DXVK_CONFIG", "")
+        self.assertIn("dxvk.enableDescriptorBuffer = true", dxvk_cfg)
+        self.assertIn("dxvk.nvLowLatency2 = true", dxvk_cfg)
+        self.assertEqual(env.get("DXVK_NVAPI_ENABLE_REFLEX"), "1")
+
+    def test_cpu_bound_descriptor_buffer_suggestion(self):
+        manifest = {
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "cpu_bound",
+                "pacing": {"cpu_busy_pct": 92.0, "gpu_busy_pct": 45.0},
+            },
+            "environment": {"cpu": {"logical_cores": 8}},
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        db_sugg = [s for s in suggestions if s.get("fix_id") == "enable_descriptor_buffer"]
+        self.assertTrue(len(db_sugg) > 0)
+        self.assertIn("Enable Vulkan Descriptor Buffers", db_sugg[0]["fix_button_text"])
+
     def test_generate_and_load_profile_toml(self):
         with tempfile.TemporaryDirectory() as td:
             p_file = os.path.join(td, "game.toml")
