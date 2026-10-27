@@ -1964,13 +1964,20 @@ test-container:
 get-steamrt-image:
 	echo $(STEAMRT_IMAGE)
 
-STEAM_DIR := $(HOME)/.steam/root
+STEAM_COMPAT_DIR ?= $(shell \
+	if [ -d "$(HOME)/.local/share/Steam/compatibilitytools.d" ]; then echo "$(HOME)/.local/share/Steam/compatibilitytools.d"; \
+	elif [ -d "$(HOME)/.steam/root/compatibilitytools.d" ]; then echo "$(HOME)/.steam/root/compatibilitytools.d"; \
+	elif [ -d "$(HOME)/.steam/steam/compatibilitytools.d" ]; then echo "$(HOME)/.steam/steam/compatibilitytools.d"; \
+	elif [ -d "$(HOME)/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d" ]; then echo "$(HOME)/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"; \
+	elif [ -d "$(HOME)/.local/share/Steam" ]; then echo "$(HOME)/.local/share/Steam/compatibilitytools.d"; \
+	elif [ -d "$(HOME)/.steam/root" ]; then echo "$(HOME)/.steam/root/compatibilitytools.d"; \
+	else echo "$(HOME)/.local/share/Steam/compatibilitytools.d"; fi)
+
 .PHONY: install
 install: all
-	if [ ! -d $(STEAM_DIR) ]; then echo >&2 "!! "$(STEAM_DIR)" does not exist, cannot install"; return 1; fi
-	mkdir -p $(STEAM_DIR)/compatibilitytools.d/$(BUILD_NAME)
-	rsync --delete -arx $(DST_BASE)/* $(STEAM_DIR)/compatibilitytools.d/$(BUILD_NAME)
-	@echo "Installed ProtoGoblin to "$(STEAM_DIR)/compatibilitytools.d/$(BUILD_NAME)
+	mkdir -p $(STEAM_COMPAT_DIR)/$(BUILD_NAME)
+	rsync --delete -arx $(DST_BASE)/* $(STEAM_COMPAT_DIR)/$(BUILD_NAME)
+	@echo "Installed ProtoGoblin to $(STEAM_COMPAT_DIR)/$(BUILD_NAME)"
 	@echo "You may need to restart Steam to select this tool"
 
 
