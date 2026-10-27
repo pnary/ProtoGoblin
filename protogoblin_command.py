@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # Ensure local modules can be loaded
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -349,6 +349,31 @@ class ProtoGoblinCommandApp:
         )
         btn_refresh.pack(side=tk.RIGHT, padx=10, pady=10)
 
+        self.btn_toggle_mode = tk.Button(
+            header,
+            text="🎯 Profiling: OFF",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.toggle_selected_game_mode,
+        )
+        self.btn_toggle_mode.pack(side=tk.RIGHT, padx=5, pady=10)
+
+        btn_add_game = tk.Button(
+            header,
+            text="➕ Configure Game...",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            command=self.add_game_dialog,
+        )
+        btn_add_game.pack(side=tk.RIGHT, padx=5, pady=10)
+
         btn_inspect = tk.Button(
             header,
             text="🔍 Inspect .EXE...",
@@ -517,6 +542,49 @@ class ProtoGoblinCommandApp:
         # Scrollable container for tweak categories
         container = tk.Frame(self.tab_tweaks, bg=self.card_bg)
         container.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        # 0. Execution & Telemetry Mode Card
+        self.mode_frame = tk.LabelFrame(
+            container,
+            text=" 🎯 Execution & Telemetry Mode (Applies Automatically from Steam) ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.mode_frame.pack(fill=tk.X, pady=6)
+
+        self.var_profile_mode = tk.StringVar(value="play")
+        rb_play = tk.Radiobutton(
+            self.mode_frame,
+            text="Play Mode - Clean, silent execution. Optimizations and tweaks apply without HUD or background disk logging.",
+            variable=self.var_profile_mode,
+            value="play",
+            bg="#161b22",
+            fg="#c9d1d9",
+            selectcolor="#0d1117",
+            activebackground="#161b22",
+            activeforeground="#58a6ff",
+            font=("Segoe UI", 9),
+            command=self._on_mode_radio_changed,
+        )
+        rb_play.pack(anchor=tk.W, pady=2)
+
+        rb_profile = tk.Radiobutton(
+            self.mode_frame,
+            text="Profile Mode - Active 'Goblin-ing' HUD overlay, frametime variance, 1% lows, and hardware load telemetry recorded.",
+            variable=self.var_profile_mode,
+            value="profile",
+            bg="#161b22",
+            fg="#39FF14",
+            selectcolor="#0d1117",
+            activebackground="#161b22",
+            activeforeground="#39FF14",
+            font=("Segoe UI", 9, "bold"),
+            command=self._on_mode_radio_changed,
+        )
+        rb_profile.pack(anchor=tk.W, pady=2)
 
         # 1. Unreal Engine Tweaks Card
         self.ue_frame = tk.LabelFrame(
@@ -804,6 +872,24 @@ class ProtoGoblinCommandApp:
         else:
             self.var_atelier_sync_fix.set(False)
 
+        # Sync profile mode from existing .toml profile if present
+        prof_mode = None
+        if app_id:
+            xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            p_file = os.path.join(xdg_config, "protogoblin", "games", f"{app_id}.toml")
+            if os.path.isfile(p_file):
+                prof_data = protogoblin.EngineTweakManager.load_profile(p_file)
+                if prof_data:
+                    prof_mode = (
+                        prof_data.get("runtime", {}).get("mode")
+                        or prof_data.get("protogoblin", {}).get("mode")
+                    )
+        if not prof_mode:
+            prof_mode = sess.get("mode", "play")
+
+        self.var_profile_mode.set(prof_mode)
+        self._update_header_mode_button(prof_mode)
+
         for widget in self.diag_cards_container.winfo_children():
             widget.destroy()
 
@@ -1019,6 +1105,99 @@ class ProtoGoblinCommandApp:
         )
         messagebox.showinfo("PE Binary Inspection", msg)
 
+    def _update_header_mode_button(self, mode):
+        if mode == "profile":
+            self.btn_toggle_mode.config(
+                text="🎯 Profiling: ON (Goblin-ing)",
+                bg="#238636",
+                fg="#ffffff",
+                activebackground="#2ea043",
+                activeforeground="#ffffff",
+            )
+        else:
+            self.btn_toggle_mode.config(
+                text="⚪ Profiling: OFF (Play Mode)",
+                bg="#21262d",
+                fg="#c9d1d9",
+                activebackground="#30363d",
+                activeforeground="#ffffff",
+            )
+
+    def _on_mode_radio_changed(self):
+        m = self.var_profile_mode.get()
+        self._update_header_mode_button(m)
+
+    def toggle_selected_game_mode(self):
+        if not self.current_manifest:
+            messagebox.showwarning("Notice", "Select a game session first to toggle its profiling mode.")
+            return
+
+        curr = self.var_profile_mode.get()
+        new_mode = "play" if curr == "profile" else "profile"
+        self.var_profile_mode.set(new_mode)
+        self._update_header_mode_button(new_mode)
+        path = self.generate_profile_toml(silent=True)
+
+        mode_desc = (
+            "Profile Mode (Active 'Goblin-ing' HUD overlay and telemetry recording)"
+            if new_mode == "profile"
+            else "Play Mode (Silent execution, optimizations active, telemetry off)"
+        )
+        messagebox.showinfo(
+            "Game Mode Updated",
+            f"Mode updated to: {mode_desc}\n\n"
+            f"Saved to profile:\n{path}\n\n"
+            "This title will now launch in this mode automatically from Steam without needing launch arguments!",
+        )
+
+    def add_game_dialog(self):
+        app_id = simpledialog.askstring(
+            "Configure Game by AppID",
+            "Enter Steam AppID to configure profiling and optimizations\n(e.g. 2555360 for Immortals of Aveum Demo):",
+            parent=self.root,
+        )
+        if not app_id:
+            return
+
+        app_id = app_id.strip()
+        preset = protogoblin.PresetDatabase.get_preset(app_id)
+        title = preset.get("title") if preset else f"Steam App {app_id}"
+
+        enable_prof = messagebox.askyesno(
+            "Enable Profiling?",
+            f"Game: {title} (AppID {app_id})\n\n"
+            "Would you like to ENABLE Profiling Mode ('Goblin-ing' HUD + Telemetry) for this game?\n\n"
+            "• Click Yes for Profile Mode\n• Click No for Play Mode (Optimizations only)",
+        )
+
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        profile_dir = os.path.join(xdg_config, "protogoblin", "games")
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_file = os.path.join(profile_dir, f"{app_id}.toml")
+
+        mode = "profile" if enable_prof else "play"
+        user_tweaks = {"mode": mode}
+        if preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
+            user_tweaks["atelier_sync_fix"] = True
+
+        toml_content = protogoblin.EngineTweakManager.generate_profile_toml(
+            game_id=app_id,
+            app_id=app_id,
+            target_exe=f"{title.replace(' ', '_')}.exe",
+            sync_backend="ntsync",
+            user_tweaks=user_tweaks,
+        )
+        with open(profile_file, "w", encoding="utf-8") as f:
+            f.write(toml_content)
+
+        messagebox.showinfo(
+            "Profile Created",
+            f"Successfully configured {title} (AppID: {app_id})!\n\n"
+            f"Mode: {'PROFILE MODE (Telemetry & HUD)' if enable_prof else 'PLAY MODE'}\n"
+            f"Profile path:\n{profile_file}\n\n"
+            "ProtoGoblin will automatically apply this mode whenever the game is launched via Steam.",
+        )
+
     def reset_tweaks_to_stock(self):
         """Disables all engine tweaks, overrides, and limiters to establish a raw baseline."""
         self.var_ue_motion_blur.set(False)
@@ -1106,6 +1285,7 @@ class ProtoGoblinCommandApp:
         profile_file = os.path.join(profile_dir, f"{steam_id}.toml")
 
         user_tweaks = {
+            "mode": self.var_profile_mode.get(),
             "atelier_sync_fix": self.var_atelier_sync_fix.get(),
             "unreal": {
                 "disable_motion_blur": self.var_ue_motion_blur.get(),

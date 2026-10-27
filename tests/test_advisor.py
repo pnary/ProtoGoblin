@@ -405,6 +405,33 @@ class TestEngineTweakManager(unittest.TestCase):
         self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
         self.assertIn("dxgi.syncInterval = 0", env.get("DXVK_CONFIG", ""))
 
+    def test_profile_mode_in_profile_toml(self):
+        with tempfile.TemporaryDirectory() as td:
+            p_file = os.path.join(td, "99999.toml")
+            toml_text = EngineTweakManager.generate_profile_toml(
+                game_id="99999",
+                app_id=99999,
+                target_exe="TestGame.exe",
+                user_tweaks={"mode": "profile"},
+            )
+            self.assertIn('mode = "profile"', toml_text)
+            with open(p_file, "w", encoding="utf-8") as f:
+                f.write(toml_text)
+
+            old_mode_env = os.environ.pop("PROTOGOBLIN_MODE", None)
+            os.environ["PROTOGOBLIN_PROFILE"] = p_file
+            try:
+                sess = ProtoGoblinSession(steam_appid=99999)
+                env = {}
+                sess.pre_flight(["TestGame.exe"], env)
+                self.assertEqual(sess.mode, "profile")
+                self.assertEqual(env.get("MANGOHUD"), "1")
+                self.assertIn("custom_text=Goblin-ing", env.get("MANGOHUD_CONFIG", ""))
+            finally:
+                os.environ.pop("PROTOGOBLIN_PROFILE", None)
+                if old_mode_env:
+                    os.environ["PROTOGOBLIN_MODE"] = old_mode_env
+
 
 if __name__ == "__main__":
     unittest.main()

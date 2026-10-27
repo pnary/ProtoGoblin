@@ -495,6 +495,13 @@ class EngineTweakManager:
         godot_cfg = tweaks.get("godot", cls.DEFAULTS["godot"])
         gfx_cfg = tweaks.get("graphics", cls.DEFAULTS["graphics"])
 
+        runtime_mode = (
+            tweaks.get("mode")
+            or tweaks.get("runtime", {}).get("mode")
+            or tweaks.get("protogoblin", {}).get("mode")
+            or "play"
+        )
+
         lines = [
             "# ProtoGoblin Per-Game Optimization Profile",
             f"# Target: {target_exe}",
@@ -506,7 +513,7 @@ class EngineTweakManager:
             f'detected_engine = "{eng_name}"',
             "",
             "[runtime]",
-            'mode = "play"',
+            f'mode = "{runtime_mode}"',
             "prune_unused_subsystems = true",
             'anticheat_policy = "passthrough"',
             "",
@@ -1360,6 +1367,20 @@ class ProtoGoblinSession:
                 break
 
         self.initial_exe = target_path
+
+        # Check per-game profile for configured mode if PROTOGOBLIN_MODE wasn't explicitly provided in environment
+        if "PROTOGOBLIN_MODE" not in os.environ:
+            profile_path = self.find_game_profile()
+            if profile_path:
+                prof_data = EngineTweakManager.load_profile(profile_path)
+                if prof_data:
+                    prof_mode = (
+                        prof_data.get("runtime", {}).get("mode")
+                        or prof_data.get("protogoblin", {}).get("mode")
+                        or prof_data.get("general", {}).get("mode")
+                    )
+                    if prof_mode in ["profile", "play"]:
+                        self.mode = prof_mode
 
         # Anti-cheat scan
         self.anti_cheat = AntiCheatDetector.scan(target_path)
