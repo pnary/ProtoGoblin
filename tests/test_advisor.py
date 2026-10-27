@@ -432,6 +432,20 @@ class TestEngineTweakManager(unittest.TestCase):
         EngineTweakManager.apply_tweaks(profile, {}, ["Atelier_Ryza.exe"], env)
         self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
         self.assertIn("dxgi.syncInterval = 0", env.get("DXVK_CONFIG", ""))
+        self.assertEqual(env.get("PROTOGOBLIN_STAGING_SYNC_FIX"), "1")
+
+    def test_vendored_staging_sync_fix_resolution(self):
+        with tempfile.TemporaryDirectory() as td:
+            lib64 = os.path.join(td, "share", "protogoblin", "lib64")
+            os.makedirs(lib64, exist_ok=True)
+            profile = {
+                "synchronization": {"atelier_sync_fix": {"enabled": True}},
+            }
+            env = {}
+            EngineTweakManager.apply_tweaks(profile, {}, ["Atelier_Ryza.exe"], env, proton_dir=td)
+            self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
+            self.assertEqual(env.get("PROTOGOBLIN_STAGING_SYNC_FIX"), "1")
+            self.assertIn(lib64, env.get("WINEDLLPATH", ""))
 
     def test_profile_mode_in_profile_toml(self):
         with tempfile.TemporaryDirectory() as td:

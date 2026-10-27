@@ -262,6 +262,20 @@ elif [[ "$DEV_OVERLAY" == true ]]; then
         cp -rf "${SCRIPT_DIR}/tools/"* "${TOOL_DIR}/tools/"
     fi
 
+    # Install vendored libraries (such as D3D11 staging buffer sync fix)
+    if [[ -d "${SCRIPT_DIR}/share/protogoblin/lib64" ]]; then
+        mkdir -p "${TOOL_DIR}/share/protogoblin/lib64"
+        cp -rf "${SCRIPT_DIR}/share/protogoblin/lib64/"* "${TOOL_DIR}/share/protogoblin/lib64/" 2>/dev/null || true
+    fi
+    if [[ -d "${SCRIPT_DIR}/share/protogoblin/lib32" ]]; then
+        mkdir -p "${TOOL_DIR}/share/protogoblin/lib32"
+        cp -rf "${SCRIPT_DIR}/share/protogoblin/lib32/"* "${TOOL_DIR}/share/protogoblin/lib32/" 2>/dev/null || true
+    fi
+    if [[ -d "${SCRIPT_DIR}/vklayers/staging-sync-fix" ]]; then
+        mkdir -p "${TOOL_DIR}/share/protogoblin/staging-sync-fix"
+        cp -rf "${SCRIPT_DIR}/vklayers/staging-sync-fix/"* "${TOOL_DIR}/share/protogoblin/staging-sync-fix/" 2>/dev/null || true
+    fi
+
 else
     # Check if a dist directory already exists
     if [[ -d "${SCRIPT_DIR}/build/dist" ]]; then

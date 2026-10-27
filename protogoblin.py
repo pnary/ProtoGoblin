@@ -590,7 +590,7 @@ class EngineTweakManager:
         return "\n".join(lines)
 
     @classmethod
-    def apply_tweaks(cls, profile, engine_info, argv, env, prefix_dir=None):
+    def apply_tweaks(cls, profile, engine_info, argv, env, prefix_dir=None, proton_dir=None):
         if not profile:
             return argv
 
@@ -641,6 +641,20 @@ class EngineTweakManager:
             if "d3d11=" not in dll_ov:
                 env["WINEDLLOVERRIDES"] = f"d3d11=n,b;{dll_ov}" if dll_ov else "d3d11=n,b"
             dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
+            env["PROTOGOBLIN_STAGING_SYNC_FIX"] = "1"
+
+            # Check candidate paths for vendored d3d11.dll wrapper
+            p_dir = proton_dir or os.environ.get("PROTOGOBLIN_DIR") or os.path.dirname(os.path.abspath(__file__))
+            candidate_dirs = [
+                os.path.join(p_dir, "share", "protogoblin", "lib64"),
+                os.path.join(p_dir, "share", "protogoblin", "lib32"),
+                os.path.join(p_dir, "vklayers", "staging-sync-fix"),
+            ]
+            for cdir in candidate_dirs:
+                if os.path.isdir(cdir):
+                    current_path = env.get("WINEDLLPATH", "")
+                    if cdir not in current_path:
+                        env["WINEDLLPATH"] = f"{cdir}:{current_path}" if current_path else cdir
 
         if gfx_sec.get("force_vsync") == "off":
             dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
@@ -1474,6 +1488,7 @@ class ProtoGoblinSession:
                     argv,
                     env,
                     prefix_dir,
+                    proton_dir=self.proton_dir,
                 )
         elif not is_raw and presets_enabled:
             # Automatic preset bootstrap from PresetDatabase if no custom profile exists
