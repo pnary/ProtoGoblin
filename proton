@@ -46,6 +46,7 @@ import protonfixes
 #To enable debug logging, copy "user_settings.sample.py" to "user_settings.py"
 #and edit it if needed.
 import utilities
+import protogoblin
 
 CURRENT_PREFIX_VERSION="ProtoGoblin-0.01"
 
@@ -2883,6 +2884,8 @@ class Session:
         return subprocess.call(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
 
     def run(self):
+        protogoblin.g_protogoblin.pre_flight(sys.argv[2:], self.env)
+        log("ProtoGoblin session initialized: " + protogoblin.g_protogoblin.session_id)
         umu_without_steam = "UMU_ID" in os.environ and os.environ.get("UMU_USE_STEAM") != "1"
         if umu_without_steam:
             append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")
@@ -2943,6 +2946,9 @@ class Session:
                 log("terminate remote debugger")
                 remote_debug_proc.terminate()
                 remote_debug_proc.communicate()
+
+        protogoblin.g_protogoblin.post_flight(rc, self.env)
+        log("ProtoGoblin manifest emitted: " + protogoblin.g_protogoblin.manifest_path)
 
         return rc
 

@@ -1813,6 +1813,9 @@ $(VULKAN_BINDINGS_TARGET): $(addprefix $(SRCDIR)/,vulkan.py)
 UTILITIES_TARGET := $(addprefix $(DST_BASE)/,utilities.py)
 $(UTILITIES_TARGET): $(addprefix $(SRCDIR)/,utilities.py)
 
+PROTOGOBLIN_PY_TARGET := $(addprefix $(DST_BASE)/,protogoblin.py)
+$(PROTOGOBLIN_PY_TARGET): $(addprefix $(SRCDIR)/,protogoblin.py)
+
 PROTON_PY_TARGET := $(addprefix $(DST_BASE)/,proton)
 $(PROTON_PY_TARGET): $(addprefix $(SRCDIR)/,proton)
 
@@ -1824,6 +1827,7 @@ $(USER_SETTINGS_PY_TARGET): $(addprefix $(SRCDIR)/,user_settings.sample.py)
 
 DIST_COPY_TARGETS := $(FILELOCK_TARGET) $(PROTON_PY_TARGET) \
                      $(VULKAN_BINDINGS_TARGET) $(UTILITIES_TARGET) \
+                     $(PROTOGOBLIN_PY_TARGET) \
                      $(PROTON37_TRACKED_FILES_TARGET) $(USER_SETTINGS_PY_TARGET)
 
 ifeq ($(ENABLE_WOW64),1)

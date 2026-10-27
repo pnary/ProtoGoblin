@@ -1,5 +1,7 @@
 .plan
 .ref
+__pycache__/
+*.pyc
 /dist
 /dist-*
 /obj-*
