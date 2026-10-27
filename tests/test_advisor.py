@@ -152,6 +152,16 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertTrue(any("FSR3 Frame Generation Crash Trap" in t for t in titles))
         self.assertTrue(any("Heavy UE5 Nanite & Lumen Translation Overhead" in t for t in titles))
 
+    def test_auto_preset_injection_in_preflight(self):
+        # Session without existing TOML config should auto-apply preset recommendations
+        sess = ProtoGoblinSession(mode="play", steam_appid=2555360)
+        env = {}
+        argv = ["ImmortalsOfAveum.exe"]
+        out_argv = sess.pre_flight(argv, env)
+
+        self.assertEqual(env.get("VKD3D_FRAME_RATE"), "60")
+        self.assertTrue(any("r.MotionBlurQuality 0" in arg for arg in out_argv))
+
 
 class TestEngineDetector(unittest.TestCase):
     def setUp(self):

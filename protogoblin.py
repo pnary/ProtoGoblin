@@ -1282,18 +1282,18 @@ class SystemProbe:
 class ProtoGoblinSession:
     """Manages the lifecycle of a ProtoGoblin game execution session."""
 
-    def __init__(self, proton_dir=None):
+    def __init__(self, proton_dir=None, steam_appid=None, mode=None):
         self.proton_dir = proton_dir or os.path.dirname(os.path.abspath(__file__))
         self.schema_version = "1.0.0"
         self.session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{os.getpid():04x}"
         self.start_iso = datetime.now(timezone.utc).isoformat()
         self.start_monotonic = time.monotonic()
 
-        self.mode = os.environ.get("PROTOGOBLIN_MODE", "play").lower().strip()
+        self.mode = mode or os.environ.get("PROTOGOBLIN_MODE", "play").lower().strip()
         if self.mode not in ["play", "profile"]:
             self.mode = "play"
 
-        self.steam_appid = os.environ.get("SteamGameId") or os.environ.get("SteamAppId")
+        self.steam_appid = str(steam_appid) if steam_appid else (os.environ.get("SteamGameId") or os.environ.get("SteamAppId"))
 
         xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
         game_slug = self.steam_appid or "unknown_game"
@@ -1428,6 +1428,17 @@ class ProtoGoblinSession:
                     env,
                     prefix_dir,
                 )
+        else:
+            # Automatic preset bootstrap from PresetDatabase if no custom profile exists
+            preset = PresetDatabase.get_preset(self.steam_appid)
+            if preset and preset.get("recommended_tweaks"):
+                recs = preset["recommended_tweaks"]
+                for k, v in recs.get("env", {}).items():
+                    if k not in env:
+                        env[k] = str(v)
+                for a in recs.get("args", []):
+                    if a not in argv:
+                        argv.append(a)
 
         return argv
 
