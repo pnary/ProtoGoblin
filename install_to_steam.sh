@@ -12,6 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_NAME="ProtoGoblin-local"
 DISPLAY_NAME="ProtoGoblin (Local Build)"
 CONTAINER_ENGINE=""
+TARGET_ARCH="$(uname -m 2>/dev/null || echo 'x86_64')"
+[[ "$TARGET_ARCH" == "amd64" ]] && TARGET_ARCH="x86_64"
 FORCE_BUILD=false
 DEV_OVERLAY=false
 BASE_PROTON=""
@@ -79,6 +81,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --display-name)
             DISPLAY_NAME="$2"
+            shift 2
+            ;;
+        --arch)
+            TARGET_ARCH="$2"
             shift 2
             ;;
         --engine)
@@ -191,7 +197,7 @@ if [[ "$FORCE_BUILD" == true ]]; then
     BUILD_DIR="${SCRIPT_DIR}/build"
     mkdir -p "$BUILD_DIR"
     pushd "$BUILD_DIR" >/dev/null
-    "${SCRIPT_DIR}/configure.sh" --build-name="$BUILD_NAME" --container-engine="$ENGINE"
+    "${SCRIPT_DIR}/configure.sh" --build-name="$BUILD_NAME" --target-arch="$TARGET_ARCH" --container-engine="$ENGINE"
     make -j"$(nproc)"
     popd >/dev/null
 
