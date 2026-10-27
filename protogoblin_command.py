@@ -297,6 +297,195 @@ class DiagnosticAdvisor:
         return suggestions
 
 
+def compute_session_diff(manifest_a, manifest_b):
+    """Computes an A/B delta comparison between two ProtoGoblin session manifests.
+
+    manifest_a: Baseline session (e.g. before / raw / unoptimized)
+    manifest_b: Target session (e.g. after / tweaked / optimized)
+    """
+    sess_a = manifest_a.get("session") or {}
+    sess_b = manifest_b.get("session") or {}
+    tgt_a = manifest_a.get("target") or {}
+    tgt_b = manifest_b.get("target") or {}
+    t_exe_a = os.path.basename((tgt_a.get("target_executable") or {}).get("path", "Unknown"))
+    t_exe_b = os.path.basename((tgt_b.get("target_executable") or {}).get("path", "Unknown"))
+    app_id_a = tgt_a.get("steam_appid") or "-"
+    app_id_b = tgt_b.get("steam_appid") or "-"
+
+    roi_a = manifest_a.get("roi_telemetry") or manifest_a.get("roi") or {}
+    roi_b = manifest_b.get("roi_telemetry") or manifest_b.get("roi") or {}
+
+    has_roi_a = bool(roi_a.get("roi_enabled") and roi_a.get("frame_metrics"))
+    has_roi_b = bool(roi_b.get("roi_enabled") and roi_b.get("frame_metrics"))
+
+    fm_a = roi_a.get("frame_metrics") or {}
+    fm_b = roi_b.get("frame_metrics") or {}
+    pacing_a = roi_a.get("pacing") or {}
+    pacing_b = roi_b.get("pacing") or {}
+
+    def _delta(a_val, b_val):
+        a_f = float(a_val or 0.0)
+        b_f = float(b_val or 0.0)
+        diff = b_f - a_f
+        pct = (diff / a_f * 100.0) if a_f > 0 else 0.0
+        return round(diff, 2), round(pct, 1)
+
+    diff_fps_avg, pct_fps_avg = _delta(fm_a.get("fps_avg"), fm_b.get("fps_avg"))
+    diff_fps_1p, pct_fps_1p = _delta(fm_a.get("fps_1_pct_low"), fm_b.get("fps_1_pct_low"))
+    diff_fps_01p, pct_fps_01p = _delta(fm_a.get("fps_0_1_pct_low"), fm_b.get("fps_0_1_pct_low"))
+    diff_ft_avg, pct_ft_avg = _delta(fm_a.get("frametime_avg_ms"), fm_b.get("frametime_avg_ms"))
+    diff_jitter, pct_jitter = _delta(fm_a.get("frametime_jitter_ms"), fm_b.get("frametime_jitter_ms"))
+
+    bot_a = roi_a.get("bottleneck_classification", "unknown")
+    bot_b = roi_b.get("bottleneck_classification", "unknown")
+
+    cpu_busy_a = float(pacing_a.get("cpu_busy_pct", 0.0))
+    cpu_busy_b = float(pacing_b.get("cpu_busy_pct", 0.0))
+    cpu_wait_a = float(pacing_a.get("cpu_wait_pct", 0.0))
+    cpu_wait_b = float(pacing_b.get("cpu_wait_pct", 0.0))
+    gpu_busy_a = float(pacing_a.get("gpu_busy_pct", 0.0))
+    gpu_busy_b = float(pacing_b.get("gpu_busy_pct", 0.0))
+
+    # Determine verdict and qualitative notes
+    verdict = "NEUTRAL"
+    notes = []
+    if pct_fps_avg >= 5.0 or pct_fps_1p >= 10.0 or (float(fm_a.get("frametime_jitter_ms", 0)) > 5.0 and pct_jitter <= -20.0):
+        verdict = "IMPROVED"
+        if pct_fps_avg >= 5.0:
+            notes.append(f"Average FPS +{pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+        if pct_fps_1p >= 10.0:
+            notes.append(f"1% lows +{pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+        if pct_jitter <= -20.0:
+            notes.append(f"Frametime jitter {pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
+    elif pct_fps_avg <= -5.0 or pct_fps_1p <= -10.0:
+        verdict = "REGRESSED"
+        if pct_fps_avg <= -5.0:
+            notes.append(f"Average FPS {pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+        if pct_fps_1p <= -10.0:
+            notes.append(f"1% lows {pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+
+    if bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]:
+        notes.append(f"Sync lockstep stall resolved ({bot_a} -> {bot_b})")
+
+    diff_result = {
+        "session_a": {
+            "id": sess_a.get("id", "Session A"),
+            "target_exe": t_exe_a,
+            "steam_appid": app_id_a,
+            "mode": sess_a.get("mode", "play"),
+            "has_roi": has_roi_a,
+            "bottleneck": bot_a,
+        },
+        "session_b": {
+            "id": sess_b.get("id", "Session B"),
+            "target_exe": t_exe_b,
+            "steam_appid": app_id_b,
+            "mode": sess_b.get("mode", "play"),
+            "has_roi": has_roi_b,
+            "bottleneck": bot_b,
+        },
+        "metrics": {
+            "fps_avg": {"a": fm_a.get("fps_avg", 0.0), "b": fm_b.get("fps_avg", 0.0), "delta": diff_fps_avg, "pct": pct_fps_avg},
+            "fps_1_pct_low": {"a": fm_a.get("fps_1_pct_low", 0.0), "b": fm_b.get("fps_1_pct_low", 0.0), "delta": diff_fps_1p, "pct": pct_fps_1p},
+            "fps_0_1_pct_low": {"a": fm_a.get("fps_0_1_pct_low", 0.0), "b": fm_b.get("fps_0_1_pct_low", 0.0), "delta": diff_fps_01p, "pct": pct_fps_01p},
+            "frametime_avg_ms": {"a": fm_a.get("frametime_avg_ms", 0.0), "b": fm_b.get("frametime_avg_ms", 0.0), "delta": diff_ft_avg, "pct": pct_ft_avg},
+            "frametime_jitter_ms": {"a": fm_a.get("frametime_jitter_ms", 0.0), "b": fm_b.get("frametime_jitter_ms", 0.0), "delta": diff_jitter, "pct": pct_jitter},
+        },
+        "bottleneck": {
+            "a": bot_a,
+            "b": bot_b,
+            "transition": f"{bot_a} -> {bot_b}",
+            "resolved": (bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]),
+        },
+        "hardware": {
+            "cpu_busy_pct": {"a": cpu_busy_a, "b": cpu_busy_b, "delta": round(cpu_busy_b - cpu_busy_a, 1)},
+            "cpu_wait_pct": {"a": cpu_wait_a, "b": cpu_wait_b, "delta": round(cpu_wait_b - cpu_wait_a, 1)},
+            "gpu_busy_pct": {"a": gpu_busy_a, "b": gpu_busy_b, "delta": round(gpu_busy_b - gpu_busy_a, 1)},
+        },
+        "verdict": verdict,
+        "notes": notes,
+        "summary": "; ".join(notes) if notes else "Performance metrics comparable.",
+    }
+    return diff_result
+
+
+def format_diff_report(diff):
+    """Formats an A/B session comparison dict into a clean human-readable ASCII report."""
+    s_a = diff["session_a"]
+    s_b = diff["session_b"]
+    m = diff["metrics"]
+    bot = diff["bottleneck"]
+    hw = diff["hardware"]
+
+    v_icon = "🚀 " if diff["verdict"] == "IMPROVED" else ("⚠️ " if diff["verdict"] == "REGRESSED" else "⚖️ ")
+    verdict_str = f"{v_icon}{diff['verdict']}: {diff['summary']}"
+
+    lines = [
+        "=" * 82,
+        " PROTOGOBLIN A/B SESSION COMPARISON & REGRESSION DIFF",
+        "=" * 82,
+        f" Baseline Session (A - Before):  {s_a['id']} [{s_a['mode'].upper()}] - {s_a['target_exe']} ({s_a['steam_appid']})",
+        f" Target   Session (B - After):   {s_b['id']} [{s_b['mode'].upper()}] - {s_b['target_exe']} ({s_b['steam_appid']})",
+        f" Comparison Verdict:            {verdict_str}",
+        "=" * 82,
+        "",
+    ]
+
+    if not s_a.get("has_roi") or not s_b.get("has_roi"):
+        lines.extend([
+            " [!] NOTICE: One or both sessions were executed in PLAY mode without ROI telemetry.",
+            "     Detailed frame percentiles and jitter require sessions launched with:",
+            "       PROTOGOBLIN_MODE=profile %command%",
+            "",
+        ])
+
+    lines.extend([
+        " FRAMETIME & PACING BENCHMARK",
+        "-" * 82,
+        f" {'Metric':<28} {'Session A (Before)':<20} {'Session B (After)':<20} {'Delta':<14}",
+        "-" * 82,
+    ])
+
+    def _fmt_row(title, metric_dict, unit, higher_is_better=True):
+        a_val = float(metric_dict.get("a") or 0.0)
+        b_val = float(metric_dict.get("b") or 0.0)
+        delta = float(metric_dict.get("delta") or 0.0)
+        pct = float(metric_dict.get("pct") or 0.0)
+        sign = "+" if delta > 0 else ""
+        arrow = "▲" if ((delta > 0 and higher_is_better) or (delta < 0 and not higher_is_better)) else ("▼" if delta != 0 else "=")
+        a_str = f"{a_val:.1f} {unit}"
+        b_str = f"{b_val:.1f} {unit}"
+        d_str = f"{sign}{delta:.1f} {unit} ({sign}{pct:.1f}%) {arrow}"
+        return f" {title:<28} {a_str:<20} {b_str:<20} {d_str:<14}"
+
+    lines.append(_fmt_row("Average Framerate:", m["fps_avg"], "FPS", higher_is_better=True))
+    lines.append(_fmt_row("1% Low Framerate:", m["fps_1_pct_low"], "FPS", higher_is_better=True))
+    lines.append(_fmt_row("0.1% Low Framerate:", m["fps_0_1_pct_low"], "FPS", higher_is_better=True))
+    lines.append(_fmt_row("Average Frametime:", m["frametime_avg_ms"], "ms", higher_is_better=False))
+    lines.append(_fmt_row("Frametime Jitter (StdDev):", m["frametime_jitter_ms"], "ms", higher_is_better=False))
+
+    bot_res_str = " (Stall Resolved!)" if bot["resolved"] else ""
+    lines.extend([
+        f" {'Bottleneck Classification:':<28} {s_a['bottleneck'].upper():<20} {s_b['bottleneck'].upper():<20} {bot['transition']}{bot_res_str}",
+        "",
+        " HARDWARE RESOURCE ALLOCATION",
+        "-" * 82,
+        f" {'Component':<28} {'Session A (Before)':<20} {'Session B (After)':<20} {'Shift':<14}",
+        "-" * 82,
+    ])
+
+    for comp_name, key in [("CPU Busy Utilization:", "cpu_busy_pct"), ("CPU Wait / Blocked:", "cpu_wait_pct"), ("GPU Busy Utilization:", "gpu_busy_pct")]:
+        h_data = hw[key]
+        a_str = f"{h_data['a']:.1f}%"
+        b_str = f"{h_data['b']:.1f}%"
+        s = "+" if h_data['delta'] > 0 else ""
+        d_str = f"{s}{h_data['delta']:.1f}%"
+        lines.append(f" {comp_name:<28} {a_str:<20} {b_str:<20} {d_str:<14}")
+
+    lines.extend(["=" * 82, ""])
+    return "\n".join(lines)
+
+
 class ProtoGoblinCommandApp:
     """Main Application Window for ProtoGoblin Command GUI."""
 
@@ -491,11 +680,15 @@ class ProtoGoblinCommandApp:
         self.tab_perf = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_perf, text="  📊 Performance & Pacing  ")
 
-        # Tab 4: System & Translation Details
+        # Tab 4: Session Comparison (A/B Diff)
+        self.tab_diff = tk.Frame(self.notebook, bg=self.card_bg)
+        self.notebook.add(self.tab_diff, text="  ⚖️ Session Comparison (A/B Diff)  ")
+
+        # Tab 5: System & Translation Details
         self.tab_sys = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_sys, text="  ⚙️ Graphics & Subsystems  ")
 
-        # Tab 5: Raw JSON Manifest
+        # Tab 6: Raw JSON Manifest
         self.tab_json = tk.Frame(self.notebook, bg=self.card_bg)
         self.notebook.add(self.tab_json, text="  📄 Raw Manifest (JSON)  ")
 
@@ -503,6 +696,7 @@ class ProtoGoblinCommandApp:
         self._build_diag_tab()
         self._build_tweaks_tab()
         self._build_perf_tab()
+        self._build_diff_tab()
         self._build_sys_tab()
         self._build_json_tab()
 
@@ -791,6 +985,118 @@ class ProtoGoblinCommandApp:
         )
         self.perf_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+    def _build_diff_tab(self):
+        ctrl_bar = tk.Frame(self.tab_diff, bg="#161b22", padx=15, pady=12)
+        ctrl_bar.pack(fill=tk.X)
+
+        lbl_title = tk.Label(
+            ctrl_bar,
+            text="A/B Session Comparison & Regression Analysis",
+            font=("Segoe UI", 11, "bold"),
+            bg="#161b22",
+            fg="#58a6ff",
+        )
+        lbl_title.pack(anchor=tk.W, pady=(0, 8))
+
+        row = tk.Frame(ctrl_bar, bg="#161b22")
+        row.pack(fill=tk.X)
+
+        tk.Label(row, text="Baseline (A - Before):", font=("Segoe UI", 9), bg="#161b22", fg="#c9d1d9").pack(side=tk.LEFT, padx=(0, 5))
+        self.combo_session_a = ttk.Combobox(row, width=34, state="readonly")
+        self.combo_session_a.pack(side=tk.LEFT, padx=(0, 10))
+        self.combo_session_a.bind("<<ComboboxSelected>>", lambda e: self.run_session_diff())
+
+        btn_swap = tk.Button(
+            row,
+            text="⇄ Swap",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=8,
+            pady=2,
+            font=("Segoe UI", 8, "bold"),
+            command=self.swap_diff_sessions,
+        )
+        btn_swap.pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Label(row, text="Target (B - After):", font=("Segoe UI", 9), bg="#161b22", fg="#c9d1d9").pack(side=tk.LEFT, padx=(0, 5))
+        self.combo_session_b = ttk.Combobox(row, width=34, state="readonly")
+        self.combo_session_b.pack(side=tk.LEFT, padx=(0, 10))
+        self.combo_session_b.bind("<<ComboboxSelected>>", lambda e: self.run_session_diff())
+
+        btn_diff = tk.Button(
+            row,
+            text="⚡ Compare",
+            bg="#238636",
+            fg="#ffffff",
+            activebackground="#2ea043",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=12,
+            pady=2,
+            font=("Segoe UI", 9, "bold"),
+            command=self.run_session_diff,
+        )
+        btn_diff.pack(side=tk.LEFT, padx=(5, 0))
+
+        self.diff_text = tk.Text(
+            self.tab_diff,
+            bg="#0d1117",
+            fg="#c9d1d9",
+            font=("Consolas", 10),
+            relief=tk.FLAT,
+            padx=15,
+            pady=15,
+        )
+        self.diff_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def swap_diff_sessions(self):
+        if not hasattr(self, "combo_session_a") or not hasattr(self, "combo_session_b"):
+            return
+        cur_a = self.combo_session_a.current()
+        cur_b = self.combo_session_b.current()
+        if cur_a >= 0 and cur_b >= 0:
+            self.combo_session_a.current(cur_b)
+            self.combo_session_b.current(cur_a)
+            self.run_session_diff()
+
+    def _load_manifest_by_index(self, idx):
+        paths = getattr(self, "filtered_manifest_paths", self.manifest_paths)
+        if 0 <= idx < len(paths):
+            p = paths[idx]
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return None
+        return None
+
+    def run_session_diff(self):
+        if not hasattr(self, "diff_text") or not hasattr(self, "combo_session_a") or not hasattr(self, "combo_session_b"):
+            return
+        idx_a = self.combo_session_a.current()
+        idx_b = self.combo_session_b.current()
+
+        if idx_a < 0 or idx_b < 0:
+            self.diff_text.delete("1.0", tk.END)
+            self.diff_text.insert(tk.END, "Please select both Baseline (Session A) and Target (Session B) to compare.\n")
+            return
+
+        manifest_a = self._load_manifest_by_index(idx_a)
+        manifest_b = self._load_manifest_by_index(idx_b)
+
+        if not manifest_a or not manifest_b:
+            self.diff_text.delete("1.0", tk.END)
+            self.diff_text.insert(tk.END, "Failed to load one or both session manifests.\n")
+            return
+
+        diff_data = compute_session_diff(manifest_a, manifest_b)
+        report = format_diff_report(diff_data)
+        self.diff_text.delete("1.0", tk.END)
+        self.diff_text.insert(tk.END, report)
+
     def _build_sys_tab(self):
         self.sys_text = tk.Text(
             self.tab_sys,
@@ -829,6 +1135,8 @@ class ProtoGoblinCommandApp:
     def _filter_session_list(self):
         self.sessions_listbox.delete(0, tk.END)
         query = self.search_var.get().lower().strip()
+        self.filtered_manifest_paths = []
+        self.diff_session_labels = []
 
         for idx, path in enumerate(self.manifest_paths):
             try:
@@ -839,12 +1147,26 @@ class ProtoGoblinCommandApp:
                 t_exe = os.path.basename(tgt.get("target_executable", {}).get("path", "Unknown"))
                 app_id = tgt.get("steam_appid") or "-"
                 mode = sess.get("mode", "play").upper()
+                sess_id = sess.get("id", f"sess_{idx}")
 
                 display = f"[{mode:<7}] {t_exe:<18} ({app_id})"
                 if not query or query in display.lower() or query in path.lower():
                     self.sessions_listbox.insert(tk.END, display)
+                    self.filtered_manifest_paths.append(path)
+                    self.diff_session_labels.append(f"[{mode}] {t_exe} ({sess_id[:16]})")
             except Exception:
                 continue
+
+        if hasattr(self, "combo_session_a") and hasattr(self, "combo_session_b"):
+            self.combo_session_a["values"] = self.diff_session_labels
+            self.combo_session_b["values"] = self.diff_session_labels
+            if len(self.diff_session_labels) >= 2:
+                self.combo_session_a.current(1)
+                self.combo_session_b.current(0)
+            elif len(self.diff_session_labels) == 1:
+                self.combo_session_a.current(0)
+                self.combo_session_b.current(0)
+            self.run_session_diff()
 
         if self.sessions_listbox.size() > 0:
             self.sessions_listbox.select_set(0)
@@ -856,15 +1178,25 @@ class ProtoGoblinCommandApp:
             return
 
         idx = sel[0]
-        # Match displayed index with filtered list
-        if idx < len(self.manifest_paths):
-            path = self.manifest_paths[idx]
+        paths = getattr(self, "filtered_manifest_paths", self.manifest_paths)
+        if idx < len(paths):
+            path = paths[idx]
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     self.current_manifest = json.load(f)
                 self._render_manifest_data(self.current_manifest, path)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load manifest: {e}")
+
+        if hasattr(self, "combo_session_b") and idx < len(paths):
+            self.combo_session_b.current(idx)
+            if idx + 1 < len(paths):
+                self.combo_session_a.current(idx + 1)
+            elif len(paths) > 1 and idx > 0:
+                self.combo_session_a.current(idx - 1)
+            else:
+                self.combo_session_a.current(idx)
+            self.run_session_diff()
 
     def _render_manifest_data(self, data, path):
         sess = data.get("session", {})

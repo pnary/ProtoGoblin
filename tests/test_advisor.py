@@ -17,7 +17,11 @@ from protogoblin import (
     PresetDatabase,
     ProtoGoblinSession,
 )
-from protogoblin_command import DiagnosticAdvisor
+from protogoblin_command import (
+    DiagnosticAdvisor,
+    compute_session_diff,
+    format_diff_report,
+)
 
 
 class TestDiagnosticAdvisor(unittest.TestCase):
@@ -473,6 +477,127 @@ class TestEngineTweakManager(unittest.TestCase):
                 os.environ.pop("PROTOGOBLIN_PROFILE", None)
                 if old_mode_env:
                     os.environ["PROTOGOBLIN_MODE"] = old_mode_env
+
+
+class TestSessionComparison(unittest.TestCase):
+    def test_session_diff_improved(self):
+        manifest_a = {
+            "session": {"id": "sess_a_1000", "mode": "profile"},
+            "target": {"steam_appid": "1121560", "target_executable": {"path": "C:\\Games\\Atelier_Ryza.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "sync_bound",
+                "frame_metrics": {
+                    "fps_avg": 54.2,
+                    "fps_1_pct_low": 22.4,
+                    "fps_0_1_pct_low": 14.1,
+                    "frametime_avg_ms": 18.45,
+                    "frametime_jitter_ms": 18.40,
+                },
+                "pacing": {
+                    "cpu_busy_pct": 15.0,
+                    "cpu_wait_pct": 45.0,
+                    "gpu_busy_pct": 35.0,
+                },
+            },
+        }
+
+        manifest_b = {
+            "session": {"id": "sess_b_1015", "mode": "profile"},
+            "target": {"steam_appid": "1121560", "target_executable": {"path": "C:\\Games\\Atelier_Ryza.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "gpu_bound",
+                "frame_metrics": {
+                    "fps_avg": 89.6,
+                    "fps_1_pct_low": 61.1,
+                    "fps_0_1_pct_low": 45.0,
+                    "frametime_avg_ms": 11.16,
+                    "frametime_jitter_ms": 2.10,
+                },
+                "pacing": {
+                    "cpu_busy_pct": 22.0,
+                    "cpu_wait_pct": 4.0,
+                    "gpu_busy_pct": 98.0,
+                },
+            },
+        }
+
+        diff = compute_session_diff(manifest_a, manifest_b)
+        self.assertEqual(diff["verdict"], "IMPROVED")
+        self.assertTrue(diff["bottleneck"]["resolved"])
+        self.assertEqual(diff["bottleneck"]["transition"], "sync_bound -> gpu_bound")
+        self.assertAlmostEqual(diff["metrics"]["fps_avg"]["delta"], 35.4, places=1)
+        self.assertAlmostEqual(diff["metrics"]["fps_avg"]["pct"], 65.3, places=1)
+        self.assertAlmostEqual(diff["metrics"]["frametime_jitter_ms"]["delta"], -16.3, places=1)
+        self.assertAlmostEqual(diff["hardware"]["cpu_wait_pct"]["delta"], -41.0, places=1)
+
+        report = format_diff_report(diff)
+        self.assertIn("IMPROVED", report)
+        self.assertIn("Stall Resolved!", report)
+        self.assertIn("Average Framerate:", report)
+        self.assertIn("Hardware Resource Allocation".upper(), report)
+
+    def test_session_diff_regressed(self):
+        manifest_a = {
+            "session": {"id": "sess_a", "mode": "profile"},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "gpu_bound",
+                "frame_metrics": {
+                    "fps_avg": 100.0,
+                    "fps_1_pct_low": 75.0,
+                    "fps_0_1_pct_low": 60.0,
+                    "frametime_avg_ms": 10.0,
+                    "frametime_jitter_ms": 1.0,
+                },
+                "pacing": {"cpu_busy_pct": 50.0, "cpu_wait_pct": 5.0, "gpu_busy_pct": 99.0},
+            },
+        }
+
+        manifest_b = {
+            "session": {"id": "sess_b", "mode": "profile"},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "cpu_bound",
+                "frame_metrics": {
+                    "fps_avg": 45.0,
+                    "fps_1_pct_low": 25.0,
+                    "fps_0_1_pct_low": 15.0,
+                    "frametime_avg_ms": 22.2,
+                    "frametime_jitter_ms": 6.5,
+                },
+                "pacing": {"cpu_busy_pct": 95.0, "cpu_wait_pct": 2.0, "gpu_busy_pct": 40.0},
+            },
+        }
+
+        diff = compute_session_diff(manifest_a, manifest_b)
+        self.assertEqual(diff["verdict"], "REGRESSED")
+        self.assertFalse(diff["bottleneck"]["resolved"])
+        self.assertAlmostEqual(diff["metrics"]["fps_avg"]["delta"], -55.0, places=1)
+        self.assertAlmostEqual(diff["metrics"]["fps_avg"]["pct"], -55.0, places=1)
+
+        report = format_diff_report(diff)
+        self.assertIn("REGRESSED", report)
+
+    def test_session_diff_missing_roi(self):
+        manifest_a = {
+            "session": {"id": "sess_play", "mode": "play"},
+            "target": {"steam_appid": "111", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": None,
+        }
+        manifest_b = {
+            "session": {"id": "sess_prof", "mode": "profile"},
+            "target": {"steam_appid": "111", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": None,
+        }
+
+        diff = compute_session_diff(manifest_a, manifest_b)
+        self.assertEqual(diff["verdict"], "NEUTRAL")
+        report = format_diff_report(diff)
+        self.assertIn("NOTICE: One or both sessions were executed in PLAY mode", report)
 
 
 if __name__ == "__main__":
