@@ -332,6 +332,41 @@ class TestEngineTweakManager(unittest.TestCase):
             self.assertTrue(loaded["engine"]["unreal"]["disable_motion_blur"])
             self.assertEqual(loaded["graphics"]["force_vsync"], "off")
 
+    def test_atelier_sync_fix_pipeline(self):
+        # 1. Profile Telemetry detection produces fix_id "atelier_sync_fix"
+        manifest = {
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "sync_bound",
+                "frame_metrics": {"fps_avg": 25.0, "fps_1_pct_low": 12.0},
+                "pacing": {"gpu_busy_pct": 28.0, "cpu_busy_pct": 30.0},
+            }
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        sync_suggestions = [s for s in suggestions if s.get("fix_id") == "atelier_sync_fix"]
+        self.assertTrue(len(sync_suggestions) > 0)
+        self.assertIn("Apply Staging Buffer Sync Fix", sync_suggestions[0]["fix_button_text"])
+
+        # 2. TOML profile generation with atelier_sync_fix
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="1121560",
+            app_id=1121560,
+            target_exe="Atelier_Ryza.exe",
+            user_tweaks={"atelier_sync_fix": True, "graphics": {"force_vsync": "off"}},
+        )
+        self.assertIn("[synchronization.atelier_sync_fix]", toml_text)
+        self.assertIn("enabled = true", toml_text)
+
+        # 3. Applying tweaks injects WINEDLLOVERRIDES="d3d11=n,b" and syncInterval=0
+        profile = {
+            "synchronization": {"atelier_sync_fix": {"enabled": True}},
+            "graphics": {"force_vsync": "off"},
+        }
+        env = {}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Atelier_Ryza.exe"], env)
+        self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
+        self.assertIn("dxgi.syncInterval = 0", env.get("DXVK_CONFIG", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

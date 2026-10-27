@@ -80,6 +80,8 @@ class DiagnosticAdvisor:
                     "title": "Shader Compilation Stuttering Observed",
                     "description": f"{count} pipelines compiled during session taking {time_ms:.1f}ms total. Pipeline cache hit rate was {hit_rate:.1%}.",
                     "action": "Enable local shader caching (PROTON_LOCAL_SHADER_CACHE=1) or asynchronous compilation (DXVK_ASYNC=1) to prevent gameplay hitching.",
+                    "fix_id": "async_shader_compile",
+                    "fix_button_text": "⚡ Enable Async Shader Compilation",
                 }
             )
 
@@ -128,6 +130,8 @@ class DiagnosticAdvisor:
                             "title": "Intra-Frame CPU-GPU Staging Synchronization Stall",
                             "description": f"Severe GPU under-utilization ({gpu_load}%) and low CPU utilization ({cpu_load}%) observed during active rendering. This signature indicates recurring intra-frame staging buffer readbacks (Map/CopyResource cycles) where the render thread repeatedly flushes and stalls on GPU fences multiple times per frame. (Common engine flaw in Gust/Koei Tecmo titles and naive D3D9->D3D11 ports).",
                             "action": "Deploy shadow staging buffer wrapper (Atelier Sync Fix) and force dxgi.syncInterval = 0 in profile.toml.",
+                            "fix_id": "atelier_sync_fix",
+                            "fix_button_text": "⚡ Apply Staging Buffer Sync Fix & VSync Off",
                         }
                     )
                 else:
@@ -145,12 +149,16 @@ class DiagnosticAdvisor:
             fps_1 = fm.get("fps_1_pct_low", 0)
             jitter = fm.get("frametime_jitter_ms", 0)
             if fps_avg > 0 and fps_1 > 0 and (fps_1 / fps_avg) < 0.65:
+                cap_target = max(30, int(fps_avg))
                 suggestions.append(
                     {
                         "level": "warning",
                         "title": "Significant Frame Pacing Volatility",
                         "description": f"1% Low FPS ({fps_1:.1f}) dropped to {fps_1/fps_avg:.0%} of average FPS ({fps_avg:.1f}). Frametime jitter was {jitter:.1f}ms.",
-                        "action": f"Set a clean frame rate cap via DXVK_FRAME_RATE={int(fps_avg)} to stabilize frame presentation intervals.",
+                        "action": f"Set a clean frame rate cap via DXVK_FRAME_RATE={cap_target} to stabilize frame presentation intervals.",
+                        "fix_id": "cap_framerate",
+                        "fix_button_text": f"⚡ Cap Frame Rate to {cap_target} FPS",
+                        "cap_target": cap_target,
                     }
                 )
 
@@ -226,7 +234,9 @@ class DiagnosticAdvisor:
                         "level": "error",
                         "title": "Documented Gust Engine D3D11 Sync Stall (ProtonDB)",
                         "description": "ProtonDB reports confirm this title has the severe Gust D3D11 staging buffer sync defect. Without a shadow staging wrapper, the GPU sits mostly idle and FPS drops heavily.",
-                        "action": "Apply Atelier Sync Fix (doitsujin/TellowKrinkle) and set dxgi.syncInterval = 0.",
+                        "action": "Apply Atelier Sync Fix (doitsujin/TellowKrinkle) and set dxgi.syncInterval = 0 in profile.toml.",
+                        "fix_id": "atelier_sync_fix",
+                        "fix_button_text": "⚡ Apply Staging Buffer Sync Fix & VSync Off",
                     }
                 )
             if recs.get("env") or recs.get("args"):
@@ -583,6 +593,7 @@ class ProtoGoblinCommandApp:
         self.var_gfx_async_shader = tk.BooleanVar(value=True)
         self.var_gfx_aniso16 = tk.BooleanVar(value=True)
         self.var_gfx_low_latency = tk.BooleanVar(value=True)
+        self.var_atelier_sync_fix = tk.BooleanVar(value=False)
         self.var_gfx_max_fps = tk.StringVar(value="0")
 
         dxvk_checks = [
@@ -590,6 +601,7 @@ class ProtoGoblinCommandApp:
             ("Asynchronous Shader Compilation (DXVK_ASYNC=1 to prevent stutter)", self.var_gfx_async_shader),
             ("Force 16x Anisotropic Filtering (d3d11.samplerAnisotropy = 16)", self.var_gfx_aniso16),
             ("Low Latency Queue Mode (dxvk.lowLatency = true)", self.var_gfx_low_latency),
+            ("Gust / Atelier D3D11 Staging Buffer Sync Fix (Shadow staging wrapper override)", self.var_atelier_sync_fix),
         ]
         for text, var in dxvk_checks:
             cb = tk.Checkbutton(
@@ -746,6 +758,13 @@ class ProtoGoblinCommandApp:
                 text=f"Active Game: {t_name} (AppID: {tgt.get('steam_appid') or '-'}, Engine: {eng_name})"
             )
 
+        app_id = tgt.get("steam_appid")
+        preset = protogoblin.PresetDatabase.get_preset(app_id) if app_id else None
+        if preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
+            self.var_atelier_sync_fix.set(True)
+        else:
+            self.var_atelier_sync_fix.set(False)
+
         for widget in self.diag_cards_container.winfo_children():
             widget.destroy()
 
@@ -818,6 +837,24 @@ class ProtoGoblinCommandApp:
                     anchor=tk.W,
                 )
                 lbl_a.pack(fill=tk.X)
+
+                if s.get("fix_id"):
+                    fix_id = s["fix_id"]
+                    extra = s.get("cap_target")
+                    btn_fix = tk.Button(
+                        card_frame,
+                        text=s.get("fix_button_text", "⚡ Apply Suggested Fix"),
+                        bg="#238636",
+                        fg="#ffffff",
+                        activebackground="#2ea043",
+                        activeforeground="#ffffff",
+                        font=("Segoe UI", 9, "bold"),
+                        relief=tk.FLAT,
+                        padx=10,
+                        pady=4,
+                        command=lambda fid=fix_id, ext=extra: self.apply_suggested_fix(fid, ext),
+                    )
+                    btn_fix.pack(anchor=tk.W, pady=(8, 2))
 
         # Tab 2: Performance
         self.perf_text.delete("1.0", tk.END)
@@ -943,10 +980,47 @@ class ProtoGoblinCommandApp:
         )
         messagebox.showinfo("PE Binary Inspection", msg)
 
-    def generate_profile_toml(self):
+    def apply_suggested_fix(self, fix_id, extra=None):
         if not self.current_manifest:
-            messagebox.showwarning("Notice", "Select a session first to generate a profile.")
+            messagebox.showwarning("Notice", "Select a session first to apply suggested fix.")
             return
+
+        if fix_id == "atelier_sync_fix":
+            self.var_atelier_sync_fix.set(True)
+            self.var_gfx_vsync_off.set(True)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                "Gust / Atelier D3D11 Staging Buffer Sync Fix applied!\n\n"
+                "• Shadow staging buffer wrapper override enabled ([synchronization.atelier_sync_fix])\n"
+                "• Presentation sync forced off (dxgi.syncInterval = 0)\n\n"
+                f"Saved to profile:\n{path}",
+            )
+        elif fix_id == "async_shader_compile":
+            self.var_gfx_async_shader.set(True)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                "Asynchronous Shader Compilation enabled!\n\n"
+                "• DXVK_ASYNC = 1 enforced in game profile to eliminate pipeline compile stalls.\n\n"
+                f"Saved to profile:\n{path}",
+            )
+        elif fix_id == "cap_framerate":
+            cap = str(extra if extra is not None else 60)
+            self.var_gfx_max_fps.set(cap)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                f"Frame Rate Cap Applied ({cap} FPS)!\n\n"
+                f"• Target frame rate limiter set to {cap} FPS to eliminate frametime jitter.\n\n"
+                f"Saved to profile:\n{path}",
+            )
+
+    def generate_profile_toml(self, silent=False):
+        if not self.current_manifest:
+            if not silent:
+                messagebox.showwarning("Notice", "Select a session first to generate a profile.")
+            return None
 
         tgt = self.current_manifest.get("target", {})
         t_exe = tgt.get("target_executable", {}) or {}
@@ -959,6 +1033,7 @@ class ProtoGoblinCommandApp:
         profile_file = os.path.join(profile_dir, f"{steam_id}.toml")
 
         user_tweaks = {
+            "atelier_sync_fix": self.var_atelier_sync_fix.get(),
             "unreal": {
                 "disable_motion_blur": self.var_ue_motion_blur.get(),
                 "disable_depth_of_field": self.var_ue_depth_of_field.get(),
@@ -1004,12 +1079,16 @@ class ProtoGoblinCommandApp:
         try:
             with open(profile_file, "w", encoding="utf-8") as pf:
                 pf.write(toml_content)
-            messagebox.showinfo(
-                "Profile Created",
-                f"Generated optimization profile with active engine tweaks at:\n{profile_file}",
-            )
+            if not silent:
+                messagebox.showinfo(
+                    "Profile Created",
+                    f"Generated optimization profile with active engine tweaks at:\n{profile_file}",
+                )
+            return profile_file
         except OSError as e:
-            messagebox.showerror("Error", f"Failed to save profile: {e}")
+            if not silent:
+                messagebox.showerror("Error", f"Failed to save profile: {e}")
+            return None
 
 
 def main():

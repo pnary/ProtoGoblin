@@ -483,7 +483,7 @@ class EngineTweakManager:
         return result
 
     @classmethod
-    def generate_profile_toml(cls, game_id, app_id, target_exe, engine_info, sync_backend="ntsync", user_tweaks=None):
+    def generate_profile_toml(cls, game_id, app_id, target_exe, engine_info=None, sync_backend="ntsync", user_tweaks=None):
         tweaks = user_tweaks or {}
         eng_name = engine_info.get("engine", "") if engine_info else ""
         is_ue = eng_name in ["unreal_4", "unreal_5", "unreal"]
@@ -554,6 +554,23 @@ class EngineTweakManager:
                 f'max_fps = {godot_cfg.get("max_fps", 0)}',
             ])
 
+        preset = PresetDatabase.get_preset(app_id) if app_id else None
+        atelier_sync = None
+        if "atelier_sync_fix" in tweaks:
+            atelier_sync = tweaks["atelier_sync_fix"]
+        elif "synchronization" in tweaks and "atelier_sync_fix" in tweaks["synchronization"]:
+            atelier_sync = tweaks["synchronization"]["atelier_sync_fix"]
+        elif preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
+            atelier_sync = True
+
+        if atelier_sync:
+            lines.extend([
+                "",
+                "[synchronization.atelier_sync_fix]",
+                "enabled = true",
+                "# Shadow staging buffer wrapper to eliminate intra-frame CPU-GPU sync stalls",
+            ])
+
         lines.append("")
         return "\n".join(lines)
 
@@ -565,6 +582,7 @@ class EngineTweakManager:
         eng_name = engine_info.get("engine", "") if engine_info else ""
         engine_sec = profile.get("engine", {})
         gfx_sec = profile.get("graphics", {})
+        sync_sec = profile.get("synchronization", {})
 
         new_argv = list(argv)
 
@@ -593,8 +611,22 @@ class EngineTweakManager:
         if godot_cfg.get("max_fps", 0) > 0:
             new_argv.append(f"--max-fps={godot_cfg['max_fps']}")
 
-        # 4. DXVK / Graphics layer intercepts
+        # 4. DXVK & Synchronization layer intercepts
         dxvk_items = []
+
+        # Check for Atelier staging buffer sync fix
+        sync_fix_enabled = (
+            sync_sec.get("atelier_sync_fix")
+            or (isinstance(sync_sec.get("atelier_sync_fix"), dict) and sync_sec["atelier_sync_fix"].get("enabled"))
+            or (isinstance(sync_sec, dict) and sync_sec.get("enabled") and "atelier" in str(sync_sec))
+            or engine_sec.get("gust", {}).get("atelier_sync_fix")
+        )
+        if sync_fix_enabled:
+            dll_ov = env.get("WINEDLLOVERRIDES", "")
+            if "d3d11=" not in dll_ov:
+                env["WINEDLLOVERRIDES"] = f"d3d11=n,b;{dll_ov}" if dll_ov else "d3d11=n,b"
+            dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
+
         if gfx_sec.get("force_vsync") == "off":
             dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
         elif gfx_sec.get("force_vsync") == "on":
