@@ -5,6 +5,7 @@ Phase 0: Process-Tree Tracking, Anti-Cheat Pre-Flight, and Tier-1 Manifest Gener
 """
 
 import csv
+import glob
 import hashlib
 import json
 import os
@@ -1348,6 +1349,7 @@ class ProtoGoblinSession:
         self.process_tree_count = 1
         self.peak_thread_count = 1
         self.tracker = None
+        self.pruned_subsystems = []
 
     def _resolve_version(self):
         v_file = os.path.join(self.proton_dir, "VERSION")
@@ -1384,6 +1386,89 @@ class ProtoGoblinSession:
                 return p_local
 
         return None
+
+    def find_latest_session_manifest(self):
+        """Finds the most recent utilization.json for this game (excluding the current session)."""
+        xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        game_slug = self.steam_appid or "unknown_game"
+        game_dir = os.path.join(xdg_data, "protogoblin", "sessions", game_slug)
+        if not os.path.isdir(game_dir):
+            return None
+        pattern = os.path.join(game_dir, "*", "utilization.json")
+        manifests = glob.glob(pattern)
+        manifests = [m for m in manifests if self.session_id not in m]
+        if not manifests:
+            return None
+        manifests.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return manifests[0]
+
+    def prune_subsystems(self, env, profile=None):
+        """Actively disables unutilized subsystems in Play mode to reduce IPC and hook overhead."""
+        if self.mode != "play":
+            return []
+
+        prune_env = os.environ.get("PROTOGOBLIN_PRUNE", "1").lower()
+        if prune_env in ["0", "false", "no"]:
+            return []
+
+        profile_prune_enabled = True
+        prune_cfg = {}
+        if profile:
+            runtime_sec = profile.get("runtime", {})
+            profile_prune_enabled = runtime_sec.get("prune_unused_subsystems", True)
+            prune_cfg = profile.get("pruning", {})
+
+        if not profile_prune_enabled:
+            return []
+
+        unutilized = set()
+        if prune_cfg:
+            for sub, active in prune_cfg.items():
+                if active:
+                    unutilized.add(sub.lower())
+
+        prev_manifest_path = self.find_latest_session_manifest()
+        if prev_manifest_path and os.path.isfile(prev_manifest_path):
+            try:
+                with open(prev_manifest_path, "r", encoding="utf-8") as f:
+                    prev_data = json.load(f)
+                prev_subs = (prev_data.get("subsystems") or {}).get("unutilized", [])
+                for s in prev_subs:
+                    unutilized.add(str(s).lower())
+            except Exception:
+                pass
+
+        pruned = []
+
+        def _disable_dll(dll_name):
+            cur = env.get("WINEDLLOVERRIDES", "")
+            if f"{dll_name}=" not in cur:
+                env["WINEDLLOVERRIDES"] = f"{dll_name}=d;{cur}" if cur else f"{dll_name}=d"
+
+        # 1. VR / OpenXR Pruning
+        if "openvr" in unutilized or "wineopenxr" in unutilized or "vr" in unutilized or prune_cfg.get("vr"):
+            for vr_dll in ["openvr_api", "wineopenxr", "vrclient", "vrclient_x64"]:
+                _disable_dll(vr_dll)
+            env["PROTON_NO_VR"] = "1"
+            env["PROTON_DISABLE_OPENXR"] = "1"
+            pruned.append("vr")
+
+        # 2. Media Foundation Pruning
+        if ("mfplat" in unutilized and prune_cfg.get("mfplat")) or prune_cfg.get("mfplat"):
+            for mf_dll in ["mfplat", "mfreadwrite"]:
+                _disable_dll(mf_dll)
+            pruned.append("mfplat")
+
+        # 3. D3D12 Pruning (for games that never load d3d12)
+        if ("d3d12" in unutilized and prune_cfg.get("d3d12")) or prune_cfg.get("d3d12"):
+            _disable_dll("d3d12")
+            pruned.append("d3d12")
+
+        if pruned:
+            env["PROTOGOBLIN_PRUNED_SUBSYSTEMS"] = ",".join(pruned)
+            self.pruned_subsystems = pruned
+
+        return pruned
 
     def pre_flight(self, argv, env, prefix_dir=None):
         """Initializes the session directory, probes environment, and runs anti-cheat scan."""
@@ -1477,7 +1562,7 @@ class ProtoGoblinSession:
         is_raw = os.environ.get("PROTOGOBLIN_RAW", "0").lower() in ["1", "true", "yes"]
         presets_enabled = os.environ.get("PROTOGOBLIN_PRESETS", "1").lower() not in ["0", "false", "no"]
 
-        # Apply Game Profile (engine-specific visual & performance overrides)
+        profile = None
         profile_path = self.find_game_profile()
         if profile_path and not is_raw:
             profile = EngineTweakManager.load_profile(profile_path)
@@ -1501,6 +1586,10 @@ class ProtoGoblinSession:
                 for a in recs.get("args", []):
                     if a not in argv:
                         argv.append(a)
+
+        # Active Subsystem Pruning in Play Mode based on prior profiling telemetry
+        if not is_raw:
+            self.prune_subsystems(env, profile=profile)
 
         return argv
 
@@ -1674,6 +1763,7 @@ class ProtoGoblinSession:
             "subsystems": {
                 "loaded": loaded_subsystems,
                 "unutilized": unutilized_subsystems,
+                "pruned": getattr(self, "pruned_subsystems", []),
                 "active_dll_overrides": active_overrides,
             },
             "graphics": {

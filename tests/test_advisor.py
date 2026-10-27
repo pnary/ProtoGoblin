@@ -3,6 +3,7 @@
 Unit tests for ProtoGoblin Command DiagnosticAdvisor and EngineDetector
 """
 
+import json
 import os
 import shutil
 import sys
@@ -598,6 +599,119 @@ class TestSessionComparison(unittest.TestCase):
         self.assertEqual(diff["verdict"], "NEUTRAL")
         report = format_diff_report(diff)
         self.assertIn("NOTICE: One or both sessions were executed in PLAY mode", report)
+
+
+class TestSubsystemPruning(unittest.TestCase):
+    def test_subsystem_pruning_play_mode_from_prior_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = td
+            try:
+                # Create prior profiling session with unutilized subsystems
+                game_dir = os.path.join(td, "protogoblin", "sessions", "12345", "prior_session")
+                os.makedirs(game_dir, exist_ok=True)
+                prior_manifest = {
+                    "session": {"id": "prior_session", "mode": "profile"},
+                    "subsystems": {
+                        "loaded": ["kernel32", "dxgi", "d3d11"],
+                        "unutilized": ["openvr", "wineopenxr", "d3d12"],
+                    },
+                }
+                with open(os.path.join(game_dir, "utilization.json"), "w", encoding="utf-8") as f:
+                    json.dump(prior_manifest, f)
+
+                # Run session in play mode
+                sess = ProtoGoblinSession(steam_appid=12345, mode="play")
+                env = {}
+                sess.pre_flight(["Game.exe"], env)
+
+                self.assertIn("vr", sess.pruned_subsystems)
+                self.assertIn("openvr_api=d", env.get("WINEDLLOVERRIDES", ""))
+                self.assertIn("wineopenxr=d", env.get("WINEDLLOVERRIDES", ""))
+                self.assertEqual(env.get("PROTON_NO_VR"), "1")
+                self.assertEqual(env.get("PROTON_DISABLE_OPENXR"), "1")
+                self.assertIn("vr", env.get("PROTOGOBLIN_PRUNED_SUBSYSTEMS", ""))
+            finally:
+                if old_xdg:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+
+    def test_subsystem_pruning_disabled_in_profile_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = td
+            try:
+                game_dir = os.path.join(td, "protogoblin", "sessions", "12345", "prior_session")
+                os.makedirs(game_dir, exist_ok=True)
+                prior_manifest = {
+                    "session": {"id": "prior_session"},
+                    "subsystems": {"unutilized": ["openvr", "wineopenxr"]},
+                }
+                with open(os.path.join(game_dir, "utilization.json"), "w", encoding="utf-8") as f:
+                    json.dump(prior_manifest, f)
+
+                # In profile mode, pruning should NOT occur
+                sess = ProtoGoblinSession(steam_appid=12345, mode="profile")
+                env = {}
+                sess.pre_flight(["Game.exe"], env)
+
+                self.assertEqual(sess.pruned_subsystems, [])
+                self.assertNotIn("openvr_api=d", env.get("WINEDLLOVERRIDES", ""))
+                self.assertNotIn("PROTON_NO_VR", env)
+            finally:
+                if old_xdg:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+
+    def test_subsystem_pruning_disabled_via_env(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            old_prune = os.environ.get("PROTOGOBLIN_PRUNE")
+            os.environ["XDG_DATA_HOME"] = td
+            os.environ["PROTOGOBLIN_PRUNE"] = "0"
+            try:
+                game_dir = os.path.join(td, "protogoblin", "sessions", "12345", "prior_session")
+                os.makedirs(game_dir, exist_ok=True)
+                prior_manifest = {
+                    "session": {"id": "prior_session"},
+                    "subsystems": {"unutilized": ["openvr", "wineopenxr"]},
+                }
+                with open(os.path.join(game_dir, "utilization.json"), "w", encoding="utf-8") as f:
+                    json.dump(prior_manifest, f)
+
+                sess = ProtoGoblinSession(steam_appid=12345, mode="play")
+                env = {}
+                sess.pre_flight(["Game.exe"], env)
+
+                self.assertEqual(sess.pruned_subsystems, [])
+                self.assertNotIn("openvr_api=d", env.get("WINEDLLOVERRIDES", ""))
+            finally:
+                if old_xdg:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                if old_prune is not None:
+                    os.environ["PROTOGOBLIN_PRUNE"] = old_prune
+                else:
+                    os.environ.pop("PROTOGOBLIN_PRUNE", None)
+
+    def test_subsystem_pruning_via_profile_config(self):
+        sess = ProtoGoblinSession(steam_appid=55555, mode="play")
+        env = {}
+        profile = {
+            "runtime": {"prune_unused_subsystems": True},
+            "pruning": {"vr": True, "mfplat": True, "d3d12": True},
+        }
+        pruned = sess.prune_subsystems(env, profile=profile)
+        self.assertIn("vr", pruned)
+        self.assertIn("mfplat", pruned)
+        self.assertIn("d3d12", pruned)
+        self.assertIn("openvr_api=d", env.get("WINEDLLOVERRIDES", ""))
+        self.assertIn("mfplat=d", env.get("WINEDLLOVERRIDES", ""))
+        self.assertIn("d3d12=d", env.get("WINEDLLOVERRIDES", ""))
+        self.assertEqual(env.get("PROTON_NO_VR"), "1")
 
 
 if __name__ == "__main__":

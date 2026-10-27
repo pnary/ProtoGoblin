@@ -1427,6 +1427,7 @@ class ProtoGoblinCommandApp:
                 f"Kernel Fast Path:     {'Enabled' if sync.get('fast_path_enabled') else 'Disabled'}",
                 f"Subsystems Loaded:    {', '.join(sub.get('loaded', []))}",
                 f"Subsystems Unutilized:{', '.join(sub.get('unutilized', []))}",
+                f"Subsystems Pruned:    {', '.join(sub.get('pruned', [])) or 'None'}",
             ]
         )
         self.sys_text.insert(tk.END, "\n".join(s_lines))
