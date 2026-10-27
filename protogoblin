@@ -310,12 +310,31 @@ def cmd_version(args):
     return 0
 
 
+def cmd_gui(args):
+    """Launches ProtoGoblin Command GUI."""
+    gui_script = os.path.join(SCRIPT_DIR, "protogoblin_command.py")
+    if not os.path.isfile(gui_script):
+        print(red(f"Error: GUI launcher script not found at {gui_script}"))
+        return 1
+    import subprocess
+
+    cmd = [sys.executable, gui_script]
+    if args.session_id:
+        cmd.extend(["--session", args.session_id])
+    return subprocess.call(cmd)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="protogoblin",
         description="ProtoGoblin CLI - Introspective Telemetry & Session Management",
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to run")
+
+    # gui
+    gui_p = subparsers.add_parser("gui", help="Launch ProtoGoblin Command GUI dashboard")
+    gui_p.add_argument("--session", dest="session_id", default=None, help="Initial session ID or AppID to select")
+    gui_p.set_defaults(func=cmd_gui)
 
     # list
     list_p = subparsers.add_parser("list", help="List recorded gameplay sessions")
