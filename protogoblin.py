@@ -1416,9 +1416,12 @@ class ProtoGoblinSession:
                 "details": {},
             }
 
+        is_raw = os.environ.get("PROTOGOBLIN_RAW", "0").lower() in ["1", "true", "yes"]
+        presets_enabled = os.environ.get("PROTOGOBLIN_PRESETS", "1").lower() not in ["0", "false", "no"]
+
         # Apply Game Profile (engine-specific visual & performance overrides)
         profile_path = self.find_game_profile()
-        if profile_path:
+        if profile_path and not is_raw:
             profile = EngineTweakManager.load_profile(profile_path)
             if profile:
                 argv = EngineTweakManager.apply_tweaks(
@@ -1428,7 +1431,7 @@ class ProtoGoblinSession:
                     env,
                     prefix_dir,
                 )
-        else:
+        elif not is_raw and presets_enabled:
             # Automatic preset bootstrap from PresetDatabase if no custom profile exists
             preset = PresetDatabase.get_preset(self.steam_appid)
             if preset and preset.get("recommended_tweaks"):

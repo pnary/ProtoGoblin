@@ -162,6 +162,21 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertEqual(env.get("VKD3D_FRAME_RATE"), "60")
         self.assertTrue(any("r.MotionBlurQuality 0" in arg for arg in out_argv))
 
+    def test_raw_mode_bypass_presets(self):
+        # Setting PROTOGOBLIN_RAW=1 bypasses presets for clean defect profiling
+        os.environ["PROTOGOBLIN_RAW"] = "1"
+        try:
+            sess = ProtoGoblinSession(mode="profile", steam_appid=2555360)
+            env = {}
+            argv = ["ImmortalsOfAveum.exe"]
+            out_argv = sess.pre_flight(argv, env)
+
+            self.assertIsNone(env.get("VKD3D_FRAME_RATE"))
+            self.assertFalse(any("r.MotionBlurQuality 0" in arg for arg in out_argv))
+            self.assertEqual(out_argv, ["ImmortalsOfAveum.exe"])
+        finally:
+            del os.environ["PROTOGOBLIN_RAW"]
+
 
 class TestEngineDetector(unittest.TestCase):
     def setUp(self):

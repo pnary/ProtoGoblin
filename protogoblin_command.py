@@ -652,9 +652,27 @@ class ProtoGoblinCommandApp:
         )
         entry_fps.pack(side=tk.LEFT, padx=10)
 
-        # Save Button in tweaks tab
+        # Button row in tweaks tab
+        btn_row = tk.Frame(self.tab_tweaks, bg=self.card_bg)
+        btn_row.pack(pady=12)
+
+        btn_stock = tk.Button(
+            btn_row,
+            text="🧹 Reset All to Clean Stock (Disable Tweaks)",
+            bg="#30363d",
+            fg="#c9d1d9",
+            activebackground="#21262d",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9),
+            relief=tk.FLAT,
+            padx=12,
+            pady=8,
+            command=self.reset_tweaks_to_stock,
+        )
+        btn_stock.pack(side=tk.LEFT, padx=6)
+
         btn_apply = tk.Button(
-            self.tab_tweaks,
+            btn_row,
             text="💾 Save & Apply Profile TOML for Selected Game",
             bg="#238636",
             fg="#ffffff",
@@ -666,7 +684,7 @@ class ProtoGoblinCommandApp:
             pady=8,
             command=self.generate_profile_toml,
         )
-        btn_apply.pack(pady=12)
+        btn_apply.pack(side=tk.LEFT, padx=6)
 
     def _build_perf_tab(self):
         self.perf_text = tk.Text(
@@ -1000,6 +1018,40 @@ class ProtoGoblinCommandApp:
             f"Anti-Cheat Detected: {'YES (' + ac.get('provider') + ')' if ac.get('detected') else 'Clean (None)'}"
         )
         messagebox.showinfo("PE Binary Inspection", msg)
+
+    def reset_tweaks_to_stock(self):
+        """Disables all engine tweaks, overrides, and limiters to establish a raw baseline."""
+        self.var_ue_motion_blur.set(False)
+        self.var_ue_depth_of_field.set(False)
+        self.var_ue_chromatic_aberration.set(False)
+        self.var_ue_film_grain.set(False)
+        self.var_ue_lens_flare.set(False)
+        self.var_ue_volumetric_fog.set(False)
+        self.var_ue_lumen.set(False)
+
+        self.var_unity_native_jobs.set(False)
+        self.var_unity_disable_vr.set(False)
+        self.var_unity_vulkan.set(False)
+
+        self.var_godot_vsync.set(False)
+        self.var_godot_vulkan.set(False)
+
+        self.var_gfx_vsync_off.set(False)
+        self.var_gfx_async_shader.set(False)
+        self.var_gfx_aniso16.set(False)
+        self.var_gfx_low_latency.set(False)
+        self.var_atelier_sync_fix.set(False)
+        self.var_gfx_max_fps.set("0")
+
+        if self.current_manifest:
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Stock Baseline Set",
+                f"All overrides disabled in profile TOML:\n{path}\n\n"
+                "The game will execute in raw/unmodified stock mode for clean baseline profiling.",
+            )
+        else:
+            messagebox.showinfo("Reset Complete", "All tweak toggles have been reset to stock / disabled.")
 
     def apply_suggested_fix(self, fix_id, extra=None):
         if not self.current_manifest:
