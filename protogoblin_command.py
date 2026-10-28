@@ -270,6 +270,45 @@ class DiagnosticAdvisor:
                         }
                     )
 
+        # 4c. Filesystem & Asset Streaming Traversal I/O Telemetry
+        fs = manifest.get("filesystem", {})
+        io_stats = fs.get("io_cache_stats")
+        if io_stats:
+            reads_total = io_stats.get("reads_total", 0)
+            hits = io_stats.get("reads_cached_hits", 0)
+            hit_rate = io_stats.get("hit_rate_pct", 0.0)
+            saved_mb = io_stats.get("bytes_cached_saved", 0) / (1024 * 1024)
+            saved_ms = io_stats.get("estimated_latency_saved_ms", 0.0)
+            io_active = io_stats.get("io_cache_active", False)
+
+            if reads_total >= 1000:
+                if not io_active:
+                    suggestions.append(
+                        {
+                            "level": "warning",
+                            "title": f"Synchronous Traversal File I/O Overhead ({reads_total:,} Reads)",
+                            "description": (
+                                f"The game issued {reads_total:,} synchronous asset streaming reads ({io_stats.get('bytes_read_total', 0) / (1024*1024):.1f} MB), "
+                                "triggering repeated Wine/kernel boundary crossings during traversal. This is a primary driver of zone traversal micro-stutter."
+                            ),
+                            "action": "Enable Adaptive Traversal File I/O Cache in profile.toml [filesystem.io_cache].",
+                            "fix_id": "enable_io_cache",
+                            "fix_button_text": "⚡ Enable Traversal File I/O Cache",
+                        }
+                    )
+                else:
+                    suggestions.append(
+                        {
+                            "level": "success",
+                            "title": f"Traversal File I/O Cache Active ({hit_rate:.1f}% Hit Rate)",
+                            "description": (
+                                f"Satisfied {hits:,} of {reads_total:,} asset reads directly from RAM cache ({saved_mb:.1f} MB saved), "
+                                f"preventing ~{saved_ms:.1f}ms of synchronous disk/kernel traversal stalls."
+                            ),
+                            "action": "Optimal asset streaming read-ahead caching is active.",
+                        }
+                    )
+
         # 5. Subsystem Pruning
         unutilized = sub.get("unutilized", [])
         if unutilized:
@@ -1202,6 +1241,31 @@ class ProtoGoblinCommandApp:
         )
         entry_fps.pack(side=tk.LEFT, padx=10)
 
+        # 4. Filesystem & Asset Streaming Card
+        self.fs_frame = tk.LabelFrame(
+            container,
+            text=" Filesystem & Asset Streaming Overrides ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.fs_frame.pack(fill=tk.X, pady=6)
+
+        self.var_fs_io_cache = tk.BooleanVar(value=True)
+        cb_fs = tk.Checkbutton(
+            self.fs_frame,
+            text="Adaptive Asset Streaming Read-Ahead Cache (Eliminates traversal stutter in open-world titles)",
+            variable=self.var_fs_io_cache,
+            bg="#161b22",
+            fg="#c9d1d9",
+            selectcolor="#0d1117",
+            activebackground="#161b22",
+            activeforeground="#58a6ff",
+        )
+        cb_fs.pack(anchor=tk.W, pady=2)
+
         # Button row in tweaks tab
         btn_row = tk.Frame(self.tab_tweaks, bg=self.card_bg)
         btn_row.pack(pady=12)
@@ -1849,6 +1913,21 @@ class ProtoGoblinCommandApp:
                 ]
             )
 
+        io_stats = sess.get("filesystem", {}).get("io_cache_stats")
+        if io_stats:
+            p_lines.extend(
+                [
+                    "",
+                    "FILESYSTEM & ASSET STREAMING TELEMETRY",
+                    "-" * 60,
+                    f"Cache Active:           {'YES' if io_stats.get('io_cache_active') else 'NO'}",
+                    f"Tracked Game Archives:  {io_stats.get('tracked_archives_count', 0)} containers",
+                    f"Synchronous Reads:      {io_stats.get('reads_total', 0):,} total | {io_stats.get('reads_cached_hits', 0):,} cache hits ({io_stats.get('hit_rate_pct', 0.0):.1f}%)",
+                    f"Data Streamed / Saved:  {io_stats.get('bytes_read_total', 0) / (1024*1024):.1f} MB read | {io_stats.get('bytes_cached_saved', 0) / (1024*1024):.1f} MB served from RAM",
+                    f"Est. Latency Avoided:   {io_stats.get('estimated_latency_saved_ms', 0.0):.1f} ms",
+                ]
+            )
+
         self.perf_text.insert(tk.END, "\n".join(p_lines))
 
         # Tab 3: System & Translation
@@ -2049,6 +2128,7 @@ class ProtoGoblinCommandApp:
         self.var_atelier_sync_fix.set(False)
         self.var_sync_state_dedup.set(False)
         self.var_sync_swapchain_debounce.set(False)
+        self.var_fs_io_cache.set(False)
         self.var_gfx_max_fps.set("0")
 
         if self.current_manifest:
@@ -2116,6 +2196,16 @@ class ProtoGoblinCommandApp:
                 "• DXGI SwapChain rapid resize debouncing enabled to eliminate UI/render-target presentation stalls.\n\n"
                 f"Saved to profile:\n{path}",
             )
+        elif fix_id == "enable_io_cache":
+            self.var_fs_io_cache.set(True)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                "Adaptive Traversal File I/O Cache enabled ([filesystem.io_cache])!\n\n"
+                "• Intercepts synchronous reads on streaming archive containers (.pak, .bundle, etc.)\n"
+                "• Read-ahead LRU ring buffer satisfies asset reads directly from RAM to eliminate traversal hitching.\n\n"
+                f"Saved to profile:\n{path}",
+            )
 
     def generate_profile_toml(self, silent=False):
         if not self.current_manifest:
@@ -2170,6 +2260,9 @@ class ProtoGoblinCommandApp:
                 "ntsync": self.var_sync_ntsync.get(),
                 "state_dedup": self.var_sync_state_dedup.get(),
                 "swapchain_debounce": self.var_sync_swapchain_debounce.get(),
+            },
+            "filesystem": {
+                "io_cache": self.var_fs_io_cache.get(),
             },
         }
 

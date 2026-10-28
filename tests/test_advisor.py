@@ -189,6 +189,48 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertEqual(len(active_suggs), 1)
         self.assertEqual(active_suggs[0]["level"], "success")
 
+    def test_direct_io_stats_unoptimized_warning(self):
+        m_unopt = {
+            "filesystem": {
+                "io_cache_stats": {
+                    "io_cache_active": False,
+                    "tracked_archives_count": 5,
+                    "reads_total": 4500,
+                    "reads_cached_hits": 0,
+                    "hit_rate_pct": 0.0,
+                    "bytes_read_total": 15000000,
+                    "bytes_cached_saved": 0,
+                    "estimated_latency_saved_ms": 0.0,
+                }
+            }
+        }
+        suggs = DiagnosticAdvisor.analyze(m_unopt)
+        io_suggs = [s for s in suggs if "Synchronous Traversal File I/O Overhead" in s["title"]]
+        self.assertEqual(len(io_suggs), 1)
+        self.assertEqual(io_suggs[0]["level"], "warning")
+        self.assertEqual(io_suggs[0]["fix_id"], "enable_io_cache")
+        self.assertIn("Enable Traversal File I/O Cache", io_suggs[0]["fix_button_text"])
+
+    def test_direct_io_stats_optimized_success(self):
+        m_opt = {
+            "filesystem": {
+                "io_cache_stats": {
+                    "io_cache_active": True,
+                    "tracked_archives_count": 5,
+                    "reads_total": 4500,
+                    "reads_cached_hits": 3600,
+                    "hit_rate_pct": 80.0,
+                    "bytes_read_total": 15000000,
+                    "bytes_cached_saved": 12000000,
+                    "estimated_latency_saved_ms": 54.0,
+                }
+            }
+        }
+        suggs = DiagnosticAdvisor.analyze(m_opt)
+        io_suggs = [s for s in suggs if "Traversal File I/O Cache Active" in s["title"]]
+        self.assertEqual(len(io_suggs), 1)
+        self.assertEqual(io_suggs[0]["level"], "success")
+
     def test_subsystem_pruning_opportunity(self):
         manifest = {
             "subsystems": {
@@ -629,6 +671,67 @@ class TestEngineTweakManager(unittest.TestCase):
                 self.assertIsNotNone(d3d11_metrics)
                 self.assertTrue(d3d11_metrics["state_dedup_active"])
                 self.assertEqual(d3d11_metrics["constant_buffers"]["updates_redundant"], 3000)
+            finally:
+                if old_base:
+                    os.environ["PROTOGOBLIN_SESSIONS_DIR"] = old_base
+                else:
+                    os.environ.pop("PROTOGOBLIN_SESSIONS_DIR", None)
+
+    def test_io_cache_profile_and_env_injection(self):
+        # 1. Profile generation
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="2555360",
+            app_id=2555360,
+            target_exe="Game.exe",
+            user_tweaks={"filesystem": {"io_cache": True}},
+        )
+        self.assertIn("[filesystem.io_cache]", toml_text)
+        self.assertIn("enabled = true", toml_text)
+
+        # 2. Applying tweaks injects PROTOGOBLIN_IO_CACHE=1 and LD_PRELOAD if .so found
+        with tempfile.TemporaryDirectory() as td:
+            lib64 = os.path.join(td, "share", "protogoblin", "lib64")
+            os.makedirs(lib64, exist_ok=True)
+            so_file = os.path.join(lib64, "libprotogoblin_io_cache.so")
+            with open(so_file, "w") as f:
+                f.write("mock")
+
+            profile = {"filesystem": {"io_cache": {"enabled": True}}}
+            env = {}
+            EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env, proton_dir=td)
+            self.assertEqual(env.get("PROTOGOBLIN_IO_CACHE"), "1")
+            self.assertIn(so_file, env.get("LD_PRELOAD", ""))
+
+    def test_post_flight_ingests_io_cache_stats(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_base = os.environ.get("PROTOGOBLIN_SESSIONS_DIR")
+            os.environ["PROTOGOBLIN_SESSIONS_DIR"] = td
+            try:
+                sess = ProtoGoblinSession(steam_appid=55555)
+                env = {}
+                sess.pre_flight(["Game.exe"], env)
+
+                # Simulate I/O cache emitting stats
+                io_stats_path = os.path.join(sess.session_dir, "protogoblin_io_stats.json")
+                stats_payload = {
+                    "io_cache_active": True,
+                    "tracked_archives_count": 8,
+                    "reads_total": 12000,
+                    "reads_cached_hits": 9500,
+                    "hit_rate_pct": 79.17,
+                    "bytes_read_total": 50000000,
+                    "bytes_cached_saved": 40000000,
+                    "estimated_latency_saved_ms": 142.5,
+                }
+                with open(io_stats_path, "w", encoding="utf-8") as f:
+                    json.dump(stats_payload, f)
+
+                manifest = sess.post_flight(0, env=env)
+                self.assertIsNotNone(manifest)
+                fs_metrics = manifest.get("filesystem", {}).get("io_cache_stats")
+                self.assertIsNotNone(fs_metrics)
+                self.assertTrue(fs_metrics["io_cache_active"])
+                self.assertEqual(fs_metrics["reads_cached_hits"], 9500)
             finally:
                 if old_base:
                     os.environ["PROTOGOBLIN_SESSIONS_DIR"] = old_base

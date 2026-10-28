@@ -619,6 +619,19 @@ class EngineTweakManager:
                 "# Swapchain ResizeBuffers debounce filter to eliminate UI/focus resolution micro-stutters",
             ])
 
+        io_cache = None
+        if "io_cache" in tweaks:
+            io_cache = tweaks["io_cache"]
+        elif "filesystem" in tweaks and "io_cache" in tweaks["filesystem"]:
+            io_cache = tweaks["filesystem"]["io_cache"]
+        if io_cache:
+            lines.extend([
+                "",
+                "[filesystem.io_cache]",
+                "enabled = true",
+                "# Adaptive read-ahead cache to eliminate traversal stutter in asset-streaming titles",
+            ])
+
         lines.append("")
         return "\n".join(lines)
 
@@ -749,6 +762,27 @@ class EngineTweakManager:
                     cls._patch_unreal_engine_ini(prefix_dir, cvars)
             except Exception:
                 pass
+
+        # 6. Filesystem & Asset Streaming I/O Cache
+        fs_sec = profile.get("filesystem", {})
+        io_cache_enabled = (
+            fs_sec.get("io_cache")
+            or (isinstance(fs_sec.get("io_cache"), dict) and fs_sec["io_cache"].get("enabled"))
+            or profile.get("io_cache")
+        )
+        if io_cache_enabled:
+            env["PROTOGOBLIN_IO_CACHE"] = "1"
+            p_dir = proton_dir or os.environ.get("PROTOGOBLIN_DIR") or os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(p_dir, "share", "protogoblin", "lib64", "libprotogoblin_io_cache.so"),
+                os.path.join(p_dir, "lib64", "libprotogoblin_io_cache.so"),
+                os.path.join(p_dir, "dist", "share", "protogoblin", "lib64", "libprotogoblin_io_cache.so"),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    cur_ld = env.get("LD_PRELOAD", "")
+                    env["LD_PRELOAD"] = f"{c}:{cur_ld}" if cur_ld else c
+                    break
 
         return new_argv
 
@@ -1823,6 +1857,16 @@ class ProtoGoblinSession:
             except Exception:
                 pass
 
+        # Ingest Filesystem / I/O cache telemetry if emitted during session
+        io_stats_file = os.path.join(self.session_dir, "protogoblin_io_stats.json")
+        io_cache_stats = None
+        if os.path.exists(io_stats_file):
+            try:
+                with open(io_stats_file, "r", encoding="utf-8") as f:
+                    io_cache_stats = json.load(f)
+            except Exception:
+                pass
+
         manifest = {
             "schema_version": self.schema_version,
             "session": {
@@ -1858,6 +1902,9 @@ class ProtoGoblinSession:
                 "unutilized": unutilized_subsystems,
                 "pruned": getattr(self, "pruned_subsystems", []),
                 "active_dll_overrides": active_overrides,
+            },
+            "filesystem": {
+                "io_cache_stats": io_cache_stats,
             },
             "graphics": {
                 "active_backend": active_backend,

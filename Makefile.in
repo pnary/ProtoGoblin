@@ -991,6 +991,7 @@ include $(SRC)/vklayers/build-vkbasalt.mk
 include $(SRC)/vklayers/build-mangohud.mk
 include $(SRC)/vklayers/build-steam-overlay-wayland.mk
 include $(SRC)/vklayers/build-staging-sync-fix.mk
+include $(SRC)/vklayers/build-io-cache.mk
 endif # WITHOUT_VKLAYERS
 
 
