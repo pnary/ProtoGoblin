@@ -16,6 +16,9 @@ TARGET_ARCH="$(uname -m 2>/dev/null || echo 'x86_64')"
 [[ "$TARGET_ARCH" == "amd64" ]] && TARGET_ARCH="x86_64"
 FORCE_BUILD=false
 DEV_OVERLAY=false
+EXPLICIT_UPDATE=false
+CHECK_ONLY=false
+FORCE_UPDATE=false
 BASE_PROTON=""
 CUSTOM_DEST=""
 
@@ -41,6 +44,9 @@ Options:
   --build                 Perform a full containerized build from source before installing.
   --dev                   Developer overlay mode: graft ProtoGoblin scripts/presets onto
                           an existing Proton installation (fast, no 45-minute Wine recompile).
+  --update                Check existing deployment and update outdated components in-place.
+  --check                 Check if the existing deployment is up to date without modifying files.
+  --force                 Force update/refresh even if components appear current.
   --base-proton PATH      Base Proton directory for --dev mode (auto-detected if omitted).
   --name NAME             Internal tool name (default: ProtoGoblin-local).
   --display-name NAME     Visible name in Steam drop-down (default: "ProtoGoblin (Local Build)").
@@ -49,11 +55,14 @@ Options:
   -h, --help              Show this help message and exit.
 
 Examples:
-  # Install from existing build folder or build by default if not found:
+  # Automatically check existing deployment and update if needed, or install:
   ./install_to_steam.sh
 
-  # Quick developer install onto existing Proton:
-  ./install_to_steam.sh --dev
+  # Check whether existing deployment matches latest repository files:
+  ./install_to_steam.sh --check
+
+  # Explicitly update existing deployment in-place:
+  ./install_to_steam.sh --update
 
   # Force full container build and install:
   ./install_to_steam.sh --build --engine=docker
@@ -69,6 +78,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dev)
             DEV_OVERLAY=true
+            shift
+            ;;
+        --update)
+            EXPLICIT_UPDATE=true
+            shift
+            ;;
+        --check)
+            CHECK_ONLY=true
+            shift
+            ;;
+        --force)
+            FORCE_UPDATE=true
             shift
             ;;
         --base-proton)
@@ -203,46 +224,119 @@ find_base_proton() {
     echo ""
 }
 
-# 4. Perform Build / Sync Logic
-mkdir -p "$COMPAT_DIR"
-
-build_from_source() {
-    local ENGINE
-    ENGINE="$(detect_engine)"
-    if [[ -z "$ENGINE" ]]; then
-        log_err "Neither docker nor podman found. Install one or run with --dev overlay mode."
-        exit 1
-    fi
-    log_info "Configuring and running full build via $ENGINE..."
-    local BUILD_DIR="${SCRIPT_DIR}/build"
-    mkdir -p "$BUILD_DIR"
-    pushd "$BUILD_DIR" >/dev/null
-    chmod +x "${SCRIPT_DIR}/configure.sh" 2>/dev/null || true
-    "${SCRIPT_DIR}/configure.sh" --build-name="$BUILD_NAME" --target-arch="$TARGET_ARCH" --container-engine="$ENGINE"
-    make -j"$(nproc)"
-    popd >/dev/null
-
-    log_info "Installing built binaries to Steam..."
-    mkdir -p "$TOOL_DIR"
-    rsync --delete -arx "${BUILD_DIR}/dist/" "${TOOL_DIR}/"
+# 4. Deployment Detection & Component Verification
+check_existing_deployment() {
+    [[ -d "$TOOL_DIR" ]] && ([[ -f "${TOOL_DIR}/compatibilitytool.vdf" ]] || [[ -f "${TOOL_DIR}/proton" ]])
 }
 
-if [[ "$FORCE_BUILD" == true ]]; then
-    build_from_source
+get_outdated_components() {
+    local outdated=()
+    local CORE_FILES=(
+        "proton"
+        "protogoblin.py"
+        "protogoblin_command.py"
+        "protogoblin"
+        "utilities.py"
+        "vulkan.py"
+        "filelock.py"
+        "default_pfx.py"
+    )
+    for f in "${CORE_FILES[@]}"; do
+        if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
+            if [[ ! -f "${TOOL_DIR}/${f}" ]] || ! cmp -s "${SCRIPT_DIR}/${f}" "${TOOL_DIR}/${f}"; then
+                outdated+=("${f}")
+            fi
+        fi
+    done
 
-elif [[ "$DEV_OVERLAY" == true ]]; then
-    DETECTED_BASE="$(find_base_proton)"
-    if [[ -z "$DETECTED_BASE" ]]; then
-        log_err "No existing Proton installation found to overlay onto."
-        log_err "Please provide --base-proton /path/to/Proton or use --build."
-        exit 1
+    local preset="share/protogoblin/protogoblin_presets.json"
+    if [[ -f "${SCRIPT_DIR}/${preset}" ]]; then
+        if [[ ! -f "${TOOL_DIR}/${preset}" ]] || ! cmp -s "${SCRIPT_DIR}/${preset}" "${TOOL_DIR}/${preset}"; then
+            outdated+=("${preset}")
+        fi
     fi
-    log_info "Using base Proton runtime from: ${DETECTED_BASE}"
-    log_info "Copying base runtime to ${TOOL_DIR}..."
-    mkdir -p "$TOOL_DIR"
-    rsync -arx --exclude "compatibilitytool.vdf" "${DETECTED_BASE}/" "${TOOL_DIR}/"
 
-    log_info "Injecting ProtoGoblin runtime, introspective hooks, and presets..."
+    if [[ -d "${SCRIPT_DIR}/tools" ]]; then
+        for f in "${SCRIPT_DIR}/tools"/*; do
+            if [[ -f "$f" ]]; then
+                local bname="$(basename "$f")"
+                if [[ ! -f "${TOOL_DIR}/tools/${bname}" ]] || ! cmp -s "$f" "${TOOL_DIR}/tools/${bname}"; then
+                    outdated+=("tools/${bname}")
+                fi
+            fi
+        done
+    fi
+
+    if [[ -d "${SCRIPT_DIR}/vklayers/staging-sync-fix" ]]; then
+        for f in "${SCRIPT_DIR}/vklayers/staging-sync-fix"/*; do
+            if [[ -f "$f" ]]; then
+                local bname="$(basename "$f")"
+                if [[ ! -f "${TOOL_DIR}/vklayers/staging-sync-fix/${bname}" ]] || ! cmp -s "$f" "${TOOL_DIR}/vklayers/staging-sync-fix/${bname}"; then
+                    outdated+=("vklayers/staging-sync-fix/${bname}")
+                fi
+            fi
+        done
+    fi
+
+    if [[ -d "${SCRIPT_DIR}/vklayers/io-cache" ]]; then
+        for f in "${SCRIPT_DIR}/vklayers/io-cache"/*; do
+            if [[ -f "$f" ]]; then
+                local bname="$(basename "$f")"
+                if [[ ! -f "${TOOL_DIR}/vklayers/io-cache/${bname}" ]] || ! cmp -s "$f" "${TOOL_DIR}/vklayers/io-cache/${bname}"; then
+                    outdated+=("vklayers/io-cache/${bname}")
+                fi
+            fi
+        done
+        local so_path="${TOOL_DIR}/share/protogoblin/lib64/libprotogoblin_io_cache.so"
+        if command -v g++ &>/dev/null; then
+            if [[ ! -f "$so_path" ]] || [[ "${SCRIPT_DIR}/vklayers/io-cache/io_cache.cpp" -nt "$so_path" ]]; then
+                outdated+=("share/protogoblin/lib64/libprotogoblin_io_cache.so")
+            fi
+        fi
+    fi
+
+    local vdf="${TOOL_DIR}/compatibilitytool.vdf"
+    if [[ ! -f "$vdf" ]] || ! grep -q "\"${BUILD_NAME}\"" "$vdf" 2>/dev/null; then
+        outdated+=("compatibilitytool.vdf")
+    fi
+
+    echo "${outdated[@]}"
+}
+
+write_manifest() {
+    local VDF_PATH="${TOOL_DIR}/compatibilitytool.vdf"
+    log_info "Writing Steam registration manifest: ${VDF_PATH}"
+
+    cat > "$VDF_PATH" <<EOF
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "${BUILD_NAME}"
+    {
+      "install_path" "."
+      "display_name" "${DISPLAY_NAME}"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}
+EOF
+
+    chmod +x "${TOOL_DIR}/proton" 2>/dev/null || true
+    if [[ -f "${TOOL_DIR}/protogoblin.py" ]]; then
+        chmod +x "${TOOL_DIR}/protogoblin.py"
+    fi
+    if [[ -f "${TOOL_DIR}/protogoblin_command.py" ]]; then
+        chmod +x "${TOOL_DIR}/protogoblin_command.py"
+    fi
+    if [[ -f "${TOOL_DIR}/protogoblin" ]]; then
+        chmod +x "${TOOL_DIR}/protogoblin"
+    fi
+}
+
+install_protogoblin_components() {
+    log_info "Synchronizing ProtoGoblin runtime, introspective hooks, and presets..."
     cp -f "${SCRIPT_DIR}/proton" "${TOOL_DIR}/proton"
     cp -f "${SCRIPT_DIR}/protogoblin.py" "${TOOL_DIR}/protogoblin.py"
     cp -f "${SCRIPT_DIR}/protogoblin_command.py" "${TOOL_DIR}/protogoblin_command.py"
@@ -267,9 +361,10 @@ elif [[ "$DEV_OVERLAY" == true ]]; then
     if [[ -d "${SCRIPT_DIR}/tools" ]]; then
         mkdir -p "${TOOL_DIR}/tools"
         cp -rf "${SCRIPT_DIR}/tools/"* "${TOOL_DIR}/tools/"
+        chmod +x "${TOOL_DIR}/tools/"* 2>/dev/null || true
     fi
 
-    # Install vendored libraries (such as D3D11 staging buffer sync fix)
+    # Install vendored libraries (such as D3D11 staging buffer sync fix and I/O cache)
     if [[ -d "${SCRIPT_DIR}/share/protogoblin/lib64" ]]; then
         mkdir -p "${TOOL_DIR}/share/protogoblin/lib64"
         cp -rf "${SCRIPT_DIR}/share/protogoblin/lib64/"* "${TOOL_DIR}/share/protogoblin/lib64/" 2>/dev/null || true
@@ -289,69 +384,155 @@ elif [[ "$DEV_OVERLAY" == true ]]; then
         cp -rf "${SCRIPT_DIR}/vklayers/io-cache/"* "${TOOL_DIR}/vklayers/io-cache/" 2>/dev/null || true
         if command -v g++ &>/dev/null; then
             mkdir -p "${TOOL_DIR}/share/protogoblin/lib64"
-            log_info "Building libprotogoblin_io_cache.so..."
-            g++ -O2 -fPIC -shared -std=c++17 "${SCRIPT_DIR}/vklayers/io-cache/io_cache.cpp" -o "${TOOL_DIR}/share/protogoblin/lib64/libprotogoblin_io_cache.so" -ldl -lpthread 2>/dev/null || true
+            local so_path="${TOOL_DIR}/share/protogoblin/lib64/libprotogoblin_io_cache.so"
+            if [[ ! -f "$so_path" ]] || [[ "${SCRIPT_DIR}/vklayers/io-cache/io_cache.cpp" -nt "$so_path" ]] || [[ "$FORCE_UPDATE" == true ]]; then
+                log_info "Building libprotogoblin_io_cache.so..."
+                g++ -O2 -fPIC -shared -std=c++17 "${SCRIPT_DIR}/vklayers/io-cache/io_cache.cpp" -o "$so_path" -ldl -lpthread 2>/dev/null || true
+            fi
         fi
     fi
+
+    write_manifest
+}
+
+update_existing_deployment() {
+    log_info "Checking existing deployment at: ${TOOL_DIR}"
+    local outdated=($(get_outdated_components))
+    if [[ ${#outdated[@]} -eq 0 ]] && [[ "$FORCE_UPDATE" != true ]]; then
+        log_ok "Existing deployment is already up to date with repository changes."
+        return 0
+    fi
+
+    if [[ "$FORCE_UPDATE" == true ]]; then
+        log_info "Force update requested. Refreshing all ProtoGoblin components..."
+    else
+        log_warn "Detected ${#outdated[@]} outdated component(s):"
+        for item in "${outdated[@]}"; do
+            echo "   • ${item}"
+        done
+        log_info "Updating deployment with latest changes..."
+    fi
+
+    install_protogoblin_components
+    log_ok "Existing ProtoGoblin deployment successfully updated!"
+}
+
+check_deployment_status() {
+    if ! check_existing_deployment; then
+        log_warn "No existing ProtoGoblin deployment found at: ${TOOL_DIR}"
+        return 1
+    fi
+
+    log_info "Checking deployment status at: ${TOOL_DIR}"
+    local outdated=($(get_outdated_components))
+    if [[ ${#outdated[@]} -eq 0 ]]; then
+        log_ok "ProtoGoblin deployment is fully up to date."
+        return 0
+    else
+        log_warn "ProtoGoblin deployment has ${#outdated[@]} outdated component(s):"
+        for item in "${outdated[@]}"; do
+            echo "   • ${item}"
+        done
+        return 1
+    fi
+}
+
+install_dev_overlay() {
+    if check_existing_deployment && [[ -d "${TOOL_DIR}/files" ]] && [[ "$FORCE_UPDATE" != true ]]; then
+        log_info "Base Proton runtime already established in ${TOOL_DIR}."
+        update_existing_deployment
+        return
+    fi
+
+    DETECTED_BASE="$(find_base_proton)"
+    if [[ -z "$DETECTED_BASE" ]]; then
+        log_err "No existing Proton installation found to overlay onto."
+        log_err "Please provide --base-proton /path/to/Proton or use --build."
+        exit 1
+    fi
+    log_info "Using base Proton runtime from: ${DETECTED_BASE}"
+    log_info "Copying base runtime to ${TOOL_DIR}..."
+    mkdir -p "$TOOL_DIR"
+    rsync -arx --exclude "compatibilitytool.vdf" "${DETECTED_BASE}/" "${TOOL_DIR}/"
+
+    install_protogoblin_components
+}
+
+build_from_source() {
+    local ENGINE
+    ENGINE="$(detect_engine)"
+    if [[ -z "$ENGINE" ]]; then
+        log_err "Neither docker nor podman found. Install one or run with --dev overlay mode."
+        exit 1
+    fi
+    log_info "Configuring and running full build via $ENGINE..."
+    local BUILD_DIR="${SCRIPT_DIR}/build"
+    mkdir -p "$BUILD_DIR"
+    pushd "$BUILD_DIR" >/dev/null
+    chmod +x "${SCRIPT_DIR}/configure.sh" 2>/dev/null || true
+    "${SCRIPT_DIR}/configure.sh" --build-name="$BUILD_NAME" --target-arch="$TARGET_ARCH" --container-engine="$ENGINE"
+    make -j"$(nproc)"
+    popd >/dev/null
+
+    log_info "Installing built binaries to Steam..."
+    mkdir -p "$TOOL_DIR"
+    rsync --delete -arx "${BUILD_DIR}/dist/" "${TOOL_DIR}/"
+    write_manifest
+}
+
+# 5. Execution Dispatch
+mkdir -p "$COMPAT_DIR"
+
+if [[ "$CHECK_ONLY" == true ]]; then
+    check_deployment_status
+    exit $?
+
+elif [[ "$FORCE_BUILD" == true ]]; then
+    build_from_source
+
+elif [[ "$EXPLICIT_UPDATE" == true ]]; then
+    if check_existing_deployment; then
+        update_existing_deployment
+    else
+        log_warn "No existing ProtoGoblin deployment found at: ${TOOL_DIR}"
+        log_info "Proceeding with initial installation..."
+        install_dev_overlay
+    fi
+
+elif [[ -d "${SCRIPT_DIR}/build/dist" ]]; then
+    log_info "Installing from existing build/dist..."
+    mkdir -p "$TOOL_DIR"
+    rsync --delete -arx "${SCRIPT_DIR}/build/dist/" "${TOOL_DIR}/"
+    write_manifest
+
+elif [[ -d "${SCRIPT_DIR}/dist" ]]; then
+    log_info "Installing from existing dist/..."
+    mkdir -p "$TOOL_DIR"
+    rsync --delete -arx "${SCRIPT_DIR}/dist/" "${TOOL_DIR}/"
+    write_manifest
+
+elif check_existing_deployment; then
+    log_info "Detected existing ProtoGoblin deployment."
+    update_existing_deployment
+
+elif [[ "$DEV_OVERLAY" == true ]]; then
+    install_dev_overlay
 
 else
-    # Check if a dist directory already exists
-    if [[ -d "${SCRIPT_DIR}/build/dist" ]]; then
-        log_info "Installing from existing build/dist..."
-        mkdir -p "$TOOL_DIR"
-        rsync --delete -arx "${SCRIPT_DIR}/build/dist/" "${TOOL_DIR}/"
-    elif [[ -d "${SCRIPT_DIR}/dist" ]]; then
-        log_info "Installing from existing dist/..."
-        mkdir -p "$TOOL_DIR"
-        rsync --delete -arx "${SCRIPT_DIR}/dist/" "${TOOL_DIR}/"
+    DETECTED_BASE="$(find_base_proton)"
+    if [[ -n "$DETECTED_BASE" ]]; then
+        log_warn "No pre-built dist/ folder found."
+        log_info "Defaulting to --dev overlay mode using existing Proton base (${DETECTED_BASE})..."
+        install_dev_overlay
     else
-        DETECTED_BASE="$(find_base_proton)"
-        if [[ -n "$DETECTED_BASE" ]]; then
-            log_warn "No pre-built dist/ folder found."
-            log_info "Defaulting to --dev overlay mode using existing Proton base (${DETECTED_BASE})..."
-            exec "$0" --dev --name "$BUILD_NAME" --display-name "$DISPLAY_NAME"
-        else
-            log_warn "No build folder found and no existing Proton base detected."
-            log_info "Building from source..."
-            build_from_source
-        fi
+        log_warn "No build folder found and no existing Proton base detected."
+        log_info "Building from source..."
+        build_from_source
     fi
-fi
-
-# 5. Write compatibilitytool.vdf
-VDF_PATH="${TOOL_DIR}/compatibilitytool.vdf"
-log_info "Writing Steam registration manifest: ${VDF_PATH}"
-
-cat > "$VDF_PATH" <<EOF
-"compatibilitytools"
-{
-  "compat_tools"
-  {
-    "${BUILD_NAME}"
-    {
-      "install_path" "."
-      "display_name" "${DISPLAY_NAME}"
-      "from_oslist"  "windows"
-      "to_oslist"    "linux"
-    }
-  }
-}
-EOF
-
-# Ensure launcher scripts have executable bits
-chmod +x "${TOOL_DIR}/proton" 2>/dev/null || true
-if [[ -f "${TOOL_DIR}/protogoblin.py" ]]; then
-    chmod +x "${TOOL_DIR}/protogoblin.py"
-fi
-if [[ -f "${TOOL_DIR}/protogoblin_command.py" ]]; then
-    chmod +x "${TOOL_DIR}/protogoblin_command.py"
-fi
-if [[ -f "${TOOL_DIR}/protogoblin" ]]; then
-    chmod +x "${TOOL_DIR}/protogoblin"
 fi
 
 echo ""
-log_ok "ProtoGoblin successfully installed into Steam!"
+log_ok "ProtoGoblin ready in Steam!"
 echo -e "${C_CYAN}================================================================${C_RESET}"
 echo -e "Tool Location: ${TOOL_DIR}"
 echo -e "Tool Name:     ${C_GREEN}${DISPLAY_NAME}${C_RESET}"
