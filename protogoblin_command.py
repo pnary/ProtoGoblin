@@ -1177,7 +1177,7 @@ class ProtoGoblinCommandApp:
 
         rb_profile = tk.Radiobutton(
             self.mode_frame,
-            text="Profile Mode - Active 'Goblin-ing' HUD overlay, frametime variance, 1% lows, and hardware load telemetry recorded.",
+            text="Profile Mode - Active 'ProtoGoblin' HUD overlay, frametime variance, 1% lows, and hardware load telemetry recorded.",
             variable=self.var_profile_mode,
             value="profile",
             bg="#161b22",
@@ -2199,7 +2199,7 @@ class ProtoGoblinCommandApp:
     def _update_header_mode_button(self, mode):
         if mode == "profile":
             self.btn_toggle_mode.config(
-                text="🎯 Profiling: ON (Goblin-ing)",
+                text="🎯 Profiling: ON (ProtoGoblin)",
                 bg="#238636",
                 fg="#ffffff",
                 activebackground="#2ea043",
@@ -2230,7 +2230,7 @@ class ProtoGoblinCommandApp:
         path = self.generate_profile_toml(silent=True)
 
         mode_desc = (
-            "Profile Mode (Active 'Goblin-ing' HUD overlay and telemetry recording)"
+            "Profile Mode (Active 'ProtoGoblin' HUD overlay and telemetry recording)"
             if new_mode == "profile"
             else "Play Mode (Silent execution, optimizations active, telemetry off)"
         )
@@ -2257,7 +2257,7 @@ class ProtoGoblinCommandApp:
         enable_prof = messagebox.askyesno(
             "Enable Profiling?",
             f"Game: {title} (AppID {app_id})\n\n"
-            "Would you like to ENABLE Profiling Mode ('Goblin-ing' HUD + Telemetry) for this game?\n\n"
+            "Would you like to ENABLE Profiling Mode ('ProtoGoblin' HUD + Telemetry) for this game?\n\n"
             "• Click Yes for Profile Mode\n• Click No for Play Mode (Optimizations only)",
         )
 

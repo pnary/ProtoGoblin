@@ -678,6 +678,14 @@ class EngineTweakManager:
                 "# Enforce sub-millisecond QPC sleep-spin hybrid pacing to eliminate timer wake overshoot",
             ])
 
+        hotkey = tweaks.get("hotkey") or tweaks.get("profiling", {}).get("hotkey")
+        if hotkey:
+            lines.extend([
+                "",
+                "[profiling]",
+                f'hotkey = "{hotkey}"',
+            ])
+
         compat_sec = tweaks.get("compatibility", {})
         dll_overrides = compat_sec.get("dll_overrides", {})
         if dll_overrides:
@@ -880,6 +888,12 @@ class EngineTweakManager:
                 if not any(p.startswith(f"{dll}=") for p in ov_parts):
                     ov_parts.append(entry)
             env["WINEDLLOVERRIDES"] = ";".join(ov_parts)
+
+        prof_sec = profile.get("profiling", {})
+        if prof_sec.get("hotkey"):
+            env["PROTOGOBLIN_PROFILE_KEY"] = prof_sec["hotkey"]
+        elif profile.get("hotkey"):
+            env["PROTOGOBLIN_PROFILE_KEY"] = profile["hotkey"]
 
         return new_argv
 
@@ -2026,6 +2040,80 @@ class ProtoGoblinSession:
                 pass
         return "ProtoGoblin-0.02"
 
+    @classmethod
+    def _format_mangohud_hotkey(cls, key_str):
+        """Converts key combinations (e.g. 'alt-f11', 'ctrl+f12') to MangoHud syntax (e.g. 'Alt_L+F11')."""
+        if not key_str:
+            return "Alt_L+F11"
+        s = str(key_str).strip().lower()
+        parts = [p for p in re.split(r"[-+_]", s) if p]
+        modifiers = []
+        key = None
+        for p in parts:
+            if p in ("alt", "alt_l", "altl"):
+                modifiers.append("Alt_L")
+            elif p in ("alt_r", "altr"):
+                modifiers.append("Alt_R")
+            elif p in ("ctrl", "control", "ctrl_l", "ctrll"):
+                modifiers.append("Control_L")
+            elif p in ("ctrl_r", "ctrlr"):
+                modifiers.append("Control_R")
+            elif p in ("shift", "shift_l", "shiftl"):
+                modifiers.append("Shift_L")
+            elif p in ("shift_r", "shiftr"):
+                modifiers.append("Shift_R")
+            elif p.startswith("f") and p[1:].isdigit():
+                key = p.upper()
+            else:
+                key = p.upper()
+        if not modifiers and not key:
+            return "Alt_L+F11"
+        if not modifiers:
+            modifiers.append("Alt_L")
+        if not key:
+            key = "F11"
+        return "+".join(modifiers + [key])
+
+    def get_assigned_profile_key(self, profile=None):
+        """Resolves the assigned profiling hotkey, defaulting to 'alt-f11'."""
+        env_key = os.environ.get("PROTOGOBLIN_PROFILE_KEY") or os.environ.get("PROTOGOBLIN_HOTKEY")
+        if env_key:
+            return env_key.strip()
+        if not profile:
+            p_path = self.find_game_profile()
+            if p_path:
+                profile = EngineTweakManager.load_profile(p_path)
+        if profile and isinstance(profile, dict):
+            prof_key = (
+                profile.get("profiling", {}).get("hotkey")
+                or profile.get("hotkey")
+                or profile.get("telemetry", {}).get("hotkey")
+            )
+            if prof_key:
+                return str(prof_key).strip()
+        return "alt-f11"
+
+    def get_hud_status(self, assigned_key=None):
+        """Determines active HUD status banner: 'ProtoGoblin: Profiling' or 'ProtoGoblin: Press <key> to start Profiling'."""
+        if not assigned_key:
+            assigned_key = self.get_assigned_profile_key()
+        now = time.time()
+        active = False
+        if os.path.isdir(self.session_dir):
+            for f in os.listdir(self.session_dir):
+                if f.endswith(".csv") and not f.endswith("_summary.csv"):
+                    full_p = os.path.join(self.session_dir, f)
+                    try:
+                        mtime = os.path.getmtime(full_p)
+                        if 0 <= (now - mtime) <= 3.0:
+                            active = True
+                            break
+                    except OSError:
+                        pass
+        if active:
+            return "ProtoGoblin: Profiling"
+        return f"ProtoGoblin: Press {assigned_key} to start Profiling"
+
     def find_game_profile(self):
         """Locates the per-game optimization profile TOML if one exists."""
         if os.environ.get("PROTOGOBLIN_PROFILE"):
@@ -2190,10 +2278,47 @@ class ProtoGoblinSession:
         # In profile mode, configure bundled MangoHud for automatic ROI telemetry capture and HUD status
         if self.mode == "profile":
             env["MANGOHUD"] = "1"
+            assigned_key = self.get_assigned_profile_key()
+            mangohud_key = self._format_mangohud_hotkey(assigned_key)
+
+            hud_script_path = os.path.join(self.session_dir, "hud_status.sh")
+            try:
+                with open(hud_script_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#!/bin/sh\n"
+                        f"SESSION_DIR=\"{self.session_dir}\"\n"
+                        f"KEY=\"{assigned_key}\"\n"
+                        "NOW=$(date +%s)\n"
+                        "ACTIVE=0\n"
+                        "for f in \"$SESSION_DIR\"/*.csv; do\n"
+                        "  [ -f \"$f\" ] || continue\n"
+                        "  case \"$f\" in\n"
+                        "    *_summary.csv) continue ;;\n"
+                        "  esac\n"
+                        "  MTIME=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null)\n"
+                        "  if [ -n \"$MTIME\" ]; then\n"
+                        "    DIFF=$((NOW - MTIME))\n"
+                        "    if [ \"$DIFF\" -ge 0 ] && [ \"$DIFF\" -le 3 ]; then\n"
+                        "      ACTIVE=1\n"
+                        "      break\n"
+                        "    fi\n"
+                        "  fi\n"
+                        "done\n"
+                        "if [ \"$ACTIVE\" -eq 1 ]; then\n"
+                        "  echo \"Profiling\"\n"
+                        "else\n"
+                        "  echo \"Press $KEY to start Profiling\"\n"
+                        "fi\n"
+                    )
+                os.chmod(hud_script_path, 0o755)
+            except OSError:
+                pass
+
             config_parts = [
                 f"output_folder={self.session_dir}",
                 "log_interval=100",
                 "benchmark_percentiles=0.001;0.01;0.97;0.99",
+                f"toggle_logging={mangohud_key}",
             ]
             if os.environ.get("PROTOGOBLIN_OVERLAY") == "0":
                 config_parts.append("no_display=1")
@@ -2201,7 +2326,8 @@ class ProtoGoblinSession:
                 config_parts.extend([
                     "legacy_layout=0",
                     "position=top-right",
-                    "custom_text=Goblin-ing",
+                    "custom_text=ProtoGoblin:",
+                    f"exec={hud_script_path}",
                     "text_color=39FF14",
                     "font_size=26",
                     "background_alpha=0.0",

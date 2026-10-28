@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -454,9 +455,26 @@ class TestProfileBannerHUD(unittest.TestCase):
 
             self.assertEqual(env.get("MANGOHUD"), "1")
             config = env.get("MANGOHUD_CONFIG", "")
-            self.assertIn("custom_text=Goblin-ing", config)
+            self.assertIn("custom_text=ProtoGoblin:", config)
+            self.assertIn("toggle_logging=Alt_L+F11", config)
+            self.assertIn("exec=", config)
             self.assertIn("position=top-right", config)
             self.assertIn("text_color=39FF14", config)
+
+            # Inactive profiling banner
+            self.assertEqual(session.get_hud_status(), "ProtoGoblin: Press alt-f11 to start Profiling")
+
+            # Active profiling banner
+            active_csv = os.path.join(session.session_dir, "Game_20261028_090000.csv")
+            with open(active_csv, "w") as f:
+                f.write("Frame,Frametime\n1,16.6\n")
+            self.assertEqual(session.get_hud_status(), "ProtoGoblin: Profiling")
+
+            # Post-active profiling with summary
+            with open(os.path.join(session.session_dir, "Game_20261028_090000_summary.csv"), "w") as f:
+                f.write("summary")
+            os.utime(active_csv, (time.time() - 10, time.time() - 10))
+            self.assertEqual(session.get_hud_status(), "ProtoGoblin: Press alt-f11 to start Profiling")
         finally:
             if old_mode is not None:
                 os.environ["PROTOGOBLIN_MODE"] = old_mode
@@ -464,6 +482,29 @@ class TestProfileBannerHUD(unittest.TestCase):
                 os.environ.pop("PROTOGOBLIN_MODE", None)
             if old_overlay is not None:
                 os.environ["PROTOGOBLIN_OVERLAY"] = old_overlay
+
+    def test_profile_mode_custom_assigned_key(self):
+        old_mode = os.environ.get("PROTOGOBLIN_MODE")
+        old_key = os.environ.get("PROTOGOBLIN_PROFILE_KEY")
+        try:
+            os.environ["PROTOGOBLIN_MODE"] = "profile"
+            os.environ["PROTOGOBLIN_PROFILE_KEY"] = "ctrl-f12"
+            session = ProtoGoblinSession()
+            env = {}
+            session.pre_flight(["dummy.exe"], env)
+
+            config = env.get("MANGOHUD_CONFIG", "")
+            self.assertIn("toggle_logging=Control_L+F12", config)
+            self.assertEqual(session.get_hud_status(), "ProtoGoblin: Press ctrl-f12 to start Profiling")
+        finally:
+            if old_mode is not None:
+                os.environ["PROTOGOBLIN_MODE"] = old_mode
+            else:
+                os.environ.pop("PROTOGOBLIN_MODE", None)
+            if old_key is not None:
+                os.environ["PROTOGOBLIN_PROFILE_KEY"] = old_key
+            else:
+                os.environ.pop("PROTOGOBLIN_PROFILE_KEY", None)
 
     def test_profile_mode_overlay_disabled(self):
         old_mode = os.environ.get("PROTOGOBLIN_MODE")
@@ -478,7 +519,7 @@ class TestProfileBannerHUD(unittest.TestCase):
             self.assertEqual(env.get("MANGOHUD"), "1")
             config = env.get("MANGOHUD_CONFIG", "")
             self.assertIn("no_display=1", config)
-            self.assertNotIn("custom_text=Goblin-ing", config)
+            self.assertNotIn("custom_text=ProtoGoblin:", config)
         finally:
             if old_mode is not None:
                 os.environ["PROTOGOBLIN_MODE"] = old_mode
@@ -504,7 +545,7 @@ class TestSessionInitialModeSelection(unittest.TestCase):
                 sess.pre_flight(["BrandNewGame.exe"], env)
                 self.assertEqual(sess.mode, "profile")
                 self.assertEqual(env.get("MANGOHUD"), "1")
-                self.assertIn("custom_text=Goblin-ing", env.get("MANGOHUD_CONFIG", ""))
+                self.assertIn("custom_text=ProtoGoblin:", env.get("MANGOHUD_CONFIG", ""))
             finally:
                 if old_mode_env:
                     os.environ["PROTOGOBLIN_MODE"] = old_mode_env
@@ -1046,7 +1087,7 @@ class TestEngineTweakManager(unittest.TestCase):
                 sess.pre_flight(["TestGame.exe"], env)
                 self.assertEqual(sess.mode, "profile")
                 self.assertEqual(env.get("MANGOHUD"), "1")
-                self.assertIn("custom_text=Goblin-ing", env.get("MANGOHUD_CONFIG", ""))
+                self.assertIn("custom_text=ProtoGoblin:", env.get("MANGOHUD_CONFIG", ""))
             finally:
                 os.environ.pop("PROTOGOBLIN_PROFILE", None)
                 if old_mode_env:

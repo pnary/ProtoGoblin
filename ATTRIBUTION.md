@@ -37,7 +37,7 @@ This document attributes the upstream authors, copyright holders, source reposit
 - **Upstream:** [https://github.com/flightlessmango/MangoHud](https://github.com/flightlessmango/MangoHud)
 - **Copyright:** (c) 2019-2026 FlightlessMango and MangoHud contributors.
 - **License:** MIT
-- **Usage in ProtoGoblin:** Bundled directly under `vklayers/` as a built-in Vulkan implicit layer. Powers automatic Region-of-Interest (ROI) telemetry capture, frametime percentile calculation (P50, P90, P99, 1% lows), and the active profile HUD banner (`Goblin-ing`).
+- **Usage in ProtoGoblin:** Bundled directly under `vklayers/` as a built-in Vulkan implicit layer. Powers automatic Region-of-Interest (ROI) telemetry capture, frametime percentile calculation (P50, P90, P99, 1% lows), and the active profile HUD banner (`ProtoGoblin`).
 
 ### 3. Intel PresentMon
 - **Upstream:** [https://github.com/GameTechDev/PresentMon](https://github.com/GameTechDev/PresentMon)

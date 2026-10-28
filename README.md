@@ -17,7 +17,7 @@ Unlike traditional external profilers or opaque compatibility wrappers, ProtoGob
 
 * **Introspective Self-Monitoring:**
   * **Tier 1 (Always-On Footprint):** Ultra-low-overhead (<0.1%) runtime counters tracking loaded Win32/graphics subsystems, active translation backends, and synchronization paths (`ntsync`, `fsync`, or `wineserver` RPC fallbacks). Emits a structured `utilization.json` manifest upon exit.
-  * **Tier 2 (ROI-Gated Latency Histograms):** Activated during targeted gameplay capture windows (via in-game hotkey `F11` or warmup timers). Accurately distinguishes **Game Execution Time** from **Compatibility Layer Overhead**.
+  * **Tier 2 (ROI-Gated Latency Histograms):** Activated during targeted gameplay capture windows (via in-game hotkey `Alt+F11` or warmup timers). Accurately distinguishes **Game Execution Time** from **Compatibility Layer Overhead**.
 * **Dual Operating Modes:**
   * **Play Mode:** Minimal-overhead execution applying only validated, user-approved optimizations while pruning unused interceptors identified by Tier-1 telemetry.
   * **Profile Mode:** Comprehensive diagnostic data gathering, frame-time pacing, and translation-layer boundary profiling within controlled Regions of Interest (ROI).
