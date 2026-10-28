@@ -506,6 +506,49 @@ class EngineTweakManager:
         return result
 
     @classmethod
+    def drop_profile(cls, app_id_or_path, clear_sessions=False):
+        """Drops/deletes a game profile TOML and optionally historical session data to allow clean re-profiling."""
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+
+        if os.path.isfile(str(app_id_or_path)):
+            profile_path = os.path.abspath(app_id_or_path)
+            app_id = os.path.splitext(os.path.basename(profile_path))[0]
+        else:
+            app_id = str(app_id_or_path)
+            profile_path = os.path.join(xdg_config, "protogoblin", "games", f"{app_id}.toml")
+
+        result = {
+            "app_id": app_id,
+            "profile_path": profile_path,
+            "profile_deleted": False,
+            "sessions_cleared": False,
+            "sessions_dir": None,
+        }
+
+        # 1. Remove profile TOML file if present
+        if os.path.isfile(profile_path):
+            try:
+                os.remove(profile_path)
+                result["profile_deleted"] = True
+            except OSError as e:
+                result["error"] = str(e)
+
+        # 2. Optionally clear historical sessions directory
+        if clear_sessions and app_id:
+            sessions_base = os.environ.get("PROTOGOBLIN_SESSIONS_DIR") or os.path.join(xdg_data, "protogoblin", "sessions")
+            app_sessions_dir = os.path.join(sessions_base, app_id)
+            result["sessions_dir"] = app_sessions_dir
+            if os.path.isdir(app_sessions_dir):
+                try:
+                    shutil.rmtree(app_sessions_dir)
+                    result["sessions_cleared"] = True
+                except OSError as e:
+                    result["sessions_error"] = str(e)
+
+        return result
+
+    @classmethod
     def generate_profile_toml(cls, game_id, app_id, target_exe, engine_info=None, sync_backend="ntsync", user_tweaks=None):
         tweaks = user_tweaks or {}
         eng_name = engine_info.get("engine", "") if engine_info else ""
@@ -2239,6 +2282,17 @@ class ProtoGoblinSession:
                 break
 
         self.initial_exe = target_path
+
+        # Check if user requested dropping profile / re-profiling via environment
+        if os.environ.get("PROTOGOBLIN_DROP_PROFILE") == "1" or os.environ.get("PROTOGOBLIN_REPROFILE") == "1":
+            p_to_drop = self.find_game_profile()
+            if p_to_drop and os.path.isfile(p_to_drop):
+                try:
+                    os.remove(p_to_drop)
+                    print(f"[ProtoGoblin] PROTOGOBLIN_DROP_PROFILE active: dropped existing profile {p_to_drop}")
+                except Exception:
+                    pass
+            self.mode = "profile"
 
         # Check per-game profile or initial run mode if PROTOGOBLIN_MODE wasn't explicitly provided in environment
         if "PROTOGOBLIN_MODE" not in os.environ and not getattr(self, "explicit_mode", False):

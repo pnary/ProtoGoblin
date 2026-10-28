@@ -1013,6 +1013,18 @@ class ProtoGoblinCommandApp:
         )
         btn_gen_profile.pack(side=tk.RIGHT, padx=5, pady=10)
 
+        btn_drop_profile = tk.Button(
+            header,
+            text="🗑️ Drop Profile",
+            bg="#21262d",
+            fg="#f85149",
+            activebackground="#b62324",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            command=self.drop_current_profile,
+        )
+        btn_drop_profile.pack(side=tk.RIGHT, padx=5, pady=10)
+
         # Main Content Panes
         paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=self.bg_color, sashrelief=tk.FLAT)
         paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -1066,6 +1078,21 @@ class ProtoGoblinCommandApp:
 
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
         self.sessions_listbox = self.sessions_tree
+
+        self.tree_context_menu = tk.Menu(self.root, tearoff=0, bg="#161b22", fg="#c9d1d9", activebackground="#1f6feb", activeforeground="#ffffff")
+        self.tree_context_menu.add_command(label="🗑️ Drop Profile (Reset for Re-Profiling)", command=self.drop_current_profile)
+        self.tree_context_menu.add_command(label="⚙️ Reset Tweaks to Stock", command=self.reset_tweaks_to_stock)
+        self.tree_context_menu.add_separator()
+        self.tree_context_menu.add_command(label="🔄 Refresh Sessions", command=self.refresh_sessions)
+
+        def on_tree_right_click(event):
+            item = self.sessions_tree.identify_row(event.y)
+            if item:
+                self.sessions_tree.selection_set(item)
+                self.on_session_selected(None)
+                self.tree_context_menu.post(event.x_root, event.y_root)
+
+        self.sessions_tree.bind("<Button-3>", on_tree_right_click)
 
         # Right Pane: Notebook Dashboard
         right_frame = tk.Frame(paned, bg=self.bg_color)
@@ -1478,6 +1505,21 @@ class ProtoGoblinCommandApp:
             command=self.generate_profile_toml,
         )
         btn_apply.pack(side=tk.LEFT, padx=6)
+
+        btn_drop = tk.Button(
+            btn_row,
+            text="🗑️ Drop Profile",
+            bg="#21262d",
+            fg="#f85149",
+            activebackground="#b62324",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT,
+            padx=12,
+            pady=8,
+            command=self.drop_current_profile,
+        )
+        btn_drop.pack(side=tk.LEFT, padx=6)
 
     def _build_perf_tab(self):
         self.perf_text = tk.Text(
@@ -2513,7 +2555,7 @@ class ProtoGoblinCommandApp:
             "ProtoGoblin will automatically apply this mode whenever the game is launched via Steam.",
         )
 
-    def reset_tweaks_to_stock(self):
+    def reset_tweaks_to_stock(self, silent=False, write_profile=True):
         """Disables all engine tweaks, overrides, and limiters to establish a raw baseline."""
         self.var_ue_motion_blur.set(False)
         self.var_ue_depth_of_field.set(False)
@@ -2555,15 +2597,90 @@ class ProtoGoblinCommandApp:
         self.var_compat_d3dx9.set(False)
         self.var_gfx_max_fps.set("0")
 
-        if self.current_manifest:
-            path = self.generate_profile_toml(silent=True)
-            messagebox.showinfo(
-                "Stock Baseline Set",
-                f"All overrides disabled in profile TOML:\n{path}\n\n"
-                "The game will execute in raw/unmodified stock mode for clean baseline profiling.",
+        if write_profile:
+            if self.current_manifest:
+                path = self.generate_profile_toml(silent=True)
+                if not silent:
+                    messagebox.showinfo(
+                        "Stock Baseline Set",
+                        f"All overrides disabled in profile TOML:\n{path}\n\n"
+                        "The game will execute in raw/unmodified stock mode for clean baseline profiling.",
+                    )
+            elif not silent:
+                messagebox.showinfo("Reset Complete", "All tweak toggles have been reset to stock / disabled.")
+
+    def drop_current_profile(self, prompt=True):
+        """Drops the selected game's profile TOML to permit clean re-profiling after game updates."""
+        if not self.current_manifest:
+            if prompt:
+                messagebox.showwarning("Notice", "Select a game session first to drop its profile.")
+            return False
+
+        tgt = self.current_manifest.get("target", {})
+        app_id = str(tgt.get("steam_appid") or "")
+        t_exe = os.path.basename((tgt.get("target_executable") or {}).get("path", "Game.exe"))
+        stem = os.path.splitext(t_exe)[0]
+        game_id = app_id if app_id and app_id != "unknown_game" else stem
+        game_name = self.resolve_game_name(game_id)
+        game_display = f"{game_name} ({game_id})"
+
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        profile_file = os.path.join(xdg_config, "protogoblin", "games", f"{game_id}.toml")
+        profile_exists = os.path.isfile(profile_file)
+
+        clear_sessions = False
+        if prompt:
+            msg = (
+                f"Drop profile for:\n\n"
+                f"  {game_display}\n\n"
+                f"Profile file:\n  {profile_file if profile_exists else '(Not yet written to disk)'}\n\n"
+                f"This deletes the custom profile and resets all active optimization overrides.\n"
+                f"ProtoGoblin will treat this title as newly installed on its next launch, "
+                f"enabling clean profiling and fresh diagnostic analysis (ideal after game updates).\n\n"
+                f"Do you want to proceed?"
             )
-        else:
-            messagebox.showinfo("Reset Complete", "All tweak toggles have been reset to stock / disabled.")
+            confirm = messagebox.askyesno(
+                "Drop Game Profile",
+                msg,
+                icon="warning",
+                default="no",
+            )
+            if not confirm:
+                return False
+
+            clear_sessions = messagebox.askyesno(
+                "Clear Historical Sessions?",
+                f"Would you also like to clear historical session logs for {game_display}?\n\n"
+                f"• YES: Deletes previous utilization manifests so the explorer starts completely fresh.\n"
+                f"• NO: Keeps previous session logs in history for A/B comparison against the new post-update run.",
+                default="no",
+            )
+
+        res = protogoblin.EngineTweakManager.drop_profile(
+            game_id,
+            clear_sessions=clear_sessions,
+        )
+
+        # Reset in-memory tweak UI variables without writing a new profile
+        self.reset_tweaks_to_stock(silent=True, write_profile=False)
+
+        # Refresh sessions explorer
+        self.refresh_sessions()
+
+        if prompt:
+            status_msg = f"Profile successfully dropped for {game_display}!\n\n"
+            if res.get("profile_deleted"):
+                status_msg += f"• Deleted profile TOML:\n  {profile_file}\n"
+            else:
+                status_msg += "• No disk profile was present; all active tweaks have been reset to stock.\n"
+
+            if res.get("sessions_cleared"):
+                status_msg += "• Historical session manifests cleared from disk.\n"
+
+            status_msg += "\nNext step:\nLaunch the game in Steam to establish a fresh post-update profile."
+            messagebox.showinfo("Profile Dropped", status_msg)
+
+        return True
 
     def _sync_profile_data_to_variables(self, prof_data):
         if not prof_data or not isinstance(prof_data, dict):
@@ -3204,7 +3321,20 @@ def main():
         description="ProtoGoblin Command - Graphical Optimization & Diagnostic Dashboard"
     )
     parser.add_argument("--session", dest="session_id", default=None, help="Initial session ID or AppID to select")
+    parser.add_argument("--drop-profile", dest="drop_appid", default=None, help="Drop/delete the profile for the given AppID so the game can be re-profiled")
+    parser.add_argument("--clear-sessions", dest="clear_sessions", action="store_true", help="When dropping profile, also clear historical session manifests")
     args, _ = parser.parse_known_args()
+
+    if args.drop_appid:
+        res = protogoblin.EngineTweakManager.drop_profile(args.drop_appid, clear_sessions=args.clear_sessions)
+        if res.get("profile_deleted"):
+            print(f"[ProtoGoblin] Successfully dropped profile for {args.drop_appid}: {res.get('profile_path')}")
+        else:
+            print(f"[ProtoGoblin] No profile file existed on disk for {args.drop_appid} ({res.get('profile_path')}).")
+        if res.get("sessions_cleared"):
+            print(f"[ProtoGoblin] Cleared historical sessions: {res.get('sessions_dir')}")
+        print(f"[ProtoGoblin] Game {args.drop_appid} is ready for clean re-profiling on next launch.")
+        return
 
     root = tk.Tk()
     app = ProtoGoblinCommandApp(root, initial_session_id=args.session_id)

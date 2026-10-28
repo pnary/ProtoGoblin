@@ -1923,5 +1923,106 @@ class TestCommanderSteamGroupExplorer(unittest.TestCase):
         self.assertIn("0 bytes", self.app.sys_text.get("1.0", tk.END))
 
 
+class TestProfileDropAndReprofiling(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.old_xdg_data = os.environ.get("XDG_DATA_HOME")
+        self.old_xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        self.old_sessions_dir = os.environ.get("PROTOGOBLIN_SESSIONS_DIR")
+        os.environ["XDG_DATA_HOME"] = os.path.join(self.td.name, "data")
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(self.td.name, "config")
+        os.environ["PROTOGOBLIN_SESSIONS_DIR"] = os.path.join(self.td.name, "data", "protogoblin", "sessions")
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = ProtoGoblinCommandApp(self.root)
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self.td.cleanup()
+        if self.old_xdg_data is not None:
+            os.environ["XDG_DATA_HOME"] = self.old_xdg_data
+        else:
+            os.environ.pop("XDG_DATA_HOME", None)
+        if self.old_xdg_config is not None:
+            os.environ["XDG_CONFIG_HOME"] = self.old_xdg_config
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        if self.old_sessions_dir is not None:
+            os.environ["PROTOGOBLIN_SESSIONS_DIR"] = self.old_sessions_dir
+        else:
+            os.environ.pop("PROTOGOBLIN_SESSIONS_DIR", None)
+
+    def test_engine_tweak_manager_drop_profile(self):
+        p_dir = os.path.join(self.td.name, "config", "protogoblin", "games")
+        os.makedirs(p_dir, exist_ok=True)
+        p_file = os.path.join(p_dir, "77777.toml")
+        with open(p_file, "w", encoding="utf-8") as f:
+            f.write('[runtime]\nmode = "play"\n')
+
+        s_dir = os.path.join(self.td.name, "data", "protogoblin", "sessions", "77777")
+        os.makedirs(s_dir, exist_ok=True)
+
+        self.assertTrue(os.path.isfile(p_file))
+        self.assertTrue(os.path.isdir(s_dir))
+
+        # Drop profile without clearing sessions
+        res1 = EngineTweakManager.drop_profile("77777", clear_sessions=False)
+        self.assertTrue(res1["profile_deleted"])
+        self.assertFalse(res1["sessions_cleared"])
+        self.assertFalse(os.path.isfile(p_file))
+        self.assertTrue(os.path.isdir(s_dir))
+
+        # Drop profile again with clearing sessions
+        res2 = EngineTweakManager.drop_profile("77777", clear_sessions=True)
+        self.assertFalse(res2["profile_deleted"])
+        self.assertTrue(res2["sessions_cleared"])
+        self.assertFalse(os.path.isdir(s_dir))
+
+    def test_protogoblin_session_drop_profile_env(self):
+        p_dir = os.path.join(self.td.name, "config", "protogoblin", "games")
+        os.makedirs(p_dir, exist_ok=True)
+        p_file = os.path.join(p_dir, "88888.toml")
+        with open(p_file, "w", encoding="utf-8") as f:
+            f.write('[runtime]\nmode = "play"\n')
+
+        old_drop = os.environ.get("PROTOGOBLIN_DROP_PROFILE")
+        try:
+            os.environ["PROTOGOBLIN_DROP_PROFILE"] = "1"
+            sess = ProtoGoblinSession(steam_appid=88888)
+            env = {}
+            sess.pre_flight(["Game.exe"], env)
+            self.assertFalse(os.path.isfile(p_file))
+            self.assertEqual(sess.mode, "profile")
+        finally:
+            if old_drop is not None:
+                os.environ["PROTOGOBLIN_DROP_PROFILE"] = old_drop
+            else:
+                os.environ.pop("PROTOGOBLIN_DROP_PROFILE", None)
+
+    def test_commander_drop_current_profile_ui(self):
+        self.app.current_manifest = {
+            "target": {
+                "steam_appid": 66666,
+                "target_executable": {"path": "C:\\Games\\TestGame\\test.exe"},
+            },
+            "session": {"mode": "play"},
+        }
+        p_file = self.app.generate_profile_toml(silent=True)
+        self.assertTrue(os.path.isfile(p_file))
+
+        self.app.var_gfx_vsync_off.set(True)
+        self.app.var_gfx_descriptor_buffer.set(True)
+
+        res = self.app.drop_current_profile(prompt=False)
+        self.assertTrue(res)
+        self.assertFalse(os.path.isfile(p_file))
+        self.assertFalse(self.app.var_gfx_vsync_off.get())
+        self.assertFalse(self.app.var_gfx_descriptor_buffer.get())
+
+
 if __name__ == "__main__":
     unittest.main()
