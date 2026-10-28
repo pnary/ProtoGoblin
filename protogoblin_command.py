@@ -887,6 +887,7 @@ class ProtoGoblinCommandApp:
 
         self.manifest_paths = []
         self.current_manifest = None
+        self.custom_suggestion_states = {}
         self.initial_session_id = initial_session_id
 
         self._build_ui()
@@ -1870,7 +1871,9 @@ class ProtoGoblinCommandApp:
         if getattr(self, "dev_mode", False):
             self.refresh_dev_tab()
 
-    def _render_manifest_data(self, data, path):
+    def _render_manifest_data(self, data, path=""):
+        if path:
+            self.current_manifest_path = path
         sess = data.get("session", {})
         tgt = data.get("target", {})
         t_exe = tgt.get("target_executable", {}) or {}
@@ -1911,6 +1914,7 @@ class ProtoGoblinCommandApp:
             if os.path.isfile(p_file):
                 prof_data = protogoblin.EngineTweakManager.load_profile(p_file)
                 if prof_data:
+                    self._sync_profile_data_to_variables(prof_data)
                     prof_mode = (
                         prof_data.get("runtime", {}).get("mode")
                         or prof_data.get("protogoblin", {}).get("mode")
@@ -1957,18 +1961,41 @@ class ProtoGoblinCommandApp:
                     highlightthickness=1,
                     padx=12,
                     pady=10,
+                    cursor="hand2",
                 )
                 card_frame.pack(fill=tk.X, pady=6)
 
+                header_frame = tk.Frame(card_frame, bg="#161b22")
+                header_frame.pack(fill=tk.X)
+
                 lbl_t = tk.Label(
-                    card_frame,
+                    header_frame,
                     text=s["title"],
                     font=("Segoe UI", 10, "bold"),
                     bg="#161b22",
                     fg=border_color,
                     anchor=tk.W,
+                    cursor="hand2",
                 )
-                lbl_t.pack(fill=tk.X)
+                lbl_t.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+                is_active = self.is_suggestion_enabled(s)
+                cb_var = tk.BooleanVar(value=is_active)
+
+                chk = tk.Checkbutton(
+                    header_frame,
+                    text="Applied" if is_active else "Enable",
+                    variable=cb_var,
+                    bg="#161b22",
+                    fg="#39FF14" if is_active else "#8b949e",
+                    activebackground="#161b22",
+                    activeforeground="#39FF14",
+                    selectcolor="#0d1117",
+                    font=("Segoe UI", 9, "bold"),
+                    cursor="hand2",
+                    command=lambda sug=s, v=cb_var: self._on_suggestion_checkbox_toggled(sug, v),
+                )
+                chk.pack(side=tk.RIGHT, padx=5)
 
                 lbl_d = tk.Label(
                     card_frame,
@@ -1979,6 +2006,7 @@ class ProtoGoblinCommandApp:
                     wraplength=580,
                     justify=tk.LEFT,
                     anchor=tk.W,
+                    cursor="hand2",
                 )
                 lbl_d.pack(fill=tk.X, pady=(4, 6))
 
@@ -1991,26 +2019,50 @@ class ProtoGoblinCommandApp:
                     wraplength=580,
                     justify=tk.LEFT,
                     anchor=tk.W,
+                    cursor="hand2",
                 )
                 lbl_a.pack(fill=tk.X)
 
-                if s.get("fix_id"):
+                action_frame = tk.Frame(card_frame, bg="#161b22")
+                action_frame.pack(fill=tk.X, pady=(8, 2))
+
+                btn_view = tk.Button(
+                    action_frame,
+                    text="🔍 Configure / Details",
+                    bg="#21262d",
+                    fg="#58a6ff",
+                    activebackground="#30363d",
+                    activeforeground="#ffffff",
+                    font=("Segoe UI", 8, "bold"),
+                    relief=tk.FLAT,
+                    padx=8,
+                    pady=3,
+                    cursor="hand2",
+                    command=lambda sug=s, v=cb_var: self.open_suggestion_detail_window(sug, v),
+                )
+                btn_view.pack(side=tk.LEFT, padx=(0, 8))
+
+                if s.get("fix_id") and not is_active:
                     fix_id = s["fix_id"]
                     extra = s.get("cap_target")
                     btn_fix = tk.Button(
-                        card_frame,
+                        action_frame,
                         text=s.get("fix_button_text", "⚡ Apply Suggested Fix"),
                         bg="#238636",
                         fg="#ffffff",
                         activebackground="#2ea043",
                         activeforeground="#ffffff",
-                        font=("Segoe UI", 9, "bold"),
+                        font=("Segoe UI", 8, "bold"),
                         relief=tk.FLAT,
-                        padx=10,
-                        pady=4,
-                        command=lambda fid=fix_id, ext=extra: self.apply_suggested_fix(fid, ext),
+                        padx=8,
+                        pady=3,
+                        cursor="hand2",
+                        command=lambda fid=fix_id, ext=extra, v=cb_var, sug=s: self._apply_and_sync_fix(fid, ext, v, sug),
                     )
-                    btn_fix.pack(anchor=tk.W, pady=(8, 2))
+                    btn_fix.pack(side=tk.LEFT)
+
+                for w in (card_frame, lbl_t, lbl_d, lbl_a):
+                    w.bind("<Button-1>", lambda e, sug=s, v=cb_var: self.open_suggestion_detail_window(sug, v))
 
         # Tab 2: Performance
         self.perf_text.delete("1.0", tk.END)
@@ -2340,6 +2392,335 @@ class ProtoGoblinCommandApp:
             )
         else:
             messagebox.showinfo("Reset Complete", "All tweak toggles have been reset to stock / disabled.")
+
+    def _sync_profile_data_to_variables(self, prof_data):
+        if not prof_data or not isinstance(prof_data, dict):
+            return
+        gfx = prof_data.get("graphics", {})
+        sync = prof_data.get("synchronization", {})
+        fs = prof_data.get("filesystem", {})
+        timing = prof_data.get("timing", {})
+        ue = prof_data.get("engine", {}).get("unreal", {})
+        vkd3d = gfx.get("vkd3d", {})
+        compat = prof_data.get("compatibility", {})
+        dlls = compat.get("dll_overrides", {})
+
+        if "descriptor_buffer" in gfx:
+            self.var_gfx_descriptor_buffer.set(bool(gfx["descriptor_buffer"]))
+        if "async_shader_compile" in gfx:
+            self.var_gfx_async_shader.set(bool(gfx["async_shader_compile"]))
+        if "max_fps" in gfx:
+            self.var_gfx_max_fps.set(str(gfx["max_fps"]))
+        if "atelier_sync_fix" in sync:
+            v = sync["atelier_sync_fix"]
+            self.var_atelier_sync_fix.set(bool(v.get("enabled") if isinstance(v, dict) else v))
+        if "state_dedup" in sync:
+            v = sync["state_dedup"]
+            self.var_sync_state_dedup.set(bool(v.get("enabled") if isinstance(v, dict) else v))
+        if "swapchain_debounce" in sync:
+            v = sync["swapchain_debounce"]
+            self.var_sync_swapchain_debounce.set(bool(v.get("enabled") if isinstance(v, dict) else v))
+        if "precision_timers" in timing:
+            v = timing["precision_timers"]
+            self.var_sync_precision_timers.set(bool(v.get("enabled") if isinstance(v, dict) else v))
+        if "io_cache" in fs:
+            v = fs["io_cache"]
+            self.var_fs_io_cache.set(bool(v.get("enabled") if isinstance(v, dict) else v))
+        if "optimize_lumen" in ue:
+            self.var_ue_optimize_lumen.set(bool(ue["optimize_lumen"]))
+        if "optimize_vsm" in ue:
+            self.var_ue_optimize_vsm.set(bool(ue["optimize_vsm"]))
+        if "single_queue" in vkd3d:
+            self.var_vkd3d_single_queue.set(bool(vkd3d["single_queue"]))
+
+        if "d3dcompiler_47" in dlls:
+            self.var_compat_d3dcompiler_47.set(True)
+        if "d3dcompiler_43" in dlls:
+            self.var_compat_d3dcompiler_43.set(True)
+        if any(k in dlls for k in ["vcrun2022", "vcruntime140", "msvcp140"]):
+            self.var_compat_vcrun2022.set(True)
+        if "xaudio2_7" in dlls or "xaudio27" in dlls:
+            self.var_compat_xaudio27.set(True)
+        if "d3dx9" in dlls or "d3dx9_43" in dlls:
+            self.var_compat_d3dx9.set(True)
+
+    def is_suggestion_enabled(self, s):
+        """Checks if a recommendation is currently enabled in UI/profile variables."""
+        fid = s.get("fix_id")
+        if not fid:
+            return self.custom_suggestion_states.get(s.get("title", ""), False)
+
+        if fid == "enable_descriptor_buffer":
+            return bool(self.var_gfx_descriptor_buffer.get())
+        elif fid == "atelier_sync_fix":
+            return bool(self.var_atelier_sync_fix.get())
+        elif fid == "async_shader_compile":
+            return bool(self.var_gfx_async_shader.get())
+        elif fid == "cap_framerate":
+            target = str(s.get("cap_target") or 60)
+            return self.var_gfx_max_fps.get() == target
+        elif fid == "state_dedup_and_debounce":
+            return bool(self.var_sync_state_dedup.get() and self.var_sync_swapchain_debounce.get())
+        elif fid == "enable_io_cache":
+            return bool(self.var_fs_io_cache.get())
+        elif fid == "enable_precision_timers":
+            return bool(self.var_sync_precision_timers.get())
+        elif fid == "optimize_ue5_lumen_vsm":
+            return bool(self.var_ue_optimize_lumen.get() and self.var_ue_optimize_vsm.get())
+        elif fid == "vkd3d_single_queue":
+            return bool(self.var_vkd3d_single_queue.get())
+        elif fid.startswith("snag_dll_"):
+            remedy = s.get("remedy") or {}
+            verb = remedy.get("verb", fid.replace("snag_dll_", ""))
+            var_map = {
+                "d3dcompiler_47": self.var_compat_d3dcompiler_47,
+                "d3dcompiler_43": self.var_compat_d3dcompiler_43,
+                "vcrun2022": self.var_compat_vcrun2022,
+                "xaudio27": self.var_compat_xaudio27,
+                "d3dx9": self.var_compat_d3dx9,
+            }
+            if verb in var_map:
+                return bool(var_map[verb].get())
+            return False
+
+        return self.custom_suggestion_states.get(s.get("title", ""), False)
+
+    def set_suggestion_enabled(self, s, enabled: bool):
+        """Enables or disables an optimization recommendation and syncs profile.toml."""
+        fid = s.get("fix_id")
+        if not fid:
+            self.custom_suggestion_states[s.get("title", "")] = enabled
+            self.generate_profile_toml(silent=True)
+            return
+
+        if fid == "enable_descriptor_buffer":
+            self.var_gfx_descriptor_buffer.set(enabled)
+        elif fid == "atelier_sync_fix":
+            self.var_atelier_sync_fix.set(enabled)
+            if enabled:
+                self.var_gfx_vsync_off.set(True)
+        elif fid == "async_shader_compile":
+            self.var_gfx_async_shader.set(enabled)
+        elif fid == "cap_framerate":
+            target = str(s.get("cap_target") or 60)
+            self.var_gfx_max_fps.set(target if enabled else "0")
+        elif fid == "state_dedup_and_debounce":
+            self.var_sync_state_dedup.set(enabled)
+            self.var_sync_swapchain_debounce.set(enabled)
+        elif fid == "enable_io_cache":
+            self.var_fs_io_cache.set(enabled)
+        elif fid == "enable_precision_timers":
+            self.var_sync_precision_timers.set(enabled)
+        elif fid == "optimize_ue5_lumen_vsm":
+            self.var_ue_optimize_lumen.set(enabled)
+            self.var_ue_optimize_vsm.set(enabled)
+            if enabled:
+                self.var_vkd3d_static_cbv.set(True)
+                self.var_gfx_descriptor_buffer.set(True)
+        elif fid == "vkd3d_single_queue":
+            self.var_vkd3d_single_queue.set(enabled)
+        elif fid.startswith("snag_dll_"):
+            remedy = s.get("remedy") or {}
+            verb = remedy.get("verb", fid.replace("snag_dll_", ""))
+            var_map = {
+                "d3dcompiler_47": self.var_compat_d3dcompiler_47,
+                "d3dcompiler_43": self.var_compat_d3dcompiler_43,
+                "vcrun2022": self.var_compat_vcrun2022,
+                "xaudio27": self.var_compat_xaudio27,
+                "d3dx9": self.var_compat_d3dx9,
+            }
+            if verb in var_map:
+                var_map[verb].set(enabled)
+            if enabled:
+                self.apply_suggested_fix(fid)
+
+        self.generate_profile_toml(silent=True)
+
+    def _on_suggestion_checkbox_toggled(self, s, cb_var):
+        new_val = cb_var.get()
+        self.set_suggestion_enabled(s, new_val)
+        if self.current_manifest:
+            self._render_manifest_data(self.current_manifest)
+
+    def _apply_and_sync_fix(self, fix_id, extra, cb_var, s):
+        self.apply_suggested_fix(fix_id, extra)
+        if cb_var is not None:
+            cb_var.set(True)
+        if self.current_manifest:
+            self._render_manifest_data(self.current_manifest)
+
+    def open_suggestion_detail_window(self, s, cb_var=None):
+        """Opens a dedicated screen to inspect and toggle an optimization recommendation."""
+        win = tk.Toplevel(self.root)
+        win.title(f"Recommendation: {s.get('title', 'Details')}")
+        win.geometry("640x500")
+        win.minsize(560, 420)
+        win.configure(bg="#0d1117")
+        win.transient(self.root)
+
+        lvl = s.get("level", "info")
+        border_color = (
+            self.error_color
+            if lvl == "error"
+            else self.warning_color
+            if lvl == "warning"
+            else self.success_color
+            if lvl == "success"
+            else "#58a6ff"
+        )
+
+        header_frame = tk.Frame(win, bg="#161b22", padx=16, pady=12)
+        header_frame.pack(fill=tk.X)
+
+        lvl_badge = tk.Label(
+            header_frame,
+            text=f"[{lvl.upper()}] RECOMMENDATION",
+            font=("Segoe UI", 9, "bold"),
+            bg="#161b22",
+            fg=border_color,
+        )
+        lvl_badge.pack(anchor=tk.W)
+
+        title_lbl = tk.Label(
+            header_frame,
+            text=s.get("title", ""),
+            font=("Segoe UI", 12, "bold"),
+            bg="#161b22",
+            fg="#f0f6fc",
+            wraplength=600,
+            justify=tk.LEFT,
+        )
+        title_lbl.pack(anchor=tk.W, pady=(4, 0))
+
+        content_frame = tk.Frame(win, bg="#0d1117", padx=16, pady=14)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        desc_lbl_header = tk.Label(
+            content_frame,
+            text="DIAGNOSTIC ANALYSIS & ROOT CAUSE",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0d1117",
+            fg="#8b949e",
+        )
+        desc_lbl_header.pack(anchor=tk.W)
+
+        desc_box = tk.Text(
+            content_frame,
+            height=4,
+            bg="#161b22",
+            fg="#c9d1d9",
+            font=("Segoe UI", 9),
+            wrap=tk.WORD,
+            relief=tk.FLAT,
+            padx=10,
+            pady=8,
+            highlightbackground="#30363d",
+            highlightthickness=1,
+        )
+        desc_box.insert(tk.END, s.get("description", ""))
+        desc_box.config(state=tk.DISABLED)
+        desc_box.pack(fill=tk.X, pady=(4, 12))
+
+        act_lbl_header = tk.Label(
+            content_frame,
+            text="RECOMMENDED ACTION",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0d1117",
+            fg="#8b949e",
+        )
+        act_lbl_header.pack(anchor=tk.W)
+
+        act_box = tk.Text(
+            content_frame,
+            height=3,
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 9, "bold"),
+            wrap=tk.WORD,
+            relief=tk.FLAT,
+            padx=10,
+            pady=8,
+            highlightbackground="#30363d",
+            highlightthickness=1,
+        )
+        act_box.insert(tk.END, s.get("action", ""))
+        act_box.config(state=tk.DISABLED)
+        act_box.pack(fill=tk.X, pady=(4, 14))
+
+        # Checkbox toggle frame
+        toggle_frame = tk.Frame(
+            content_frame,
+            bg="#161b22",
+            padx=14,
+            pady=12,
+            highlightbackground=border_color,
+            highlightthickness=1,
+        )
+        toggle_frame.pack(fill=tk.X, pady=(0, 14))
+
+        curr_state = self.is_suggestion_enabled(s)
+        modal_var = tk.BooleanVar(value=curr_state)
+
+        def on_modal_toggle():
+            new_val = modal_var.get()
+            self.set_suggestion_enabled(s, new_val)
+            if cb_var is not None:
+                cb_var.set(new_val)
+            chk_modal.config(
+                text="Recommendation is Active and Injected in Game Profile"
+                if new_val
+                else "Recommendation is Disabled (Stock Runtime)",
+                fg="#39FF14" if new_val else "#8b949e",
+            )
+            if self.current_manifest:
+                self._render_manifest_data(self.current_manifest)
+
+        chk_modal = tk.Checkbutton(
+            toggle_frame,
+            text="Recommendation is Active and Injected in Game Profile"
+            if curr_state
+            else "Recommendation is Disabled (Stock Runtime)",
+            variable=modal_var,
+            command=on_modal_toggle,
+            bg="#161b22",
+            fg="#39FF14" if curr_state else "#8b949e",
+            activebackground="#161b22",
+            activeforeground="#39FF14",
+            selectcolor="#0d1117",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+        )
+        chk_modal.pack(anchor=tk.W)
+
+        sub_msg = tk.Label(
+            toggle_frame,
+            text="Checking this box writes the optimization into the per-game profile.toml, automatically active on Steam launches.",
+            font=("Segoe UI", 8),
+            bg="#161b22",
+            fg="#8b949e",
+            wraplength=560,
+            justify=tk.LEFT,
+        )
+        sub_msg.pack(anchor=tk.W, pady=(4, 0))
+
+        btn_row = tk.Frame(win, bg="#0d1117", padx=16, pady=10)
+        btn_row.pack(fill=tk.X, side=tk.BOTTOM)
+
+        btn_close = tk.Button(
+            btn_row,
+            text="Close & Save",
+            bg="#238636",
+            fg="#ffffff",
+            activebackground="#2ea043",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+            command=win.destroy,
+        )
+        btn_close.pack(side=tk.RIGHT)
 
     def apply_suggested_fix(self, fix_id, extra=None):
         if not self.current_manifest:

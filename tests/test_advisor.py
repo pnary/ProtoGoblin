@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import time
+import tkinter as tk
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +25,7 @@ from protogoblin import (
 )
 from protogoblin_command import (
     DiagnosticAdvisor,
+    ProtoGoblinCommandApp,
     compute_session_diff,
     format_diff_report,
     generate_debug_dump,
@@ -1571,6 +1573,168 @@ class TestCompatibilityAndDllSnagging(unittest.TestCase):
                     os.environ["XDG_DATA_HOME"] = old_xdg
                 else:
                     os.environ.pop("XDG_DATA_HOME", None)
+
+
+class TestCommanderRecommendationInteraction(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.old_xdg_data = os.environ.get("XDG_DATA_HOME")
+        self.old_xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_DATA_HOME"] = self.td.name
+        os.environ["XDG_CONFIG_HOME"] = self.td.name
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = ProtoGoblinCommandApp(self.root)
+        self.app.current_manifest = {
+            "target": {
+                "steam_appid": 12345,
+                "target_executable": {"path": "C:\\Games\\TestGame\\game.exe"},
+            },
+            "session": {"mode": "profile"},
+        }
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self.td.cleanup()
+        if self.old_xdg_data is not None:
+            os.environ["XDG_DATA_HOME"] = self.old_xdg_data
+        else:
+            os.environ.pop("XDG_DATA_HOME", None)
+        if self.old_xdg_config is not None:
+            os.environ["XDG_CONFIG_HOME"] = self.old_xdg_config
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+
+    def test_builtin_suggestion_toggles(self):
+        # 1. Descriptor buffer (defaults to True on initial GUI boot)
+        s_desc = {"fix_id": "enable_descriptor_buffer", "title": "Test Descriptor Buffer"}
+        self.assertTrue(self.app.is_suggestion_enabled(s_desc))
+        self.app.set_suggestion_enabled(s_desc, False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_desc))
+        self.assertFalse(self.app.var_gfx_descriptor_buffer.get())
+        self.app.set_suggestion_enabled(s_desc, True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_desc))
+        self.assertTrue(self.app.var_gfx_descriptor_buffer.get())
+
+        # 2. Cap framerate
+        s_cap = {"fix_id": "cap_framerate", "cap_target": 60, "title": "Cap 60 FPS"}
+        self.assertFalse(self.app.is_suggestion_enabled(s_cap))
+        self.app.set_suggestion_enabled(s_cap, True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_cap))
+        self.assertEqual(self.app.var_gfx_max_fps.get(), "60")
+        self.app.set_suggestion_enabled(s_cap, False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_cap))
+        self.assertEqual(self.app.var_gfx_max_fps.get(), "0")
+
+        # 3. Atelier sync fix (also sets vsync off)
+        s_atelier = {"fix_id": "atelier_sync_fix", "title": "Atelier Sync Fix"}
+        self.assertFalse(self.app.is_suggestion_enabled(s_atelier))
+        self.app.set_suggestion_enabled(s_atelier, True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_atelier))
+        self.assertTrue(self.app.var_atelier_sync_fix.get())
+        self.assertTrue(self.app.var_gfx_vsync_off.get())
+        self.app.set_suggestion_enabled(s_atelier, False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_atelier))
+
+        # 4. Async shader compile (defaults to True)
+        s_async = {"fix_id": "async_shader_compile", "title": "Async Shaders"}
+        self.assertTrue(self.app.is_suggestion_enabled(s_async))
+        self.app.set_suggestion_enabled(s_async, False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_async))
+        self.assertFalse(self.app.var_gfx_async_shader.get())
+        self.app.set_suggestion_enabled(s_async, True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_async))
+
+        # 5. UE5 Lumen and VSM (defaults to True)
+        s_ue5 = {"fix_id": "optimize_ue5_lumen_vsm", "title": "Optimize UE5"}
+        self.assertTrue(self.app.is_suggestion_enabled(s_ue5))
+        self.app.set_suggestion_enabled(s_ue5, False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_ue5))
+        self.assertFalse(self.app.var_ue_optimize_lumen.get())
+        self.assertFalse(self.app.var_ue_optimize_vsm.get())
+        self.app.set_suggestion_enabled(s_ue5, True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_ue5))
+
+        # 6. Custom recommendation without fix_id
+        s_custom = {"title": "Disable In-Game VSync in Menu"}
+        self.assertFalse(self.app.is_suggestion_enabled(s_custom))
+        self.app.set_suggestion_enabled(s_custom, True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_custom))
+        self.app.set_suggestion_enabled(s_custom, False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_custom))
+
+        # 7. Microsoft Native DLL Snag suggestion
+        s_dll = {
+            "fix_id": "snag_dll_d3dcompiler_47",
+            "title": "Missing Microsoft Native DLL: d3dcompiler_47.dll",
+            "remedy": {"verb": "d3dcompiler_47", "dll": "d3dcompiler_47.dll"},
+        }
+        self.assertFalse(self.app.is_suggestion_enabled(s_dll))
+        self.app.var_compat_d3dcompiler_47.set(True)
+        self.assertTrue(self.app.is_suggestion_enabled(s_dll))
+        self.app.var_compat_d3dcompiler_47.set(False)
+        self.assertFalse(self.app.is_suggestion_enabled(s_dll))
+
+    def test_on_suggestion_checkbox_toggled(self):
+        s = {"fix_id": "enable_io_cache", "title": "Enable I/O Cache"}
+        cb_var = tk.BooleanVar(value=True)
+        self.app._on_suggestion_checkbox_toggled(s, cb_var)
+        self.assertTrue(self.app.var_fs_io_cache.get())
+        self.assertTrue(self.app.is_suggestion_enabled(s))
+
+        cb_var.set(False)
+        self.app._on_suggestion_checkbox_toggled(s, cb_var)
+        self.assertFalse(self.app.var_fs_io_cache.get())
+        self.assertFalse(self.app.is_suggestion_enabled(s))
+
+    def test_open_suggestion_detail_window(self):
+        s = {
+            "level": "warning",
+            "fix_id": "vkd3d_single_queue",
+            "title": "VKD3D Queue Stalls Detected",
+            "description": "Session logs revealed repeated VKD3D multi-queue sync stalls.",
+            "action": "Force VKD3D Single Queue submission.",
+        }
+        cb_var = tk.BooleanVar(value=False)
+        self.app.open_suggestion_detail_window(s, cb_var)
+        self.root.update_idletasks()
+
+        # Find the opened Toplevel window
+        toplevels = [w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel)]
+        self.assertEqual(len(toplevels), 1)
+        win = toplevels[0]
+
+        # Verify title and widgets
+        self.assertIn("VKD3D Queue Stalls", win.title())
+
+        # Find the Checkbutton inside the detail window
+        checkbuttons = []
+        def find_checkbuttons(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Checkbutton):
+                    checkbuttons.append(child)
+                find_checkbuttons(child)
+        find_checkbuttons(win)
+        self.assertGreaterEqual(len(checkbuttons), 1)
+
+        # Toggle checkbutton via invoke()
+        modal_cb = checkbuttons[0]
+        modal_cb.invoke()
+        self.assertTrue(self.app.var_vkd3d_single_queue.get())
+        self.assertTrue(cb_var.get())
+        self.assertTrue(self.app.is_suggestion_enabled(s))
+
+        # Toggle again to disable
+        modal_cb.invoke()
+        self.assertFalse(self.app.var_vkd3d_single_queue.get())
+        self.assertFalse(cb_var.get())
+        self.assertFalse(self.app.is_suggestion_enabled(s))
+
+        win.destroy()
 
 
 if __name__ == "__main__":
