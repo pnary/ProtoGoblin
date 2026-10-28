@@ -30,13 +30,13 @@ class DiagnosticAdvisor:
             return []
 
         suggestions = []
-        sync = manifest.get("synchronization", {})
-        gfx = manifest.get("graphics", {})
+        sync = manifest.get("synchronization") or {}
+        gfx = manifest.get("graphics") or {}
         roi = manifest.get("roi_telemetry")
-        ac = manifest.get("anti_cheat", {})
-        env = manifest.get("environment", {})
-        sub = manifest.get("subsystems", {})
-        tgt = manifest.get("target", {})
+        ac = manifest.get("anti_cheat") or {}
+        env = manifest.get("environment") or {}
+        sub = manifest.get("subsystems") or {}
+        tgt = manifest.get("target") or {}
 
         # 1. Anti-Cheat Passthrough & Profiling Suppression
         if ac.get("detected"):
@@ -76,7 +76,7 @@ class DiagnosticAdvisor:
             )
 
         # 3. Shader Compilation Stalls
-        sh = gfx.get("shader_compiles", {})
+        sh = gfx.get("shader_compiles") or {}
         count = sh.get("count", 0)
         time_ms = sh.get("total_time_ms", 0.0)
         hit_rate = sh.get("pipeline_cache_hit_rate", 1.0)
@@ -97,7 +97,7 @@ class DiagnosticAdvisor:
             b_class = roi.get("bottleneck_classification")
             fm = roi.get("frame_metrics") or {}
             pacing = roi.get("pacing") or {}
-            cores = env.get("cpu", {}).get("logical_cores", 1)
+            cores = (env.get("cpu") or {}).get("logical_cores") or 1
 
             if b_class == "cpu_bound":
                 if cores >= 12:
@@ -207,7 +207,7 @@ class DiagnosticAdvisor:
         # 4b. D3D11 / DXGI Wrapper Introspective Live Telemetry
         w_stats = gfx.get("d3d11_wrapper_stats")
         if w_stats:
-            cb = w_stats.get("constant_buffers", {})
+            cb = w_stats.get("constant_buffers") or {}
             cb_total = cb.get("updates_total", 0)
             cb_redundant = cb.get("updates_redundant", 0)
             cb_rate = cb.get("redundancy_rate_pct", 0.0)
@@ -241,7 +241,7 @@ class DiagnosticAdvisor:
                         }
                     )
 
-            sc = w_stats.get("swapchain", {})
+            sc = w_stats.get("swapchain") or {}
             sc_total = sc.get("resizes_total", 0)
             sc_identical = sc.get("resizes_identical", 0)
             sc_rapid = sc.get("resizes_rapid", 0)
@@ -275,7 +275,7 @@ class DiagnosticAdvisor:
                         }
                     )
 
-            timing = w_stats.get("timing", {})
+            timing = w_stats.get("timing") or {}
             sleep_total = timing.get("sleep_calls_total", 0)
             overshoot_calls = timing.get("overshoot_prevented_calls", 0)
             overshoot_ms = timing.get("overshoot_avoided_ms", 0.0)
@@ -311,7 +311,7 @@ class DiagnosticAdvisor:
                     )
 
         # 4c. Filesystem & Asset Streaming Traversal I/O Telemetry
-        fs = manifest.get("filesystem", {})
+        fs = manifest.get("filesystem") or {}
         io_stats = fs.get("io_cache_stats")
         if io_stats:
             reads_total = io_stats.get("reads_total", 0)
@@ -2256,20 +2256,20 @@ class ProtoGoblinCommandApp:
                 [
                     "REGION-OF-INTEREST (ROI) FRAMETIME TELEMETRY",
                     "-" * 60,
-                    f"Bottleneck Status:    {roi.get('bottleneck_classification', 'balanced').upper()}",
-                    f"Average Framerate:    {fm.get('fps_avg', 0):.1f} FPS",
-                    f"1% Low Framerate:     {fm.get('fps_1_pct_low', 0):.1f} FPS",
-                    f"0.1% Low Framerate:   {fm.get('fps_0_1_pct_low', 0):.1f} FPS",
-                    f"Average Frametime:    {fm.get('frametime_avg_ms', 0):.2f} ms",
-                    f"Frametime Percentiles:p95 = {fm.get('frametime_p95_ms', 0)} ms | p99 = {fm.get('frametime_p99_ms', 0)} ms",
-                    f"Frametime Jitter:     {fm.get('frametime_jitter_ms', 0):.2f} ms (StdDev)",
-                    f"Total Frames Scanned: {fm.get('total_frames', 0):,}",
+                    f"Bottleneck Status:    {(roi.get('bottleneck_classification') or 'balanced').upper()}",
+                    f"Average Framerate:    {(fm.get('fps_avg') or 0):.1f} FPS",
+                    f"1% Low Framerate:     {(fm.get('fps_1_pct_low') or 0):.1f} FPS",
+                    f"0.1% Low Framerate:   {(fm.get('fps_0_1_pct_low') or 0):.1f} FPS",
+                    f"Average Frametime:    {(fm.get('frametime_avg_ms') or 0):.2f} ms",
+                    f"Frametime Percentiles:p95 = {fm.get('frametime_p95_ms') or 0} ms | p99 = {fm.get('frametime_p99_ms') or 0} ms",
+                    f"Frametime Jitter:     {(fm.get('frametime_jitter_ms') or 0):.2f} ms (StdDev)",
+                    f"Total Frames Scanned: {(fm.get('total_frames') or 0):,}",
                     "",
                     "HARDWARE RESOURCE ALLOCATION",
                     "-" * 60,
-                    f"CPU Busy Utilization: {pacing.get('cpu_busy_pct', 0)}%",
-                    f"CPU Wait/Blocked:     {pacing.get('cpu_wait_pct', 0)}%",
-                    f"GPU Busy Utilization: {pacing.get('gpu_busy_pct', 0)}%",
+                    f"CPU Busy Utilization: {pacing.get('cpu_busy_pct') or 0}%",
+                    f"CPU Wait/Blocked:     {pacing.get('cpu_wait_pct') or 0}%",
+                    f"GPU Busy Utilization: {pacing.get('gpu_busy_pct') or 0}%",
                 ]
             )
         else:
@@ -2305,9 +2305,9 @@ class ProtoGoblinCommandApp:
                     "",
                     "D3D11 / DXGI WRAPPER INTROSPECTION METRICS",
                     "-" * 60,
-                    f"Constant Buffer Updates: {cb.get('updates_total', 0):,} total | {cb.get('updates_redundant', 0):,} redundant ({cb.get('redundancy_rate_pct', 0.0):.1f}% spam)",
-                    f"Pipeline State Binds:   {st.get('binds_total', 0):,} total | {st.get('binds_redundant', 0):,} redundant ({st.get('redundancy_rate_pct', 0.0):.1f}% rebinds)",
-                    f"SwapChain Resizes:       {sc.get('resizes_total', 0)} total | {sc.get('resizes_identical', 0)} identical drops | {sc.get('resizes_rapid', 0)} rapid bursts",
+                    f"Constant Buffer Updates: {(cb.get('updates_total') or 0):,} total | {(cb.get('updates_redundant') or 0):,} redundant ({(cb.get('redundancy_rate_pct') or 0.0):.1f}% spam)",
+                    f"Pipeline State Binds:   {(st.get('binds_total') or 0):,} total | {(st.get('binds_redundant') or 0):,} redundant ({(st.get('redundancy_rate_pct') or 0.0):.1f}% rebinds)",
+                    f"SwapChain Resizes:       {sc.get('resizes_total') or 0} total | {sc.get('resizes_identical') or 0} identical drops | {sc.get('resizes_rapid') or 0} rapid bursts",
                     f"Deduplication Active:   State Dedup: {'YES' if d3d11_stats.get('state_dedup_active') else 'NO'} | Debounce: {'YES' if d3d11_stats.get('swapchain_debounce_active') else 'NO'}",
                 ]
             )
@@ -2320,10 +2320,10 @@ class ProtoGoblinCommandApp:
                     "FILESYSTEM & ASSET STREAMING TELEMETRY",
                     "-" * 60,
                     f"Cache Active:           {'YES' if io_stats.get('io_cache_active') else 'NO'}",
-                    f"Tracked Game Archives:  {io_stats.get('tracked_archives_count', 0)} containers",
-                    f"Synchronous Reads:      {io_stats.get('reads_total', 0):,} total | {io_stats.get('reads_cached_hits', 0):,} cache hits ({io_stats.get('hit_rate_pct', 0.0):.1f}%)",
-                    f"Data Streamed / Saved:  {io_stats.get('bytes_read_total', 0) / (1024*1024):.1f} MB read | {io_stats.get('bytes_cached_saved', 0) / (1024*1024):.1f} MB served from RAM",
-                    f"Est. Latency Avoided:   {io_stats.get('estimated_latency_saved_ms', 0.0):.1f} ms",
+                    f"Tracked Game Archives:  {io_stats.get('tracked_archives_count') or 0} containers",
+                    f"Synchronous Reads:      {(io_stats.get('reads_total') or 0):,} total | {(io_stats.get('reads_cached_hits') or 0):,} cache hits ({(io_stats.get('hit_rate_pct') or 0.0):.1f}%)",
+                    f"Data Streamed / Saved:  {(io_stats.get('bytes_read_total') or 0) / (1024*1024):.1f} MB read | {(io_stats.get('bytes_cached_saved') or 0) / (1024*1024):.1f} MB served from RAM",
+                    f"Est. Latency Avoided:   {(io_stats.get('estimated_latency_saved_ms') or 0.0):.1f} ms",
                 ]
             )
 
@@ -2335,8 +2335,8 @@ class ProtoGoblinCommandApp:
                     "TIMING & FRAME-PACING CADENCE TELEMETRY",
                     "-" * 60,
                     f"Precision Timers Active:{'YES' if timing_stats.get('high_precision_timers_active') else 'NO'}",
-                    f"Win32 Sleep Calls:      {timing_stats.get('sleep_calls_total', 0):,} total | {timing_stats.get('sleep_spin_hybrid_calls', 0):,} QPC spin-paced",
-                    f"Overshoots Prevented:   {timing_stats.get('overshoot_prevented_calls', 0):,} calls (~{timing_stats.get('overshoot_avoided_ms', 0.0):.1f} ms drift avoided)",
+                    f"Win32 Sleep Calls:      {(timing_stats.get('sleep_calls_total') or 0):,} total | {(timing_stats.get('sleep_spin_hybrid_calls') or 0):,} QPC spin-paced",
+                    f"Overshoots Prevented:   {(timing_stats.get('overshoot_prevented_calls') or 0):,} calls (~{(timing_stats.get('overshoot_avoided_ms') or 0.0):.1f} ms drift avoided)",
                 ]
             )
 
@@ -2351,8 +2351,8 @@ class ProtoGoblinCommandApp:
             f"Target Binary:        {t_exe.get('path', 'unknown')}",
             f"Architecture:         {t_exe.get('arch', 'unknown').upper()}",
             f"Target SHA256:        {t_exe.get('sha256', 'unknown')}",
-            f"PE Timestamp:         {t_exe.get('pe_timestamp', 'None')}",
-            f"PE Size of Image:     {t_exe.get('pe_size_of_image', 0):,} bytes",
+            f"PE Timestamp:         {t_exe.get('pe_timestamp') or 'None'}",
+            f"PE Size of Image:     {(t_exe.get('pe_size_of_image') or 0):,} bytes",
             "",
             "INTERMEDIATE LAUNCHER",
             "-" * 60,
@@ -2375,7 +2375,7 @@ class ProtoGoblinCommandApp:
                 f"D3D APIs Detected:    {', '.join(gfx.get('d3d_api_versions', []))}",
                 f"Swapchain Mode:       {gfx.get('presentation_model', 'unknown')} ({gfx.get('present_mode', 'unknown')})",
                 f"Resolution:           {gfx.get('resolution', 'unknown')}",
-                f"Shader Pipelines:     {gfx.get('shader_compiles', {}).get('count', 0)} compiled ({gfx.get('shader_compiles', {}).get('total_time_ms', 0):.1f} ms)",
+                f"Shader Pipelines:     {(gfx.get('shader_compiles') or {}).get('count') or 0} compiled ({((gfx.get('shader_compiles') or {}).get('total_time_ms') or 0):.1f} ms)",
                 f"VRAM Allocated:       {gfx.get('memory', {}).get('vram_used_mb') or 'N/A'} MB",
                 "",
                 "SYNCHRONIZATION & SUBSYSTEMS",
@@ -2415,7 +2415,7 @@ class ProtoGoblinCommandApp:
             f"Architecture: {pe.get('arch', 'unknown')}\n"
             f"SHA256: {pe.get('sha256', 'unknown')}\n"
             f"PE Timestamp: {pe.get('pe_timestamp') or 'None'}\n"
-            f"PE Size of Image: {pe.get('pe_size_of_image', 0):,} bytes\n\n"
+            f"PE Size of Image: {(pe.get('pe_size_of_image') or 0):,} bytes\n\n"
             f"Anti-Cheat Detected: {'YES (' + ac.get('provider') + ')' if ac.get('detected') else 'Clean (None)'}"
         )
         messagebox.showinfo("PE Binary Inspection", msg)

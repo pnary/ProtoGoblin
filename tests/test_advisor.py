@@ -1868,6 +1868,33 @@ class TestCommanderSteamGroupExplorer(unittest.TestCase):
         self.assertEqual(len(children), 1)
         self.assertIn("ImmortalsOfAveum.exe", self.app.sessions_tree.item(children[0], "text"))
 
+    def test_render_manifest_with_null_pe_fields(self):
+        # Manifest with null PE fields and null stats (as seen in real sessions with cmd.exe)
+        manifest = {
+            "session": {"id": "null_test_sess", "mode": "play"},
+            "target": {
+                "steam_appid": "2555360",
+                "target_executable": {
+                    "path": "cmd.exe",
+                    "sha256": "unknown",
+                    "arch": "x86_64",
+                    "pe_timestamp": None,
+                    "pe_size_of_image": None,
+                },
+                "engine": {"detected": False, "engine": "unknown"},
+            },
+            "graphics": {
+                "active_backend": "dxvk",
+                "shader_compiles": None,
+                "d3d11_wrapper_stats": None,
+            },
+            "filesystem": {"io_cache_stats": None},
+        }
+        # Should render cleanly without TypeError formatting NoneType
+        self.app._render_manifest_data(manifest, "/dummy/path.json")
+        self.assertIn("cmd.exe", self.app.diag_header_lbl.cget("text"))
+        self.assertIn("0 bytes", self.app.sys_text.get("1.0", tk.END))
+
 
 if __name__ == "__main__":
     unittest.main()
