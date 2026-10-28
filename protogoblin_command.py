@@ -7,6 +7,7 @@ import glob
 import json
 import os
 import platform
+import re
 import sys
 import tkinter as tk
 from datetime import datetime, timezone
@@ -874,6 +875,21 @@ class ProtoGoblinCommandApp:
         except Exception:
             pass
 
+        self.style.configure(
+            "Treeview",
+            background="#161b22",
+            foreground="#c9d1d9",
+            fieldbackground="#161b22",
+            borderwidth=0,
+            font=("Segoe UI", 9),
+            rowheight=22,
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", "#1f6feb")],
+            foreground=[("selected", "#ffffff")],
+        )
+
         # Color palette
         self.bg_color = "#1e1e24"
         self.fg_color = "#f0f0f5"
@@ -889,6 +905,9 @@ class ProtoGoblinCommandApp:
         self.current_manifest = None
         self.custom_suggestion_states = {}
         self.initial_session_id = initial_session_id
+        self._game_name_cache = {}
+        self._steam_libs_cache = None
+        self.tree_item_to_path = {}
 
         self._build_ui()
         if self.initial_session_id:
@@ -1026,27 +1045,27 @@ class ProtoGoblinCommandApp:
         )
         search_entry.pack(fill=tk.X, ipady=3)
 
-        # Sessions Listbox with scrollbar
+        # Sessions Treeview with scrollbar (grouped by Steam ID)
         list_container = tk.Frame(left_frame, bg=self.card_bg)
         list_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         scrollbar = tk.Scrollbar(list_container)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.sessions_listbox = tk.Listbox(
+        self.sessions_tree = ttk.Treeview(
             list_container,
-            bg="#161b22",
-            fg="#c9d1d9",
-            selectbackground="#1f6feb",
-            selectforeground="#ffffff",
-            relief=tk.FLAT,
-            font=("Consolas", 9),
+            show="tree",
+            selectmode="browse",
             yscrollcommand=scrollbar.set,
         )
-        self.sessions_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.sessions_listbox.yview)
+        self.sessions_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.sessions_tree.yview)
 
-        self.sessions_listbox.bind("<<ListboxSelect>>", self.on_session_selected)
+        self.sessions_tree.tag_configure("group_header", font=("Segoe UI", 9, "bold"), foreground="#58a6ff")
+        self.sessions_tree.tag_configure("exe_item", font=("Segoe UI", 9), foreground="#c9d1d9")
+
+        self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_selected)
+        self.sessions_listbox = self.sessions_tree
 
         # Right Pane: Notebook Dashboard
         right_frame = tk.Frame(paned, bg=self.bg_color)
@@ -1788,6 +1807,71 @@ class ProtoGoblinCommandApp:
         messagebox.showinfo("Profile Dev Mode", f"Dev mode logging for {t_exe} ({app_id}) is now {state_str}.\nProfile saved to: {p_file}")
         self.refresh_dev_tab()
 
+    def _get_steam_libraries(self):
+        if self._steam_libs_cache is not None:
+            return self._steam_libs_cache
+        libs = set()
+        roots = [
+            os.path.expanduser("~/.local/share/Steam"),
+            os.path.expanduser("~/.steam/steam"),
+            os.path.expanduser("~/.steam/root"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam"),
+            os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.steam/steam"),
+        ]
+        for root in roots:
+            if os.path.isdir(root):
+                sapps = os.path.join(root, "steamapps")
+                if os.path.isdir(sapps):
+                    libs.add(sapps)
+                vdf = os.path.join(root, "steamapps", "libraryfolders.vdf")
+                if os.path.isfile(vdf):
+                    try:
+                        with open(vdf, "r", encoding="utf-8") as f:
+                            for line in f:
+                                m = re.search(r'\"path\"\s+\"([^\"]+)\"', line)
+                                if m:
+                                    cand = os.path.join(m.group(1), "steamapps")
+                                    if os.path.isdir(cand):
+                                        libs.add(cand)
+                    except Exception:
+                        pass
+        self._steam_libs_cache = list(libs)
+        return self._steam_libs_cache
+
+    def resolve_game_name(self, app_id):
+        """Resolves human-readable game title from PresetDatabase or Steam appmanifest."""
+        if not app_id or str(app_id) in ("-", "unknown", "unknown_game", "custom-game"):
+            return "Custom / Non-Steam Game"
+        app_id_str = str(app_id).strip()
+        if app_id_str in self._game_name_cache:
+            return self._game_name_cache[app_id_str]
+
+        # 1. Preset Database lookup
+        preset = protogoblin.PresetDatabase.get_preset(app_id_str)
+        if preset and preset.get("title"):
+            self._game_name_cache[app_id_str] = preset["title"]
+            return preset["title"]
+
+        # 2. Local Steam appmanifest lookup
+        for lib in self._get_steam_libraries():
+            acf = os.path.join(lib, f"appmanifest_{app_id_str}.acf")
+            if os.path.isfile(acf):
+                try:
+                    with open(acf, "r", encoding="utf-8") as f:
+                        for line in f:
+                            m = re.search(r'\"name\"\s+\"([^\"]+)\"', line)
+                            if m:
+                                name = m.group(1).strip()
+                                self._game_name_cache[app_id_str] = name
+                                return name
+                except Exception:
+                    pass
+
+        # 3. Fallback
+        fallback = f"Steam App {app_id_str}" if app_id_str.isdigit() else f"Game {app_id_str}"
+        self._game_name_cache[app_id_str] = fallback
+        return fallback
+
     def refresh_sessions(self):
         """Scans for all utilization.json files across ProtoGoblin sessions."""
         xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
@@ -1800,10 +1884,16 @@ class ProtoGoblinCommandApp:
         self._filter_session_list()
 
     def _filter_session_list(self):
-        self.sessions_listbox.delete(0, tk.END)
+        for item in self.sessions_tree.get_children():
+            self.sessions_tree.delete(item)
+
         query = self.search_var.get().lower().strip()
         self.filtered_manifest_paths = []
         self.diff_session_labels = []
+        self.tree_item_to_path = {}
+
+        # Group executables and sessions by steam_appid
+        grouped = {}
 
         for idx, path in enumerate(self.manifest_paths):
             try:
@@ -1812,17 +1902,78 @@ class ProtoGoblinCommandApp:
                 sess = data.get("session", {})
                 tgt = data.get("target", {})
                 t_exe = os.path.basename(tgt.get("target_executable", {}).get("path", "Unknown"))
-                app_id = tgt.get("steam_appid") or "-"
+                app_id = str(tgt.get("steam_appid") or "unknown_game")
                 mode = sess.get("mode", "play").upper()
                 sess_id = sess.get("id", f"sess_{idx}")
+                start_time = sess.get("start_time", sess_id)
+                time_str = start_time[:19].replace("T", " ") if "T" in str(start_time) else str(sess_id[:16])
+                mtime = os.path.getmtime(path)
 
-                display = f"[{mode:<7}] {t_exe:<18} ({app_id})"
-                if not query or query in display.lower() or query in path.lower():
-                    self.sessions_listbox.insert(tk.END, display)
-                    self.filtered_manifest_paths.append(path)
-                    self.diff_session_labels.append(f"[{mode}] {t_exe} ({sess_id[:16]})")
+                if app_id not in grouped:
+                    game_name = self.resolve_game_name(app_id)
+                    grouped[app_id] = {
+                        "app_id": app_id,
+                        "game_name": game_name,
+                        "latest_mtime": mtime,
+                        "sessions": [],
+                    }
+                else:
+                    if mtime > grouped[app_id]["latest_mtime"]:
+                        grouped[app_id]["latest_mtime"] = mtime
+
+                grouped[app_id]["sessions"].append({
+                    "path": path,
+                    "t_exe": t_exe,
+                    "mode": mode,
+                    "sess_id": sess_id,
+                    "time_str": time_str,
+                    "mtime": mtime,
+                })
             except Exception:
                 continue
+
+        # Sort groups by most recent activity
+        sorted_groups = sorted(grouped.values(), key=lambda g: g["latest_mtime"], reverse=True)
+
+        for group in sorted_groups:
+            app_id = group["app_id"]
+            game_name = group["game_name"]
+            group_label = f"{game_name} ({app_id})"
+
+            # Sort sessions within the group by mtime descending
+            group["sessions"].sort(key=lambda s: s["mtime"], reverse=True)
+
+            # Filter sessions based on search query
+            matching_sessions = []
+            group_matches_query = (not query) or (query in group_label.lower()) or (query in app_id.lower())
+
+            for s in group["sessions"]:
+                display_exe = f"[{s['mode']}] {s['t_exe']} ({s['time_str']})"
+                if group_matches_query or (query in s["t_exe"].lower()) or (query in s["mode"].lower()) or (query in s["sess_id"].lower()):
+                    matching_sessions.append((s, display_exe))
+
+            if not matching_sessions:
+                continue
+
+            # Insert parent group node in Treeview (expanded by default)
+            parent_id = self.sessions_tree.insert(
+                "",
+                "end",
+                text=group_label,
+                open=True,
+                tags=("group_header",),
+            )
+
+            for s, display_exe in matching_sessions:
+                item_id = self.sessions_tree.insert(
+                    parent_id,
+                    "end",
+                    text=display_exe,
+                    tags=("exe_item",),
+                )
+                self.tree_item_to_path[item_id] = s["path"]
+                self.filtered_manifest_paths.append(s["path"])
+                self.diff_session_labels.append(f"[{s['mode']}] {game_name} ({app_id}) - {s['t_exe']} ({s['sess_id'][:16]})")
 
         if hasattr(self, "combo_session_a") and hasattr(self, "combo_session_b"):
             self.combo_session_a["values"] = self.diff_session_labels
@@ -1838,27 +1989,45 @@ class ProtoGoblinCommandApp:
         if getattr(self, "dev_mode", False):
             self.refresh_dev_tab()
 
-        if self.sessions_listbox.size() > 0:
-            self.sessions_listbox.select_set(0)
+        # Select first available executable session
+        root_children = self.sessions_tree.get_children()
+        if root_children:
+            first_group = root_children[0]
+            group_children = self.sessions_tree.get_children(first_group)
+            target = group_children[0] if group_children else first_group
+            self.sessions_tree.selection_set(target)
+            self.sessions_tree.focus(target)
             self.on_session_selected(None)
 
-    def on_session_selected(self, event):
-        sel = self.sessions_listbox.curselection()
+    def on_session_selected(self, event=None):
+        sel = self.sessions_tree.selection()
         if not sel:
             return
 
-        idx = sel[0]
-        paths = getattr(self, "filtered_manifest_paths", self.manifest_paths)
-        if idx < len(paths):
-            path = paths[idx]
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.current_manifest = json.load(f)
-                self._render_manifest_data(self.current_manifest, path)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to load manifest: {e}")
+        item_id = sel[0]
+        path = self.tree_item_to_path.get(item_id)
+        if not path:
+            # User clicked the group header node! Select first child executable
+            children = self.sessions_tree.get_children(item_id)
+            if children:
+                first_child = children[0]
+                self.sessions_tree.selection_set(first_child)
+                self.sessions_tree.focus(first_child)
+                path = self.tree_item_to_path.get(first_child)
+            if not path:
+                return
 
-        if hasattr(self, "combo_session_b") and idx < len(paths):
+        paths = getattr(self, "filtered_manifest_paths", self.manifest_paths)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.current_manifest = json.load(f)
+            self.current_manifest_path = path
+            self._render_manifest_data(self.current_manifest, path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load manifest: {e}")
+
+        if hasattr(self, "combo_session_b") and path in paths:
+            idx = paths.index(path)
             self.combo_session_b.current(idx)
             if idx + 1 < len(paths):
                 self.combo_session_a.current(idx + 1)
@@ -1891,12 +2060,15 @@ class ProtoGoblinCommandApp:
         eng_tag = f" | Engine: {eng_name}" if eng_info.get("detected") else ""
         ac = data.get("anti_cheat", {})
         ac_tag = f" | 🛡️ {ac.get('provider')} (PASSTHROUGH)" if ac.get("detected") else ""
+        app_id = tgt.get("steam_appid") or "-"
+        game_name = self.resolve_game_name(app_id)
+        game_display = f"{game_name} ({app_id})" if app_id != "-" else game_name
         self.diag_header_lbl.config(
-            text=f"Target: {t_name}{eng_tag}{ac_tag} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
+            text=f"Game: {game_display} | Target: {t_name}{eng_tag}{ac_tag} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
         )
         if hasattr(self, "tweaks_game_lbl"):
             self.tweaks_game_lbl.config(
-                text=f"Active Game: {t_name} (AppID: {tgt.get('steam_appid') or '-'}, Engine: {eng_name})"
+                text=f"Active Game: {game_display} | Executable: {t_name} (Engine: {eng_name})"
             )
 
         app_id = tgt.get("steam_appid")

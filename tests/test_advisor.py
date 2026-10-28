@@ -1737,5 +1737,137 @@ class TestCommanderRecommendationInteraction(unittest.TestCase):
         win.destroy()
 
 
+class TestCommanderSteamGroupExplorer(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.old_xdg_data = os.environ.get("XDG_DATA_HOME")
+        self.old_xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_DATA_HOME"] = self.td.name
+        os.environ["XDG_CONFIG_HOME"] = self.td.name
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = ProtoGoblinCommandApp(self.root)
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self.td.cleanup()
+        if self.old_xdg_data is not None:
+            os.environ["XDG_DATA_HOME"] = self.old_xdg_data
+        else:
+            os.environ.pop("XDG_DATA_HOME", None)
+        if self.old_xdg_config is not None:
+            os.environ["XDG_CONFIG_HOME"] = self.old_xdg_config
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+
+    def test_resolve_game_name(self):
+        # 1. PresetDatabase resolution
+        self.assertIn("Immortals of Aveum", self.app.resolve_game_name("2555360"))
+        self.assertIn("Atelier Ryza", self.app.resolve_game_name("1121560"))
+
+        # 2. Unknown or non-Steam
+        self.assertEqual(self.app.resolve_game_name("unknown_game"), "Custom / Non-Steam Game")
+        self.assertEqual(self.app.resolve_game_name("-"), "Custom / Non-Steam Game")
+        self.assertEqual(self.app.resolve_game_name(None), "Custom / Non-Steam Game")
+
+        # 3. Numeric unregistered fallback
+        self.assertEqual(self.app.resolve_game_name("888888"), "Steam App 888888")
+
+        # 4. Mock ACF file
+        mock_steam = os.path.join(self.td.name, "mock_steam", "steamapps")
+        os.makedirs(mock_steam, exist_ok=True)
+        acf_path = os.path.join(mock_steam, "appmanifest_99999.acf")
+        with open(acf_path, "w", encoding="utf-8") as f:
+            f.write('"AppState"\n{\n\t"appid"\t"99999"\n\t"name"\t"My Awesome Steam Game"\n}\n')
+        self.app._steam_libs_cache = [mock_steam]
+        self.app._game_name_cache.clear()
+        self.assertEqual(self.app.resolve_game_name("99999"), "My Awesome Steam Game")
+
+    def test_sessions_grouped_by_steam_id_and_display_name(self):
+        base = os.path.join(self.td.name, "protogoblin", "sessions")
+
+        # Session 1: 2555360 (cmd.exe)
+        s1_dir = os.path.join(base, "2555360", "20261028T080000Z-1111")
+        os.makedirs(s1_dir, exist_ok=True)
+        with open(os.path.join(s1_dir, "utilization.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "session": {"id": "20261028T080000Z-1111", "mode": "play", "start_time": "2026-10-28T08:00:00Z"},
+                "target": {"steam_appid": "2555360", "target_executable": {"path": "C:\\Games\\cmd.exe"}},
+            }, f)
+
+        # Session 2: 2555360 (ImmortalsOfAveum.exe)
+        s2_dir = os.path.join(base, "2555360", "20261028T090000Z-2222")
+        os.makedirs(s2_dir, exist_ok=True)
+        with open(os.path.join(s2_dir, "utilization.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "session": {"id": "20261028T090000Z-2222", "mode": "profile", "start_time": "2026-10-28T09:00:00Z"},
+                "target": {"steam_appid": "2555360", "target_executable": {"path": "C:\\Games\\ImmortalsOfAveum.exe"}},
+            }, f)
+
+        # Session 3: 1121560 (Atelier_Ryza.exe)
+        s3_dir = os.path.join(base, "1121560", "20261028T070000Z-3333")
+        os.makedirs(s3_dir, exist_ok=True)
+        with open(os.path.join(s3_dir, "utilization.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "session": {"id": "20261028T070000Z-3333", "mode": "play", "start_time": "2026-10-28T07:00:00Z"},
+                "target": {"steam_appid": "1121560", "target_executable": {"path": "C:\\Games\\Atelier_Ryza.exe"}},
+            }, f)
+
+        self.app.refresh_sessions()
+
+        # Check Treeview groups
+        root_nodes = self.app.sessions_tree.get_children()
+        self.assertEqual(len(root_nodes), 2)
+
+        # Group titles should have: Game Name (Steam ID)
+        aveum_group = next((nid for nid in root_nodes if "2555360" in self.app.sessions_tree.item(nid, "text")), None)
+        ryza_group = next((nid for nid in root_nodes if "1121560" in self.app.sessions_tree.item(nid, "text")), None)
+
+        self.assertIsNotNone(aveum_group)
+        self.assertIsNotNone(ryza_group)
+        self.assertIn("Immortals of Aveum", self.app.sessions_tree.item(aveum_group, "text"))
+        self.assertTrue(self.app.sessions_tree.item(aveum_group, "text").endswith("(2555360)"))
+
+        self.assertIn("Atelier Ryza", self.app.sessions_tree.item(ryza_group, "text"))
+        self.assertTrue(self.app.sessions_tree.item(ryza_group, "text").endswith("(1121560)"))
+
+        # Check executables grouped under 2555360
+        aveum_children = self.app.sessions_tree.get_children(aveum_group)
+        self.assertEqual(len(aveum_children), 2)
+        aveum_child_texts = [self.app.sessions_tree.item(cid, "text") for cid in aveum_children]
+        self.assertTrue(any("ImmortalsOfAveum.exe" in t for t in aveum_child_texts))
+        self.assertTrue(any("cmd.exe" in t for t in aveum_child_texts))
+
+        # Check executable grouped under 1121560
+        ryza_children = self.app.sessions_tree.get_children(ryza_group)
+        self.assertEqual(len(ryza_children), 1)
+        self.assertIn("Atelier_Ryza.exe", self.app.sessions_tree.item(ryza_children[0], "text"))
+
+        # Test selecting a child executable loads the session manifest
+        self.app.sessions_tree.selection_set(ryza_children[0])
+        self.app.on_session_selected(None)
+        self.assertEqual(self.app.current_manifest["target"]["steam_appid"], "1121560")
+        self.assertIn("Atelier Ryza", self.app.diag_header_lbl.cget("text"))
+
+        # Test search filter by Steam ID
+        self.app.search_var.set("1121560")
+        filtered_roots = self.app.sessions_tree.get_children()
+        self.assertEqual(len(filtered_roots), 1)
+        self.assertIn("Atelier Ryza", self.app.sessions_tree.item(filtered_roots[0], "text"))
+
+        # Test search filter by executable name
+        self.app.search_var.set("ImmortalsOfAveum")
+        filtered_roots = self.app.sessions_tree.get_children()
+        self.assertEqual(len(filtered_roots), 1)
+        self.assertIn("2555360", self.app.sessions_tree.item(filtered_roots[0], "text"))
+        children = self.app.sessions_tree.get_children(filtered_roots[0])
+        self.assertEqual(len(children), 1)
+        self.assertIn("ImmortalsOfAveum.exe", self.app.sessions_tree.item(children[0], "text"))
+
+
 if __name__ == "__main__":
     unittest.main()
