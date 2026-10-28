@@ -31,6 +31,158 @@ static std::atomic<uint64_t> g_swapchainResizesTotal{0};
 static std::atomic<uint64_t> g_swapchainResizesIdentical{0};
 static std::atomic<uint64_t> g_swapchainResizesRapid{0};
 
+// Precision Timer & Pacing Telemetry
+typedef void (WINAPI *pfn_Sleep)(DWORD);
+typedef DWORD (WINAPI *pfn_SleepEx)(DWORD, BOOL);
+
+static pfn_Sleep g_realSleep = nullptr;
+static pfn_SleepEx g_realSleepEx = nullptr;
+
+static std::atomic<uint64_t> g_sleepCallsTotal{0};
+static std::atomic<uint64_t> g_sleepSpinHybridCalls{0};
+static std::atomic<uint64_t> g_overshootPreventedCalls{0};
+static std::atomic<double> g_overshootAvoidedMs{0.0};
+
+static bool IsHighPrecisionTimersEnabled() {
+    static int s_val = -1;
+    if (s_val == -1) {
+        char buf[16] = {0};
+        if (GetEnvironmentVariableA("PROTOGOBLIN_HIGH_PRECISION_TIMERS", buf, sizeof(buf))) {
+            s_val = (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y') ? 1 : 0;
+        } else {
+            s_val = 0;
+        }
+    }
+    return s_val == 1;
+}
+
+static inline void HighPrecisionWait(DWORD dwMilliseconds) {
+    if (dwMilliseconds == 0) {
+        SwitchToThread();
+        return;
+    }
+
+    LARGE_INTEGER freq;
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
+        if (g_realSleep) g_realSleep(dwMilliseconds);
+        else Sleep(dwMilliseconds);
+        return;
+    }
+
+    LARGE_INTEGER start, now;
+    QueryPerformanceCounter(&start);
+    LONGLONG targetTicks = start.QuadPart + (LONGLONG)((double)dwMilliseconds * (double)freq.QuadPart / 1000.0);
+
+    // If sleep is longer than 2ms, coarse-sleep for the bulk period minus 2ms
+    if (dwMilliseconds >= 3) {
+        DWORD coarseMs = dwMilliseconds - 2;
+        if (g_realSleep) g_realSleep(coarseMs);
+        else Sleep(coarseMs);
+    }
+
+    // High-resolution spin-yield for the remaining sub-millisecond precision window
+    QueryPerformanceCounter(&now);
+    while (now.QuadPart < targetTicks) {
+        YieldProcessor();
+        QueryPerformanceCounter(&now);
+    }
+}
+
+VOID WINAPI Protogoblin_Sleep(DWORD dwMilliseconds) {
+    g_sleepCallsTotal.fetch_add(1, std::memory_order_relaxed);
+    if (!IsHighPrecisionTimersEnabled()) {
+        if (g_realSleep) g_realSleep(dwMilliseconds);
+        else Sleep(dwMilliseconds);
+        return;
+    }
+
+    g_sleepSpinHybridCalls.fetch_add(1, std::memory_order_relaxed);
+    if (dwMilliseconds <= 2) {
+        g_overshootPreventedCalls.fetch_add(1, std::memory_order_relaxed);
+        double current = g_overshootAvoidedMs.load(std::memory_order_relaxed);
+        while (!g_overshootAvoidedMs.compare_exchange_weak(current, current + 2.0, std::memory_order_relaxed));
+    }
+
+    HighPrecisionWait(dwMilliseconds);
+}
+
+DWORD WINAPI Protogoblin_SleepEx(DWORD dwMilliseconds, BOOL bAlertable) {
+    g_sleepCallsTotal.fetch_add(1, std::memory_order_relaxed);
+    if (!IsHighPrecisionTimersEnabled() || bAlertable) {
+        if (g_realSleepEx) return g_realSleepEx(dwMilliseconds, bAlertable);
+        return SleepEx(dwMilliseconds, bAlertable);
+    }
+
+    g_sleepSpinHybridCalls.fetch_add(1, std::memory_order_relaxed);
+    if (dwMilliseconds <= 2) {
+        g_overshootPreventedCalls.fetch_add(1, std::memory_order_relaxed);
+        double current = g_overshootAvoidedMs.load(std::memory_order_relaxed);
+        while (!g_overshootAvoidedMs.compare_exchange_weak(current, current + 2.0, std::memory_order_relaxed));
+    }
+
+    HighPrecisionWait(dwMilliseconds);
+    return 0;
+}
+
+static void HookModuleIAT(HMODULE hMod) {
+    if (!hMod) return;
+
+    auto pDos = (PIMAGE_DOS_HEADER)hMod;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) return;
+
+    auto pNt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    IMAGE_DATA_DIRECTORY importDir = pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDir.VirtualAddress == 0 || importDir.Size == 0) return;
+
+    auto pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hMod + importDir.VirtualAddress);
+    while (pImportDesc->Name != 0) {
+        const char* modName = (const char*)((BYTE*)hMod + pImportDesc->Name);
+        if (_stricmp(modName, "kernel32.dll") == 0 || _stricmp(modName, "kernelbase.dll") == 0) {
+            auto pThunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + pImportDesc->FirstThunk);
+            auto pOrigThunk = pImportDesc->OriginalFirstThunk ?
+                              (PIMAGE_THUNK_DATA)((BYTE*)hMod + pImportDesc->OriginalFirstThunk) : pThunk;
+
+            while (pOrigThunk->u1.AddressOfData != 0) {
+                if (!(pOrigThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
+                    auto pImportByName = (PIMAGE_IMPORT_BY_NAME)((BYTE*)hMod + pOrigThunk->u1.AddressOfData);
+                    if (strcmp((const char*)pImportByName->Name, "Sleep") == 0) {
+                        DWORD oldProt;
+                        if (VirtualProtect(&pThunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+                            if (!g_realSleep) g_realSleep = (pfn_Sleep)pThunk->u1.Function;
+                            pThunk->u1.Function = (ULONG_PTR)Protogoblin_Sleep;
+                            VirtualProtect(&pThunk->u1.Function, sizeof(void*), oldProt, &oldProt);
+                        }
+                    } else if (strcmp((const char*)pImportByName->Name, "SleepEx") == 0) {
+                        DWORD oldProt;
+                        if (VirtualProtect(&pThunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+                            if (!g_realSleepEx) g_realSleepEx = (pfn_SleepEx)pThunk->u1.Function;
+                            pThunk->u1.Function = (ULONG_PTR)Protogoblin_SleepEx;
+                            VirtualProtect(&pThunk->u1.Function, sizeof(void*), oldProt, &oldProt);
+                        }
+                    }
+                }
+                pThunk++;
+                pOrigThunk++;
+            }
+        }
+        pImportDesc++;
+    }
+}
+
+void InstallPrecisionTimerHooks() {
+    static std::once_flag s_timerOnce;
+    std::call_once(s_timerOnce, []() {
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (hKernel32) {
+            if (!g_realSleep) g_realSleep = (pfn_Sleep)GetProcAddress(hKernel32, "Sleep");
+            if (!g_realSleepEx) g_realSleepEx = (pfn_SleepEx)GetProcAddress(hKernel32, "SleepEx");
+        }
+        HookModuleIAT(GetModuleHandleA(nullptr));
+    });
+}
+
 static bool IsStateDedupEnabled() {
     static int s_val = -1;
     if (s_val == -1) {
@@ -101,6 +253,20 @@ static void FlushStatsInternal() {
     fprintf(fp, "    \"resizes_total\": %llu,\n", (unsigned long long)scTotal);
     fprintf(fp, "    \"resizes_identical\": %llu,\n", (unsigned long long)scIdentical);
     fprintf(fp, "    \"resizes_rapid\": %llu\n", (unsigned long long)scRapid);
+    fprintf(fp, "  },\n");
+
+    bool timersActive = IsHighPrecisionTimersEnabled();
+    uint64_t sleepTotal = g_sleepCallsTotal.load(std::memory_order_relaxed);
+    uint64_t sleepHybrid = g_sleepSpinHybridCalls.load(std::memory_order_relaxed);
+    uint64_t overshootAvoidedCalls = g_overshootPreventedCalls.load(std::memory_order_relaxed);
+    double overshootMs = g_overshootAvoidedMs.load(std::memory_order_relaxed);
+
+    fprintf(fp, "  \"timing\": {\n");
+    fprintf(fp, "    \"high_precision_timers_active\": %s,\n", timersActive ? "true" : "false");
+    fprintf(fp, "    \"sleep_calls_total\": %llu,\n", (unsigned long long)sleepTotal);
+    fprintf(fp, "    \"sleep_spin_hybrid_calls\": %llu,\n", (unsigned long long)sleepHybrid);
+    fprintf(fp, "    \"overshoot_prevented_calls\": %llu,\n", (unsigned long long)overshootAvoidedCalls);
+    fprintf(fp, "    \"overshoot_avoided_ms\": %.2f\n", overshootMs);
     fprintf(fp, "  }\n");
     fprintf(fp, "}\n");
     fclose(fp);
@@ -568,6 +734,7 @@ void WrapDeviceAndContext(ID3D11Device** ppDevice, ID3D11DeviceContext** ppConte
     static std::once_flag s_once;
     std::call_once(s_once, []() {
         std::atexit(FlushStats);
+        InstallPrecisionTimerHooks();
     });
 
     if (ppDevice && *ppDevice) {

@@ -632,6 +632,21 @@ class EngineTweakManager:
                 "# Adaptive read-ahead cache to eliminate traversal stutter in asset-streaming titles",
             ])
 
+        precision_timers = None
+        if "precision_timers" in tweaks:
+            precision_timers = tweaks["precision_timers"]
+        elif "timing" in tweaks and "precision_timers" in tweaks["timing"]:
+            precision_timers = tweaks["timing"]["precision_timers"]
+        elif "synchronization" in tweaks and "precision_timers" in tweaks["synchronization"]:
+            precision_timers = tweaks["synchronization"]["precision_timers"]
+        if precision_timers:
+            lines.extend([
+                "",
+                "[timing.precision_timers]",
+                "enabled = true",
+                "# Enforce sub-millisecond QPC sleep-spin hybrid pacing to eliminate timer wake overshoot",
+            ])
+
         lines.append("")
         return "\n".join(lines)
 
@@ -690,8 +705,16 @@ class EngineTweakManager:
             sync_sec.get("swapchain_debounce")
             or (isinstance(sync_sec.get("swapchain_debounce"), dict) and sync_sec["swapchain_debounce"].get("enabled"))
         )
+        timing_sec = profile.get("timing", {})
+        precision_timers_enabled = (
+            timing_sec.get("precision_timers")
+            or (isinstance(timing_sec.get("precision_timers"), dict) and timing_sec["precision_timers"].get("enabled"))
+            or sync_sec.get("precision_timers")
+            or (isinstance(sync_sec.get("precision_timers"), dict) and sync_sec["precision_timers"].get("enabled"))
+            or profile.get("precision_timers")
+        )
 
-        wrapper_required = sync_fix_enabled or state_dedup_enabled or swapchain_debounce_enabled
+        wrapper_required = sync_fix_enabled or state_dedup_enabled or swapchain_debounce_enabled or precision_timers_enabled
         if wrapper_required:
             dll_ov = env.get("WINEDLLOVERRIDES", "")
             if "d3d11=" not in dll_ov:
@@ -703,6 +726,8 @@ class EngineTweakManager:
                 env["PROTOGOBLIN_STATE_DEDUP"] = "1"
             if swapchain_debounce_enabled:
                 env["PROTOGOBLIN_SWAPCHAIN_DEBOUNCE"] = "1"
+            if precision_timers_enabled:
+                env["PROTOGOBLIN_HIGH_PRECISION_TIMERS"] = "1"
 
             # Check candidate paths for vendored d3d11.dll wrapper
             p_dir = proton_dir or os.environ.get("PROTOGOBLIN_DIR") or os.path.dirname(os.path.abspath(__file__))

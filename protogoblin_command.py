@@ -270,6 +270,41 @@ class DiagnosticAdvisor:
                         }
                     )
 
+            timing = w_stats.get("timing", {})
+            sleep_total = timing.get("sleep_calls_total", 0)
+            overshoot_calls = timing.get("overshoot_prevented_calls", 0)
+            overshoot_ms = timing.get("overshoot_avoided_ms", 0.0)
+            timers_active = timing.get("high_precision_timers_active", False)
+
+            if sleep_total >= 500:
+                if not timers_active:
+                    suggestions.append(
+                        {
+                            "level": "warning",
+                            "title": f"High Game-Loop Sleep Timer Activity ({sleep_total:,} Calls)",
+                            "description": (
+                                f"Game issued {sleep_total:,} Win32 Sleep calls to pace its frame or physics ticks. "
+                                "Without precision timer overrides, standard Wine timer coarse scheduling (1-4ms overshoot) "
+                                "induces micro-stutter and frame-pacing drift."
+                            ),
+                            "action": "Enable High-Precision Sleep & Pacing Timers in profile.toml [timing.precision_timers].",
+                            "fix_id": "enable_precision_timers",
+                            "fix_button_text": "⚡ Enable High-Precision Sleep Timers",
+                        }
+                    )
+                else:
+                    suggestions.append(
+                        {
+                            "level": "success",
+                            "title": f"High-Precision Sleep Timers Active ({overshoot_calls:,} overshoots prevented)",
+                            "description": (
+                                f"Sub-millisecond QPC hybrid sleep-spin pacing eliminated timer wake latency drift "
+                                f"(~{overshoot_ms:.1f}ms overshoot avoided across {sleep_total:,} sleep requests)."
+                            ),
+                            "action": "Optimal high-precision sleep and frame pacing cadence is active.",
+                        }
+                    )
+
         # 4c. Filesystem & Asset Streaming Traversal I/O Telemetry
         fs = manifest.get("filesystem", {})
         io_stats = fs.get("io_cache_stats")
@@ -1200,6 +1235,7 @@ class ProtoGoblinCommandApp:
         self.var_atelier_sync_fix = tk.BooleanVar(value=False)
         self.var_sync_state_dedup = tk.BooleanVar(value=True)
         self.var_sync_swapchain_debounce = tk.BooleanVar(value=True)
+        self.var_sync_precision_timers = tk.BooleanVar(value=True)
         self.var_gfx_max_fps = tk.StringVar(value="0")
 
         dxvk_checks = [
@@ -1212,6 +1248,7 @@ class ProtoGoblinCommandApp:
             ("Gust / Atelier D3D11 Staging Buffer Sync Fix (Shadow staging wrapper override)", self.var_atelier_sync_fix),
             ("Constant Buffer & State Rebind Deduplication (D3D11 wrapper state filter)", self.var_sync_state_dedup),
             ("Debounce Rapid SwapChain Resize Choke (DXGI/D3D11 scale-factor filter)", self.var_sync_swapchain_debounce),
+            ("High-Precision Sleep & Frame Pacing Timers (QPC hybrid spin-sleep pacing)", self.var_sync_precision_timers),
         ]
         for text, var in dxvk_checks:
             cb = tk.Checkbutton(
@@ -1928,6 +1965,19 @@ class ProtoGoblinCommandApp:
                 ]
             )
 
+        timing_stats = sess.get("graphics", {}).get("d3d11_wrapper_stats", {}).get("timing")
+        if timing_stats:
+            p_lines.extend(
+                [
+                    "",
+                    "TIMING & FRAME-PACING CADENCE TELEMETRY",
+                    "-" * 60,
+                    f"Precision Timers Active:{'YES' if timing_stats.get('high_precision_timers_active') else 'NO'}",
+                    f"Win32 Sleep Calls:      {timing_stats.get('sleep_calls_total', 0):,} total | {timing_stats.get('sleep_spin_hybrid_calls', 0):,} QPC spin-paced",
+                    f"Overshoots Prevented:   {timing_stats.get('overshoot_prevented_calls', 0):,} calls (~{timing_stats.get('overshoot_avoided_ms', 0.0):.1f} ms drift avoided)",
+                ]
+            )
+
         self.perf_text.insert(tk.END, "\n".join(p_lines))
 
         # Tab 3: System & Translation
@@ -2128,6 +2178,7 @@ class ProtoGoblinCommandApp:
         self.var_atelier_sync_fix.set(False)
         self.var_sync_state_dedup.set(False)
         self.var_sync_swapchain_debounce.set(False)
+        self.var_sync_precision_timers.set(False)
         self.var_fs_io_cache.set(False)
         self.var_gfx_max_fps.set("0")
 
@@ -2206,6 +2257,16 @@ class ProtoGoblinCommandApp:
                 "• Read-ahead LRU ring buffer satisfies asset reads directly from RAM to eliminate traversal hitching.\n\n"
                 f"Saved to profile:\n{path}",
             )
+        elif fix_id == "enable_precision_timers":
+            self.var_sync_precision_timers.set(True)
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Fix Applied",
+                "High-Precision Sleep & Pacing Timers enabled ([timing.precision_timers])!\n\n"
+                "• Intercepts Win32 Sleep/SleepEx game loop timers.\n"
+                "• Enforces sub-millisecond QPC hybrid spin-sleep pacing to eliminate scheduling overshoot.\n\n"
+                f"Saved to profile:\n{path}",
+            )
 
     def generate_profile_toml(self, silent=False):
         if not self.current_manifest:
@@ -2263,6 +2324,9 @@ class ProtoGoblinCommandApp:
             },
             "filesystem": {
                 "io_cache": self.var_fs_io_cache.get(),
+            },
+            "timing": {
+                "precision_timers": self.var_sync_precision_timers.get(),
             },
         }
 

@@ -46,3 +46,4 @@ HRESULT WINAPI RealD3D11CreateDeviceAndSwapChain(
 void WrapDeviceAndContext(ID3D11Device** ppDevice, ID3D11DeviceContext** ppContext);
 void WrapSwapChain(IDXGISwapChain** ppSwapChain, const DXGI_SWAP_CHAIN_DESC* pDesc = nullptr);
 void FlushStats();
+void InstallPrecisionTimerHooks();

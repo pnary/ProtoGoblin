@@ -231,6 +231,46 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertEqual(len(io_suggs), 1)
         self.assertEqual(io_suggs[0]["level"], "success")
 
+    def test_direct_precision_timers_unoptimized_warning(self):
+        m_unopt = {
+            "graphics": {
+                "d3d11_wrapper_stats": {
+                    "timing": {
+                        "high_precision_timers_active": False,
+                        "sleep_calls_total": 2400,
+                        "sleep_spin_hybrid_calls": 0,
+                        "overshoot_prevented_calls": 0,
+                        "overshoot_avoided_ms": 0.0,
+                    }
+                }
+            }
+        }
+        suggs = DiagnosticAdvisor.analyze(m_unopt)
+        timer_suggs = [s for s in suggs if "High Game-Loop Sleep Timer Activity" in s["title"]]
+        self.assertEqual(len(timer_suggs), 1)
+        self.assertEqual(timer_suggs[0]["level"], "warning")
+        self.assertEqual(timer_suggs[0]["fix_id"], "enable_precision_timers")
+        self.assertIn("Enable High-Precision Sleep Timers", timer_suggs[0]["fix_button_text"])
+
+    def test_direct_precision_timers_optimized_success(self):
+        m_opt = {
+            "graphics": {
+                "d3d11_wrapper_stats": {
+                    "timing": {
+                        "high_precision_timers_active": True,
+                        "sleep_calls_total": 2400,
+                        "sleep_spin_hybrid_calls": 2400,
+                        "overshoot_prevented_calls": 2100,
+                        "overshoot_avoided_ms": 4200.0,
+                    }
+                }
+            }
+        }
+        suggs = DiagnosticAdvisor.analyze(m_opt)
+        timer_suggs = [s for s in suggs if "High-Precision Sleep Timers Active" in s["title"]]
+        self.assertEqual(len(timer_suggs), 1)
+        self.assertEqual(timer_suggs[0]["level"], "success")
+
     def test_subsystem_pruning_opportunity(self):
         manifest = {
             "subsystems": {
@@ -737,6 +777,24 @@ class TestEngineTweakManager(unittest.TestCase):
                     os.environ["PROTOGOBLIN_SESSIONS_DIR"] = old_base
                 else:
                     os.environ.pop("PROTOGOBLIN_SESSIONS_DIR", None)
+
+    def test_precision_timers_profile_and_env_injection(self):
+        # 1. Profile generation
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="2555360",
+            app_id=2555360,
+            target_exe="Game.exe",
+            user_tweaks={"timing": {"precision_timers": True}},
+        )
+        self.assertIn("[timing.precision_timers]", toml_text)
+        self.assertIn("enabled = true", toml_text)
+
+        # 2. Applying tweaks injects PROTOGOBLIN_HIGH_PRECISION_TIMERS=1 and d3d11 override
+        profile = {"timing": {"precision_timers": {"enabled": True}}}
+        env = {}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env)
+        self.assertEqual(env.get("PROTOGOBLIN_HIGH_PRECISION_TIMERS"), "1")
+        self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
 
     def test_profile_mode_in_profile_toml(self):
         with tempfile.TemporaryDirectory() as td:
