@@ -59,6 +59,8 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         suggestions = DiagnosticAdvisor.analyze(manifest)
         titles = [s["title"] for s in suggestions]
         self.assertTrue(any("Anti-Cheat Active (Easy Anti-Cheat)" in t for t in titles))
+        self.assertTrue(any("Profiling Suppressed" in t for t in titles))
+        self.assertTrue(any("zero-injection passthrough" in s["description"].lower() for s in suggestions))
         self.assertTrue(any(s["level"] == "warning" for s in suggestions))
 
     def test_shader_compilation_stalls(self):
@@ -566,6 +568,45 @@ class TestSessionInitialModeSelection(unittest.TestCase):
                     os.environ["PROTOGOBLIN_MODE"] = old_mode_env
                 else:
                     os.environ.pop("PROTOGOBLIN_MODE", None)
+                if old_xdg_data:
+                    os.environ["XDG_DATA_HOME"] = old_xdg_data
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                if old_xdg_cfg:
+                    os.environ["XDG_CONFIG_HOME"] = old_xdg_cfg
+                else:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+
+    def test_first_run_with_anticheat_suppresses_profiling(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg_data = os.environ.get("XDG_DATA_HOME")
+            old_xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+            old_mode_env = os.environ.pop("PROTOGOBLIN_MODE", None)
+            os.environ["XDG_DATA_HOME"] = os.path.join(td, "data")
+            os.environ["XDG_CONFIG_HOME"] = os.path.join(td, "config")
+            try:
+                game_dir = os.path.join(td, "game")
+                os.makedirs(game_dir, exist_ok=True)
+                exe_path = os.path.join(game_dir, "Game.exe")
+                with open(exe_path, "wb") as f:
+                    f.write(b"MZ\x90\x00" + b"\x00" * 100)
+                eac_dll = os.path.join(game_dir, "easyanticheat_x64.so")
+                with open(eac_dll, "wb") as f:
+                    f.write(b"\x7fELF")
+
+                sess = ProtoGoblinSession(steam_appid=55555)
+                env = {}
+                sess.pre_flight([exe_path], env)
+                self.assertEqual(sess.mode, "play")
+                self.assertTrue(sess.anti_cheat.get("profiling_suppressed"))
+                self.assertIsNone(env.get("MANGOHUD"))
+
+                manifest = sess.post_flight(0, env=env)
+                self.assertTrue(manifest["session"]["profiling_suppressed"])
+                self.assertIn("EasyAntiCheat", manifest["session"]["suppression_reason"])
+            finally:
+                if old_mode_env:
+                    os.environ["PROTOGOBLIN_MODE"] = old_mode_env
                 if old_xdg_data:
                     os.environ["XDG_DATA_HOME"] = old_xdg_data
                 else:
@@ -1131,6 +1172,23 @@ class TestSessionComparison(unittest.TestCase):
         self.assertEqual(diff["verdict"], "NEUTRAL")
         report = format_diff_report(diff)
         self.assertIn("NOTICE: One or both sessions were executed in PLAY mode", report)
+
+    def test_session_diff_with_anti_cheat_notice(self):
+        manifest_a = {
+            "session": {"id": "sess_ac", "mode": "play"},
+            "target": {"steam_appid": "111", "target_executable": {"path": "Game.exe"}},
+            "anti_cheat": {"detected": True, "provider": "BattlEye"},
+            "roi_telemetry": None,
+        }
+        manifest_b = {
+            "session": {"id": "sess_clean", "mode": "play"},
+            "target": {"steam_appid": "111", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": None,
+        }
+        diff = compute_session_diff(manifest_a, manifest_b)
+        report = format_diff_report(diff)
+        self.assertIn("ANTI-CHEAT NOTICE: Active BattlEye detected", report)
+        self.assertIn("Profiling hooks and ROI telemetry were automatically suppressed", report)
 
 
 class TestSubsystemPruning(unittest.TestCase):

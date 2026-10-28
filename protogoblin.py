@@ -2175,6 +2175,11 @@ class ProtoGoblinSession:
         self.anti_cheat = AntiCheatDetector.scan(target_path)
         if self.anti_cheat["detected"]:
             self.mode = "play"
+            self.anti_cheat["profiling_suppressed"] = True
+            self.anti_cheat["suppression_reason"] = (
+                f"Active {self.anti_cheat.get('provider', 'Anti-Cheat')} detected. Profiling hooks and HUD overlay "
+                "were disabled to enforce strict zero-injection passthrough and prevent client bans or disconnections."
+            )
 
         # Upstream ntsync auto-detection: if /dev/ntsync is exposed by host kernel (Linux 6.13+)
         if os.path.exists("/dev/ntsync") and os.environ.get("PROTON_NO_NTSYNC") != "1":
@@ -2470,6 +2475,8 @@ class ProtoGoblinSession:
                 "end_time": end_iso,
                 "duration_seconds": duration_seconds,
                 "clean_shutdown": (exit_code == 0),
+                "profiling_suppressed": bool(self.anti_cheat.get("profiling_suppressed")),
+                "suppression_reason": self.anti_cheat.get("suppression_reason"),
             },
             "target": {
                 "steam_appid": self.steam_appid,

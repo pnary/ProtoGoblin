@@ -37,15 +37,19 @@ class DiagnosticAdvisor:
         sub = manifest.get("subsystems", {})
         tgt = manifest.get("target", {})
 
-        # 1. Anti-Cheat Passthrough
+        # 1. Anti-Cheat Passthrough & Profiling Suppression
         if ac.get("detected"):
             provider = ac.get("provider", "Anti-Cheat")
             suggestions.append(
                 {
                     "level": "warning",
-                    "title": f"Anti-Cheat Active ({provider})",
-                    "description": f"Game is protected by {provider}. Zero-injection passthrough mode is enforced. Do not apply in-process Detours/shims or invasive binary patches to prevent disconnection or bans.",
-                    "action": "Ensure anticheat_policy = 'passthrough' in game profile.",
+                    "title": f"🛡️ Anti-Cheat Active ({provider}) — Profiling Suppressed",
+                    "description": (
+                        f"Game is protected by {provider}. ProtoGoblin automatically suppressed Profile Mode and HUD/overlay "
+                        f"hooks to enforce strict Zero-Injection Passthrough (Play Mode). This ensures anti-cheat integrity "
+                        f"and prevents client disconnects or account penalties."
+                    ),
+                    "action": "Game runs in clean Play Mode. In-process shims and profiling hooks are intentionally disabled.",
                 }
             )
 
@@ -577,6 +581,7 @@ def compute_session_diff(manifest_a, manifest_b):
             "mode": sess_a.get("mode", "play"),
             "has_roi": has_roi_a,
             "bottleneck": bot_a,
+            "anti_cheat": manifest_a.get("anti_cheat") or {},
         },
         "session_b": {
             "id": sess_b.get("id", "Session B"),
@@ -585,6 +590,7 @@ def compute_session_diff(manifest_a, manifest_b):
             "mode": sess_b.get("mode", "play"),
             "has_roi": has_roi_b,
             "bottleneck": bot_b,
+            "anti_cheat": manifest_b.get("anti_cheat") or {},
         },
         "metrics": {
             "fps_avg": {"a": fm_a.get("fps_avg", 0.0), "b": fm_b.get("fps_avg", 0.0), "delta": diff_fps_avg, "pct": pct_fps_avg},
@@ -634,12 +640,23 @@ def format_diff_report(diff):
     ]
 
     if not s_a.get("has_roi") or not s_b.get("has_roi"):
-        lines.extend([
-            " [!] NOTICE: One or both sessions were executed in PLAY mode without ROI telemetry.",
-            "     Detailed frame percentiles and jitter require sessions launched with:",
-            "       PROTOGOBLIN_MODE=profile %command%",
-            "",
-        ])
+        ac_a = s_a.get("anti_cheat") or {}
+        ac_b = s_b.get("anti_cheat") or {}
+        if ac_a.get("detected") or ac_b.get("detected"):
+            provider = ac_a.get("provider") or ac_b.get("provider") or "Anti-Cheat"
+            lines.extend([
+                f" [🛡️] ANTI-CHEAT NOTICE: Active {provider} detected.",
+                "     Profiling hooks and ROI telemetry were automatically suppressed to enforce",
+                "     strict zero-injection passthrough and prevent client bans or disconnections.",
+                "",
+            ])
+        else:
+            lines.extend([
+                " [!] NOTICE: One or both sessions were executed in PLAY mode without ROI telemetry.",
+                "     Detailed frame percentiles and jitter require sessions launched with:",
+                "       PROTOGOBLIN_MODE=profile %command%",
+                "",
+            ])
 
     lines.extend([
         " FRAMETIME & PACING BENCHMARK",
@@ -1869,8 +1886,10 @@ class ProtoGoblinCommandApp:
         eng_info = tgt.get("engine") or {}
         eng_name = eng_info.get("engine", "generic").upper()
         eng_tag = f" | Engine: {eng_name}" if eng_info.get("detected") else ""
+        ac = data.get("anti_cheat", {})
+        ac_tag = f" | 🛡️ {ac.get('provider')} (PASSTHROUGH)" if ac.get("detected") else ""
         self.diag_header_lbl.config(
-            text=f"Target: {t_name}{eng_tag} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
+            text=f"Target: {t_name}{eng_tag}{ac_tag} | Mode: {sess.get('mode', 'play').upper()} | Session: {sess.get('id')}"
         )
         if hasattr(self, "tweaks_game_lbl"):
             self.tweaks_game_lbl.config(
@@ -2030,13 +2049,27 @@ class ProtoGoblinCommandApp:
                 ]
             )
         else:
-            p_lines.extend(
-                [
-                    "ROI Telemetry: Not recorded (Session was launched in PLAY mode).",
-                    "To collect frame percentiles and latency breakdown, launch with:",
-                    "  PROTOGOBLIN_MODE=profile %command%",
-                ]
-            )
+            ac = data.get("anti_cheat", {})
+            if ac.get("detected"):
+                provider = ac.get("provider", "Anti-Cheat")
+                p_lines.extend(
+                    [
+                        f"ROI Telemetry: NOT RECORDED (🛡️ Anti-Cheat Active: {provider})",
+                        "-" * 60,
+                        f"NOTICE: Active anti-cheat ({provider}) was detected in the game payload.",
+                        "ProtoGoblin automatically suppressed Profile Mode and HUD/overlay hooks to enforce",
+                        "strict Zero-Injection Passthrough. In-process telemetry and frametime instrumentation",
+                        "were intentionally disabled to prevent client bans or multiplayer disconnections.",
+                    ]
+                )
+            else:
+                p_lines.extend(
+                    [
+                        "ROI Telemetry: Not recorded (Session was launched in PLAY mode).",
+                        "To collect frame percentiles and latency breakdown, launch with:",
+                        "  PROTOGOBLIN_MODE=profile %command%",
+                    ]
+                )
 
         d3d11_stats = sess.get("graphics", {}).get("d3d11_wrapper_stats")
         if d3d11_stats:
