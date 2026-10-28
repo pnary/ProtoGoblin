@@ -298,6 +298,21 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         s_godot = DiagnosticAdvisor.analyze(m_godot)
         self.assertTrue(any("Godot Engine Detected" in s["title"] for s in s_godot))
 
+    def test_advisor_ue5_lumen_vsm_heavy_workload(self):
+        manifest = {
+            "target": {"engine": {"detected": True, "engine": "unreal_5"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "gpu_bound",
+                "frame_metrics": {"fps_avg": 55.0, "fps_1_pct_low": 32.0},
+            },
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        ue5_sug = [s for s in suggestions if s.get("fix_id") == "optimize_ue5_lumen_vsm"]
+        self.assertEqual(len(ue5_sug), 1)
+        self.assertEqual(ue5_sug[0]["level"], "warning")
+        self.assertIn("Optimize UE5 Lumen & Virtual Shadow Maps", ue5_sug[0]["title"])
+
     def test_intra_frame_staging_sync_stall_detection(self):
         # Simulation of Gust / Atelier staging sync flaw: low GPU and low CPU despite active gameplay
         manifest = {
@@ -493,6 +508,88 @@ class TestEngineTweakManager(unittest.TestCase):
         self.assertIn("r.DepthOfFieldQuality 0", exec_arg)
         self.assertIn("r.SceneColorFringeQuality 0", exec_arg)
         self.assertIn("r.FilmGrain 0", exec_arg)
+
+    def test_ue5_lumen_and_vsm_cvar_injection(self):
+        profile = {
+            "engine": {
+                "unreal": {
+                    "optimize_lumen": True,
+                    "optimize_vsm": True,
+                    "optimize_nanite": True,
+                    "disable_virtual_shadows": True,
+                }
+            }
+        }
+        argv = ["Game-Win64-Shipping.exe"]
+        env = {}
+        new_argv = EngineTweakManager.apply_tweaks(profile, {"engine": "unreal_5"}, argv, env)
+
+        self.assertEqual(len(new_argv), 2)
+        exec_arg = new_argv[1]
+        self.assertTrue(exec_arg.startswith('-ExecCmds="'))
+        # Lumen optimizations
+        self.assertIn("r.Lumen.ScreenProbeGather.DownsampleByTwo 1", exec_arg)
+        self.assertIn("r.Lumen.TranslucencyReflections.FrontLayer.Allow 0", exec_arg)
+        self.assertIn("r.Lumen.Reflections.DownsampleFactor 2", exec_arg)
+        # VSM optimizations
+        self.assertIn("r.Shadow.Virtual.SMRT.RayCountDirectional 4", exec_arg)
+        self.assertIn("r.Shadow.Virtual.ResolutionLodBiasDirectional 1.0", exec_arg)
+        self.assertIn("r.Shadow.Virtual.Cache.MaxPageAge 16", exec_arg)
+        # Nanite optimizations
+        self.assertIn("r.Nanite.MaxNodesPerFrame 262144", exec_arg)
+        self.assertIn("r.Nanite.ViewMeshLODBias 0.5", exec_arg)
+        # Disable VSM
+        self.assertIn("r.Shadow.Virtual.Enable 0", exec_arg)
+
+    def test_vkd3d_config_injection(self):
+        profile = {
+            "graphics": {
+                "backend": "vkd3d",
+                "vkd3d": {
+                    "descriptor_buffer": True,
+                    "force_static_cbv": True,
+                    "single_queue": True,
+                }
+            }
+        }
+        env = {"VKD3D_CONFIG": "no_upload_hvv"}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env)
+        vkd3d_cfg = env.get("VKD3D_CONFIG", "").split(",")
+        self.assertIn("no_upload_hvv", vkd3d_cfg)
+        self.assertIn("descriptor_buffer", vkd3d_cfg)
+        self.assertIn("force_static_cbv", vkd3d_cfg)
+        self.assertIn("single_queue", vkd3d_cfg)
+
+    def test_generate_profile_toml_ue5_and_vkd3d(self):
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="99999",
+            app_id=99999,
+            target_exe="UE5Game.exe",
+            engine_info={"engine": "unreal_5"},
+            user_tweaks={
+                "unreal": {
+                    "optimize_lumen": True,
+                    "optimize_vsm": True,
+                    "optimize_nanite": True,
+                    "disable_virtual_shadows": True,
+                },
+                "graphics": {
+                    "vkd3d": {
+                        "descriptor_buffer": True,
+                        "force_static_cbv": True,
+                        "single_queue": True,
+                    }
+                }
+            },
+        )
+        self.assertIn("[engine.unreal]", toml_text)
+        self.assertIn("optimize_lumen = true", toml_text)
+        self.assertIn("optimize_vsm = true", toml_text)
+        self.assertIn("optimize_nanite = true", toml_text)
+        self.assertIn("disable_virtual_shadows = true", toml_text)
+        self.assertIn("[graphics.vkd3d]", toml_text)
+        self.assertIn("force_static_cbv = true", toml_text)
+        self.assertIn("single_queue = true", toml_text)
 
     def test_unity_and_godot_tweak_injection(self):
         profile = {

@@ -437,6 +437,21 @@ class EngineTweakManager:
         "disable_bloom": ["r.BloomQuality 0"],
         "disable_volumetric_fog": ["r.VolumetricFog 0"],
         "disable_lumen_reflections": ["r.Lumen.Reflections.Allow 0"],
+        "optimize_lumen": [
+            "r.Lumen.ScreenProbeGather.DownsampleByTwo 1",
+            "r.Lumen.TranslucencyReflections.FrontLayer.Allow 0",
+            "r.Lumen.Reflections.DownsampleFactor 2",
+        ],
+        "optimize_vsm": [
+            "r.Shadow.Virtual.SMRT.RayCountDirectional 4",
+            "r.Shadow.Virtual.ResolutionLodBiasDirectional 1.0",
+            "r.Shadow.Virtual.Cache.MaxPageAge 16",
+        ],
+        "optimize_nanite": [
+            "r.Nanite.MaxNodesPerFrame 262144",
+            "r.Nanite.ViewMeshLODBias 0.5",
+        ],
+        "disable_virtual_shadows": ["r.Shadow.Virtual.Enable 0"],
     }
 
     @classmethod
@@ -556,6 +571,20 @@ class EngineTweakManager:
                 f'disable_bloom = {"true" if ue_cfg.get("disable_bloom", False) else "false"}',
                 f'disable_volumetric_fog = {"true" if ue_cfg.get("disable_volumetric_fog", False) else "false"}',
                 f'disable_lumen_reflections = {"true" if ue_cfg.get("disable_lumen_reflections", False) else "false"}',
+                f'optimize_lumen = {"true" if ue_cfg.get("optimize_lumen", False) else "false"}',
+                f'optimize_vsm = {"true" if ue_cfg.get("optimize_vsm", False) else "false"}',
+                f'optimize_nanite = {"true" if ue_cfg.get("optimize_nanite", False) else "false"}',
+                f'disable_virtual_shadows = {"true" if ue_cfg.get("disable_virtual_shadows", False) else "false"}',
+            ])
+
+        vkd3d_cfg = gfx_cfg.get("vkd3d", {}) or tweaks.get("vkd3d", {})
+        if vkd3d_cfg:
+            lines.extend([
+                "",
+                "[graphics.vkd3d]",
+                f'descriptor_buffer = {"true" if vkd3d_cfg.get("descriptor_buffer", True) else "false"}',
+                f'force_static_cbv = {"true" if vkd3d_cfg.get("force_static_cbv", True) else "false"}',
+                f'single_queue = {"true" if vkd3d_cfg.get("single_queue", False) else "false"}',
             ])
 
         if is_unity or "unity" in tweaks:
@@ -777,6 +806,24 @@ class EngineTweakManager:
             existing_dxvk = env.get("DXVK_CONFIG", "").strip()
             addon = "; ".join(dxvk_items)
             env["DXVK_CONFIG"] = f"{existing_dxvk}; {addon}" if existing_dxvk else addon
+
+        # VKD3D-Proton configuration
+        vkd3d_cfg = gfx_sec.get("vkd3d", {}) or profile.get("vkd3d", {})
+        vkd3d_options = []
+        if gfx_sec.get("descriptor_buffer") or vkd3d_cfg.get("descriptor_buffer"):
+            vkd3d_options.append("descriptor_buffer")
+        if vkd3d_cfg.get("force_static_cbv", True):
+            vkd3d_options.append("force_static_cbv")
+        if vkd3d_cfg.get("single_queue"):
+            vkd3d_options.append("single_queue")
+
+        if vkd3d_options:
+            cur_vkd3d = env.get("VKD3D_CONFIG", "")
+            cur_parts = [p.strip() for p in cur_vkd3d.split(",") if p.strip()]
+            for opt in vkd3d_options:
+                if opt not in cur_parts:
+                    cur_parts.append(opt)
+            env["VKD3D_CONFIG"] = ",".join(cur_parts)
 
         # 5. Prefix file configuration adjustments
         if prefix_dir and os.path.isdir(prefix_dir):
