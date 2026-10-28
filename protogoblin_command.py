@@ -472,6 +472,30 @@ class DiagnosticAdvisor:
                     }
                 )
 
+        # 9. Compatibility & Native Microsoft DLL Diagnostics
+        compat = manifest.get("compatibility") or {}
+        remedies = compat.get("remedies", [])
+        is_clean = (manifest.get("session") or {}).get("clean_shutdown", True)
+        for remedy in remedies:
+            verb = remedy.get("verb", "unknown")
+            dll = remedy.get("dll", "native.dll")
+            pkg = remedy.get("package", "Microsoft Component")
+            err = remedy.get("log_error", "")
+            suggestions.append(
+                {
+                    "level": "warning" if is_clean else "error",
+                    "title": f"📦 Missing Microsoft Native DLL: {dll} ({verb})",
+                    "description": (
+                        f"Session log analysis identified an unresolved DLL import failure or unimplemented stub: '{err}'. "
+                        f"This issue is routinely resolved by deploying the official Microsoft {pkg} ({dll})."
+                    ),
+                    "action": f"Snag and deploy official Microsoft {dll} into prefix and configure native DLL override ({verb}=n,b).",
+                    "fix_id": f"snag_dll_{verb}",
+                    "fix_button_text": f"⚡ Snag & Deploy Microsoft {dll}",
+                    "remedy": remedy,
+                }
+            )
+
         return suggestions
 
 
@@ -1330,6 +1354,59 @@ class ProtoGoblinCommandApp:
             activeforeground="#58a6ff",
         )
         cb_fs.pack(anchor=tk.W, pady=2)
+
+        # 5. Compatibility & Native Microsoft DLL Overrides Card
+        self.compat_frame = tk.LabelFrame(
+            container,
+            text=" Compatibility & Native Microsoft DLL Overrides (Winetricks-style) ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.compat_frame.pack(fill=tk.X, pady=6)
+
+        self.var_compat_d3dcompiler_47 = tk.BooleanVar(value=False)
+        self.var_compat_d3dcompiler_43 = tk.BooleanVar(value=False)
+        self.var_compat_vcrun2022 = tk.BooleanVar(value=False)
+        self.var_compat_xaudio27 = tk.BooleanVar(value=False)
+        self.var_compat_d3dx9 = tk.BooleanVar(value=False)
+
+        compat_checks = [
+            ("Microsoft D3DCompiler 47 (d3dcompiler_47=n,b for HLSL dynamic shaders)", self.var_compat_d3dcompiler_47),
+            ("Microsoft D3DCompiler 43 (d3dcompiler_43=n,b for legacy D3D11 shaders)", self.var_compat_d3dcompiler_43),
+            ("Microsoft Visual C++ 2015-2022 Runtimes (vcruntime140=n,b, msvcp140=n,b)", self.var_compat_vcrun2022),
+            ("Microsoft DirectX XAudio 2.7 (xaudio2_7=n,b for audio engine stubs)", self.var_compat_xaudio27),
+            ("Microsoft Direct3D 9 Extensions (d3dx9_43=n,b utility library)", self.var_compat_d3dx9),
+        ]
+        for text, var in compat_checks:
+            cb = tk.Checkbutton(
+                self.compat_frame,
+                text=text,
+                variable=var,
+                bg="#161b22",
+                fg="#c9d1d9",
+                selectcolor="#0d1117",
+                activebackground="#161b22",
+                activeforeground="#58a6ff",
+            )
+            cb.pack(anchor=tk.W, pady=2)
+
+        compat_btn_row = tk.Frame(self.compat_frame, bg="#161b22")
+        compat_btn_row.pack(fill=tk.X, pady=(6, 2))
+        btn_snag = tk.Button(
+            compat_btn_row,
+            text="🔍 Scan Logs & Auto-Snag Missing DLLs",
+            bg="#238636",
+            fg="#ffffff",
+            activebackground="#2ea043",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.scan_and_snag_dialog,
+        )
+        btn_snag.pack(side=tk.LEFT, padx=4)
 
         # Button row in tweaks tab
         btn_row = tk.Frame(self.tab_tweaks, bg=self.card_bg)
@@ -2214,6 +2291,11 @@ class ProtoGoblinCommandApp:
         self.var_vkd3d_static_cbv.set(False)
         self.var_vkd3d_single_queue.set(False)
         self.var_fs_io_cache.set(False)
+        self.var_compat_d3dcompiler_47.set(False)
+        self.var_compat_d3dcompiler_43.set(False)
+        self.var_compat_vcrun2022.set(False)
+        self.var_compat_xaudio27.set(False)
+        self.var_compat_d3dx9.set(False)
         self.var_gfx_max_fps.set("0")
 
         if self.current_manifest:
@@ -2326,6 +2408,44 @@ class ProtoGoblinCommandApp:
                 "• Eliminates async compute queue synchronization micro-stutter\n\n"
                 f"Saved to profile:\n{path}",
             )
+        elif fix_id.startswith("snag_dll_"):
+            verb = fix_id.replace("snag_dll_", "")
+            prefix_dir = (
+                (self.current_manifest.get("environment") or {}).get("wine_prefix")
+                or os.environ.get("WINEPREFIX")
+                or os.environ.get("STEAM_COMPAT_DATA_PATH")
+            )
+            tgt = self.current_manifest.get("target", {})
+            steam_id = str(tgt.get("steam_appid") or "custom-game")
+            xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            profile_file = os.path.join(xdg_config, "protogoblin", "games", f"{steam_id}.toml")
+
+            res = protogoblin.CompatibilityFixer.snag_and_apply(
+                verb=verb,
+                prefix_dir=prefix_dir,
+                profile_path=profile_file if os.path.isfile(profile_file) else None,
+            )
+
+            if verb == "d3dcompiler_47":
+                self.var_compat_d3dcompiler_47.set(True)
+            elif verb == "d3dcompiler_43":
+                self.var_compat_d3dcompiler_43.set(True)
+            elif verb in ["vcrun2022", "vcruntime140", "msvcp140"]:
+                self.var_compat_vcrun2022.set(True)
+            elif verb == "xaudio27":
+                self.var_compat_xaudio27.set(True)
+            elif verb == "d3dx9":
+                self.var_compat_d3dx9.set(True)
+
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "Native DLL Deployed",
+                f"Official Microsoft Native Component ({verb}) Snagged & Deployed!\n\n"
+                f"• Target Component: {res.get('package', verb)}\n"
+                f"• Deployed Files: {', '.join(res.get('deployed_files', [])) or 'Configured'}\n"
+                f"• Overrides Configured: {res.get('overrides_added', {})}\n\n"
+                f"Saved to profile:\n{path}",
+            )
 
     def generate_profile_toml(self, silent=False):
         if not self.current_manifest:
@@ -2396,6 +2516,15 @@ class ProtoGoblinCommandApp:
             "timing": {
                 "precision_timers": self.var_sync_precision_timers.get(),
             },
+            "compatibility": {
+                "dll_overrides": {
+                    **({"d3dcompiler_47": "n,b"} if getattr(self, "var_compat_d3dcompiler_47", tk.BooleanVar(value=False)).get() else {}),
+                    **({"d3dcompiler_43": "n,b"} if getattr(self, "var_compat_d3dcompiler_43", tk.BooleanVar(value=False)).get() else {}),
+                    **({"vcruntime140": "n,b", "msvcp140": "n,b"} if getattr(self, "var_compat_vcrun2022", tk.BooleanVar(value=False)).get() else {}),
+                    **({"xaudio2_7": "n,b"} if getattr(self, "var_compat_xaudio27", tk.BooleanVar(value=False)).get() else {}),
+                    **({"d3dx9_43": "n,b"} if getattr(self, "var_compat_d3dx9", tk.BooleanVar(value=False)).get() else {}),
+                }
+            },
         }
 
         eng_info = tgt.get("engine") or {}
@@ -2423,6 +2552,63 @@ class ProtoGoblinCommandApp:
             if not silent:
                 messagebox.showerror("Error", f"Failed to save profile: {e}")
             return None
+
+    def scan_and_snag_dialog(self):
+        if not self.current_manifest:
+            messagebox.showwarning("Notice", "Select a session first to scan compatibility logs.")
+            return
+
+        compat = self.current_manifest.get("compatibility") or {}
+        remedies = compat.get("remedies", [])
+        if not remedies:
+            messagebox.showinfo("Log Scan Clean", "No missing native DLL imports or stub failures detected in session logs.")
+            return
+
+        remedy_names = [f"• {r.get('dll')} ({r.get('package')})" for r in remedies]
+        confirm = messagebox.askyesno(
+            "Auto-Snag Missing Native DLLs",
+            f"Detected {len(remedies)} missing Microsoft native component(s) in session logs:\n\n"
+            + "\n".join(remedy_names)
+            + "\n\nDo you want ProtoGoblin to automatically snag and deploy these official DLLs to the prefix?",
+        )
+        if confirm:
+            prefix_dir = (
+                (self.current_manifest.get("environment") or {}).get("wine_prefix")
+                or os.environ.get("WINEPREFIX")
+                or os.environ.get("STEAM_COMPAT_DATA_PATH")
+            )
+            tgt = self.current_manifest.get("target", {})
+            steam_id = str(tgt.get("steam_appid") or "custom-game")
+            xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+            profile_file = os.path.join(xdg_config, "protogoblin", "games", f"{steam_id}.toml")
+
+            applied = []
+            for r in remedies:
+                verb = r.get("verb")
+                res = protogoblin.CompatibilityFixer.snag_and_apply(
+                    verb=verb,
+                    prefix_dir=prefix_dir,
+                    profile_path=profile_file if os.path.isfile(profile_file) else None,
+                )
+                applied.append(f"{r.get('dll')} ({res.get('source', 'deployed')})")
+                if verb == "d3dcompiler_47":
+                    self.var_compat_d3dcompiler_47.set(True)
+                elif verb == "d3dcompiler_43":
+                    self.var_compat_d3dcompiler_43.set(True)
+                elif verb in ["vcrun2022", "vcruntime140", "msvcp140"]:
+                    self.var_compat_vcrun2022.set(True)
+                elif verb == "xaudio27":
+                    self.var_compat_xaudio27.set(True)
+                elif verb == "d3dx9":
+                    self.var_compat_d3dx9.set(True)
+
+            path = self.generate_profile_toml(silent=True)
+            messagebox.showinfo(
+                "DLLs Snagged",
+                f"Successfully snagged and deployed:\n\n"
+                + "\n".join([f"• {a}" for a in applied])
+                + f"\n\nSaved to profile:\n{path}",
+            )
 
 
 def main():

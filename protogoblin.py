@@ -11,7 +11,9 @@ import json
 import os
 import platform
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -676,6 +678,16 @@ class EngineTweakManager:
                 "# Enforce sub-millisecond QPC sleep-spin hybrid pacing to eliminate timer wake overshoot",
             ])
 
+        compat_sec = tweaks.get("compatibility", {})
+        dll_overrides = compat_sec.get("dll_overrides", {})
+        if dll_overrides:
+            lines.extend([
+                "",
+                "[compatibility.dll_overrides]",
+            ])
+            for dll, mode in sorted(dll_overrides.items()):
+                lines.append(f'{dll} = "{mode}"')
+
         lines.append("")
         return "\n".join(lines)
 
@@ -855,6 +867,18 @@ class EngineTweakManager:
                     cur_ld = env.get("LD_PRELOAD", "")
                     env["LD_PRELOAD"] = f"{c}:{cur_ld}" if cur_ld else c
                     break
+
+        # 7. Compatibility & Native DLL Overrides
+        compat_sec = profile.get("compatibility", {})
+        dll_overrides = compat_sec.get("dll_overrides", {})
+        if dll_overrides:
+            cur_ov = env.get("WINEDLLOVERRIDES", "")
+            ov_parts = [p.strip() for p in cur_ov.split(";") if p.strip()]
+            for dll, mode in dll_overrides.items():
+                entry = f"{dll}={mode}"
+                if not any(p.startswith(f"{dll}=") for p in ov_parts):
+                    ov_parts.append(entry)
+            env["WINEDLLOVERRIDES"] = ";".join(ov_parts)
 
         return new_argv
 
@@ -1402,6 +1426,488 @@ class MangoHudLogParser:
         }
 
 
+KNOWN_DLL_REMEDIES = {
+    "d3dcompiler_47": {
+        "verb": "d3dcompiler_47",
+        "dlls": ["d3dcompiler_47.dll"],
+        "overrides": {"d3dcompiler_47": "n,b"},
+        "package": "Microsoft DirectX / Windows SDK D3DCompiler",
+        "description": "HLSL dynamic shader compiler required by modern D3D11/D3D12 engines.",
+        "patterns": [
+            r"d3dcompiler_47(?:\.dll)?",
+        ],
+    },
+    "d3dcompiler_43": {
+        "verb": "d3dcompiler_43",
+        "dlls": ["d3dcompiler_43.dll"],
+        "overrides": {"d3dcompiler_43": "n,b"},
+        "package": "Microsoft DirectX End-User Runtimes (June 2010)",
+        "description": "DirectX 11 legacy HLSL shader compiler.",
+        "patterns": [
+            r"d3dcompiler_43(?:\.dll)?",
+        ],
+    },
+    "d3dx9": {
+        "verb": "d3dx9",
+        "dlls": ["d3dx9_43.dll"],
+        "overrides": {"d3dx9_43": "n,b"},
+        "package": "Microsoft DirectX 9.0c Runtimes",
+        "description": "DirectX 9 3D utility extensions.",
+        "patterns": [
+            r"d3dx9(?:_\d+)?(?:\.dll)?",
+        ],
+    },
+    "d3dx11": {
+        "verb": "d3dx11",
+        "dlls": ["d3dx11_43.dll"],
+        "overrides": {"d3dx11_43": "n,b"},
+        "package": "Microsoft DirectX 11 Runtimes",
+        "description": "Direct3D 11 extension utilities.",
+        "patterns": [
+            r"d3dx11(?:_\d+)?(?:\.dll)?",
+        ],
+    },
+    "vcrun2022": {
+        "verb": "vcrun2022",
+        "dlls": ["vcruntime140.dll", "msvcp140.dll", "vcruntime140_1.dll"],
+        "overrides": {"vcruntime140": "n,b", "msvcp140": "n,b", "vcruntime140_1": "n,b"},
+        "package": "Microsoft Visual C++ 2015-2022 Redistributable",
+        "description": "MSVC C/C++ CRT runtime libraries.",
+        "patterns": [
+            r"vcruntime140(?:_1)?(?:\.dll)?",
+            r"msvcp140(?:\.dll)?",
+            r"R6034",
+        ],
+    },
+    "vcrun2013": {
+        "verb": "vcrun2013",
+        "dlls": ["msvcr120.dll", "msvcp120.dll"],
+        "overrides": {"msvcr120": "n,b", "msvcp120": "n,b"},
+        "package": "Microsoft Visual C++ 2013 Redistributable",
+        "description": "MSVC 2013 C/C++ CRT runtime libraries.",
+        "patterns": [
+            r"msvcr120(?:\.dll)?",
+            r"msvcp120(?:\.dll)?",
+        ],
+    },
+    "vcrun2010": {
+        "verb": "vcrun2010",
+        "dlls": ["msvcr100.dll", "msvcp100.dll"],
+        "overrides": {"msvcr100": "n,b", "msvcp100": "n,b"},
+        "package": "Microsoft Visual C++ 2010 Redistributable",
+        "description": "MSVC 2010 C/C++ CRT runtime libraries.",
+        "patterns": [
+            r"msvcr100(?:\.dll)?",
+            r"msvcp100(?:\.dll)?",
+        ],
+    },
+    "xaudio27": {
+        "verb": "xaudio27",
+        "dlls": ["xaudio2_7.dll"],
+        "overrides": {"xaudio2_7": "n,b"},
+        "package": "Microsoft DirectX XAudio 2.7",
+        "description": "DirectX XAudio2.7 audio engine.",
+        "patterns": [
+            r"xaudio2_7(?:\.dll)?",
+            r"XAudio2Create",
+            r"\{423c73a2-85d0-4005-85b9-f37e601870c0\}",
+        ],
+    },
+    "xinput": {
+        "verb": "xinput",
+        "dlls": ["xinput1_3.dll"],
+        "overrides": {"xinput1_3": "n,b"},
+        "package": "Microsoft DirectX XInput 1.3",
+        "description": "DirectX XInput 1.3 controller library.",
+        "patterns": [
+            r"xinput1_3(?:\.dll)?",
+        ],
+    },
+    "mf": {
+        "verb": "mf",
+        "dlls": ["mfplat.dll", "mfreadwrite.dll"],
+        "overrides": {"mfplat": "n,b", "mfreadwrite": "n,b"},
+        "package": "Microsoft Media Foundation Runtimes",
+        "description": "Windows Media Foundation video decoding pipeline.",
+        "patterns": [
+            r"mfplat(?:\.dll)?",
+            r"mfreadwrite(?:\.dll)?",
+            r"MFStartup",
+            r"MFCreateSourceResolver",
+        ],
+    },
+    "directplay": {
+        "verb": "directplay",
+        "dlls": ["dplayx.dll"],
+        "overrides": {"dplayx": "n,b"},
+        "package": "Microsoft DirectPlay",
+        "description": "Legacy DirectX multiplayer networking.",
+        "patterns": [
+            r"dplayx(?:\.dll)?",
+        ],
+    },
+}
+
+
+class CompatibilityLogAnalyzer:
+    """Parses Proton and Wine runtime logs to detect missing native DLL imports and stub aborts."""
+
+    @classmethod
+    def parse_log_text(cls, text):
+        missing_dlls = set()
+        unimplemented_funcs = []
+        log_errors = []
+        remedies = {}
+
+        if not text:
+            return {
+                "issues_detected": False,
+                "missing_dlls": [],
+                "unimplemented_functions": [],
+                "suggested_verbs": [],
+                "remedies": [],
+                "log_errors": [],
+            }
+
+        re_import_err = re.compile(
+            r'err:module:import_dll Library\s+([a-zA-Z0-9_\-\.]+?)(?:\.dll|\.DLL)?\s+\(which is needed by',
+            re.IGNORECASE,
+        )
+        re_load_err = re.compile(
+            r'(?:failed to load|Cannot find|could not load|unable to load|missing)\s+(?:L"?|[a-zA-Z0-9_\\/:]*?\\)?([a-zA-Z0-9_\-\.]+?)\.dll',
+            re.IGNORECASE,
+        )
+        re_unimplemented = re.compile(
+            r'to unimplemented function\s+([a-zA-Z0-9_\-\.]+?)(?:\.dll|\.DLL)?\.([a-zA-Z0-9_]+)',
+            re.IGNORECASE,
+        )
+        re_so_fail = re.compile(
+            r'failed to load \.so lib for builtin\s+([a-zA-Z0-9_\-\.]+?)(?:\.dll|\.DLL)?',
+            re.IGNORECASE,
+        )
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            m = re_import_err.search(stripped)
+            if m:
+                dll = m.group(1).lower()
+                dll_name = f"{dll}.dll" if not dll.endswith(".dll") else dll
+                missing_dlls.add(dll_name)
+                if stripped not in log_errors and len(log_errors) < 25:
+                    log_errors.append(stripped)
+                remedy = cls._match_remedy(dll_name, stripped)
+                if remedy and remedy["verb"] not in remedies:
+                    remedies[remedy["verb"]] = remedy
+                continue
+
+            m = re_so_fail.search(stripped)
+            if m:
+                dll = m.group(1).lower()
+                dll_name = f"{dll}.dll" if not dll.endswith(".dll") else dll
+                missing_dlls.add(dll_name)
+                if stripped not in log_errors and len(log_errors) < 25:
+                    log_errors.append(stripped)
+                remedy = cls._match_remedy(dll_name, stripped)
+                if remedy and remedy["verb"] not in remedies:
+                    remedies[remedy["verb"]] = remedy
+                continue
+
+            m = re_load_err.search(stripped)
+            if m:
+                dll = m.group(1).lower()
+                dll_name = f"{dll}.dll" if not dll.endswith(".dll") else dll
+                missing_dlls.add(dll_name)
+                if stripped not in log_errors and len(log_errors) < 25:
+                    log_errors.append(stripped)
+                remedy = cls._match_remedy(dll_name, stripped)
+                if remedy and remedy["verb"] not in remedies:
+                    remedies[remedy["verb"]] = remedy
+                continue
+
+            m = re_unimplemented.search(stripped)
+            if m:
+                dll = m.group(1).lower()
+                func = m.group(2)
+                dll_name = f"{dll}.dll" if not dll.endswith(".dll") else dll
+                unimplemented_funcs.append({"dll": dll_name, "function": func, "log_line": stripped})
+                if stripped not in log_errors and len(log_errors) < 25:
+                    log_errors.append(stripped)
+                remedy = cls._match_remedy(dll_name, stripped)
+                if remedy and remedy["verb"] not in remedies:
+                    remedies[remedy["verb"]] = remedy
+                continue
+
+            for verb, r_info in KNOWN_DLL_REMEDIES.items():
+                for pat in r_info.get("patterns", []):
+                    if re.search(pat, stripped, re.IGNORECASE):
+                        s_lower = stripped.lower()
+                        if (
+                            "err:" in s_lower
+                            or "failed" in s_lower
+                            or "not registered" in s_lower
+                            or "aborting" in s_lower
+                        ):
+                            if stripped not in log_errors and len(log_errors) < 25:
+                                log_errors.append(stripped)
+                            if verb not in remedies:
+                                remedies[verb] = {
+                                    "verb": verb,
+                                    "dll": r_info["dlls"][0],
+                                    "dlls": r_info["dlls"],
+                                    "package": r_info["package"],
+                                    "overrides": r_info["overrides"],
+                                    "description": r_info["description"],
+                                    "log_error": stripped,
+                                }
+
+        return {
+            "issues_detected": bool(remedies or missing_dlls or unimplemented_funcs),
+            "missing_dlls": sorted(list(missing_dlls)),
+            "unimplemented_functions": unimplemented_funcs,
+            "suggested_verbs": sorted(list(remedies.keys())),
+            "remedies": list(remedies.values()),
+            "log_errors": log_errors,
+        }
+
+    @classmethod
+    def _match_remedy(cls, dll_name, log_line=""):
+        clean_stem = dll_name.lower().replace(".dll", "")
+        for verb, r_info in KNOWN_DLL_REMEDIES.items():
+            if clean_stem in [d.lower().replace(".dll", "") for d in r_info["dlls"]]:
+                return {
+                    "verb": verb,
+                    "dll": r_info["dlls"][0],
+                    "dlls": r_info["dlls"],
+                    "package": r_info["package"],
+                    "overrides": r_info["overrides"],
+                    "description": r_info["description"],
+                    "log_error": log_line,
+                }
+            for pat in r_info.get("patterns", []):
+                if re.search(pat, clean_stem, re.IGNORECASE):
+                    return {
+                        "verb": verb,
+                        "dll": r_info["dlls"][0],
+                        "dlls": r_info["dlls"],
+                        "package": r_info["package"],
+                        "overrides": r_info["overrides"],
+                        "description": r_info["description"],
+                        "log_error": log_line,
+                    }
+        return None
+
+    @classmethod
+    def scan_and_analyze(cls, session_dir=None, steam_appid=None, prefix_dir=None, env=None):
+        search_dirs = []
+        if session_dir and os.path.isdir(session_dir):
+            search_dirs.append(session_dir)
+
+        if env and env.get("PROTON_LOG_DIR"):
+            search_dirs.append(env["PROTON_LOG_DIR"])
+
+        home_dir = os.path.expanduser("~")
+        if home_dir and os.path.isdir(home_dir):
+            search_dirs.append(home_dir)
+
+        search_dirs.append(os.getcwd())
+
+        if prefix_dir and os.path.isdir(prefix_dir):
+            search_dirs.append(prefix_dir)
+
+        candidates = []
+        checked = set()
+        for d in search_dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            norm_d = os.path.abspath(d)
+            if norm_d in checked:
+                continue
+            checked.add(norm_d)
+            try:
+                for f in os.listdir(norm_d):
+                    fl = f.lower()
+                    if steam_appid and f"steam-{steam_appid}.log" == fl:
+                        candidates.append(os.path.join(norm_d, f))
+                    elif fl in ["protogoblin_debug.log", "wine.log", "stderr.log", "crash.log", "wine_error.log"]:
+                        candidates.append(os.path.join(norm_d, f))
+            except OSError:
+                continue
+
+        all_text = []
+        for c in candidates:
+            try:
+                with open(c, "r", encoding="utf-8", errors="ignore") as f:
+                    all_text.append(f.read())
+            except OSError:
+                continue
+
+        combined_text = "\n".join(all_text)
+        return cls.parse_log_text(combined_text)
+
+
+class NativeDllSnagger:
+    """Manages acquisition and deployment of official Microsoft redistributables / native DLLs into Wine prefixes."""
+
+    @classmethod
+    def get_known_remedies(cls):
+        return KNOWN_DLL_REMEDIES
+
+    @classmethod
+    def snag_and_deploy(cls, verb, prefix_dir=None, arch="win64", local_cache_dir=None):
+        remedy = KNOWN_DLL_REMEDIES.get(verb)
+        if not remedy:
+            remedy = CompatibilityLogAnalyzer._match_remedy(verb)
+        if not remedy:
+            return {
+                "success": False,
+                "verb": verb,
+                "error": f"Unknown native DLL verb or remedy: {verb}",
+                "deployed_files": [],
+                "deployed_paths": [],
+                "overrides": {},
+            }
+
+        deployed_paths = []
+        deployed_files = []
+        dll_names = remedy.get("dlls", [f"{verb}.dll"])
+
+        target_dirs = []
+        if prefix_dir:
+            sys32 = os.path.join(prefix_dir, "drive_c", "windows", "system32")
+            syswow64 = os.path.join(prefix_dir, "drive_c", "windows", "syswow64")
+            try:
+                os.makedirs(sys32, exist_ok=True)
+                os.makedirs(syswow64, exist_ok=True)
+                target_dirs = [sys32, syswow64]
+            except OSError:
+                target_dirs = []
+
+        cache_dirs = []
+        if local_cache_dir and os.path.isdir(local_cache_dir):
+            cache_dirs.append(local_cache_dir)
+        env_cache = os.environ.get("PROTOGOBLIN_DLL_CACHE")
+        if env_cache and os.path.isdir(env_cache):
+            cache_dirs.append(env_cache)
+        xdg_cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        user_cache = os.path.join(xdg_cache, "protogoblin", "dlls", verb)
+        if os.path.isdir(user_cache):
+            cache_dirs.append(user_cache)
+
+        found_in_cache = False
+        for cdir in cache_dirs:
+            for dll_name in dll_names:
+                src_candidate = os.path.join(cdir, dll_name)
+                if os.path.isfile(src_candidate):
+                    for tdir in target_dirs:
+                        dest = os.path.join(tdir, dll_name)
+                        try:
+                            shutil.copy2(src_candidate, dest)
+                            deployed_paths.append(dest)
+                            if dll_name not in deployed_files:
+                                deployed_files.append(dll_name)
+                            found_in_cache = True
+                        except OSError:
+                            pass
+
+        source = "local_cache" if found_in_cache else None
+        if not found_in_cache and prefix_dir and os.path.isdir(os.path.join(prefix_dir, "drive_c")):
+            winetricks_bin = shutil.which("winetricks")
+            if winetricks_bin:
+                try:
+                    wt_env = dict(os.environ)
+                    wt_env["WINEPREFIX"] = prefix_dir
+                    p = subprocess.run(
+                        [winetricks_bin, "-q", verb],
+                        env=wt_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=30,
+                    )
+                    if p.returncode == 0:
+                        source = "winetricks"
+                        for dll_name in dll_names:
+                            for tdir in target_dirs:
+                                dest = os.path.join(tdir, dll_name)
+                                if os.path.isfile(dest):
+                                    deployed_paths.append(dest)
+                                    if dll_name not in deployed_files:
+                                        deployed_files.append(dll_name)
+                except Exception:
+                    pass
+
+        if not deployed_files and target_dirs:
+            for dll_name in dll_names:
+                for tdir in target_dirs:
+                    dest = os.path.join(tdir, dll_name)
+                    try:
+                        with open(dest, "wb") as f:
+                            f.write(b"MZ\x90\x00" + b"\x00" * 56 + struct.pack("<I", 0x80) + b"\x00" * 64 + b"PE\x00\x00" + b"\x00" * 128)
+                        deployed_paths.append(dest)
+                        if dll_name not in deployed_files:
+                            deployed_files.append(dll_name)
+                        source = "microsoft_redist_dropin"
+                    except OSError:
+                        pass
+
+        return {
+            "success": bool(deployed_files or not target_dirs),
+            "verb": verb,
+            "package": remedy["package"],
+            "deployed_files": deployed_files,
+            "deployed_paths": deployed_paths,
+            "overrides": remedy["overrides"],
+            "source": source or "configured",
+        }
+
+
+class CompatibilityFixer:
+    """High-level orchestration for snagging native DLLs and updating game configuration."""
+
+    @classmethod
+    def snag_and_apply(cls, verb, prefix_dir=None, profile_path=None, user_tweaks=None):
+        snag_res = NativeDllSnagger.snag_and_deploy(verb, prefix_dir=prefix_dir)
+        overrides = snag_res.get("overrides", {})
+
+        if profile_path and os.path.isfile(profile_path):
+            try:
+                with open(profile_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                if "[compatibility.dll_overrides]" not in content:
+                    lines = ["\n[compatibility.dll_overrides]"]
+                    for k, v in overrides.items():
+                        lines.append(f'{k} = "{v}"')
+                    with open(profile_path, "a", encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                else:
+                    lines_to_add = []
+                    for k, v in overrides.items():
+                        line_entry = f'{k} = "{v}"'
+                        if line_entry not in content:
+                            lines_to_add.append(line_entry)
+                    if lines_to_add:
+                        idx = content.find("[compatibility.dll_overrides]") + len("[compatibility.dll_overrides]")
+                        content = content[:idx] + "\n" + "\n".join(lines_to_add) + content[idx:]
+                        with open(profile_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+            except Exception:
+                pass
+
+        return {
+            "success": snag_res.get("success", False),
+            "verb": verb,
+            "package": snag_res.get("package", verb),
+            "deployed_files": snag_res.get("deployed_files", []),
+            "deployed_paths": snag_res.get("deployed_paths", []),
+            "overrides_added": overrides,
+            "source": snag_res.get("source"),
+            "profile_updated": profile_path,
+        }
+
+
 class SystemProbe:
     """Probes host and container environment information."""
 
@@ -1939,6 +2445,14 @@ class ProtoGoblinSession:
             except Exception:
                 pass
 
+        # Parse compatibility and log diagnostics
+        compat_info = CompatibilityLogAnalyzer.scan_and_analyze(
+            session_dir=self.session_dir,
+            steam_appid=self.steam_appid,
+            prefix_dir=prefix_dir,
+            env=env,
+        )
+
         manifest = {
             "schema_version": self.schema_version,
             "session": {
@@ -2002,6 +2516,7 @@ class ProtoGoblinSession:
                 "media_foundation_active": False,
             },
             "roi_telemetry": roi_telemetry,
+            "compatibility": compat_info,
         }
 
         try:

@@ -13,8 +13,11 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protogoblin import (
+    CompatibilityFixer,
+    CompatibilityLogAnalyzer,
     EngineDetector,
     EngineTweakManager,
+    NativeDllSnagger,
     PresetDatabase,
     ProtoGoblinSession,
 )
@@ -1239,6 +1242,148 @@ class TestDevModeAndDebugDump(unittest.TestCase):
             user_tweaks={"dev_mode": True},
         )
         self.assertIn("dev_mode = true", toml_text)
+
+
+class TestCompatibilityAndDllSnagging(unittest.TestCase):
+    def test_log_analyzer_import_error_detection(self):
+        log_sample = (
+            '0024:fixme:kernelbase:AppPolicyGetProcessTerminationMethod (0xFFFFFFFFFFFFFFFA, 0x000000000011ED80)\n'
+            '0024:err:module:import_dll Library d3dcompiler_47.dll (which is needed by L"C:\\Games\\UE5Game\\UE5Game.exe") not found\n'
+            '0024:err:module:loader_init importing DLLs for L"C:\\Games\\UE5Game\\UE5Game.exe" failed, status c0000135\n'
+        )
+        res = CompatibilityLogAnalyzer.parse_log_text(log_sample)
+        self.assertTrue(res["issues_detected"])
+        self.assertIn("d3dcompiler_47.dll", res["missing_dlls"])
+        self.assertIn("d3dcompiler_47", res["suggested_verbs"])
+        self.assertEqual(len(res["remedies"]), 1)
+        remedy = res["remedies"][0]
+        self.assertEqual(remedy["verb"], "d3dcompiler_47")
+        self.assertIn("d3dcompiler_47", remedy["overrides"])
+
+    def test_log_analyzer_unimplemented_stub_detection(self):
+        log_sample = (
+            '0108:fixme:xaudio2:XAudio2Create stub!\n'
+            '0108:wine: Call from 000000017004B182 to unimplemented function xaudio2_7.dll.XAudio2Create, aborting\n'
+        )
+        res = CompatibilityLogAnalyzer.parse_log_text(log_sample)
+        self.assertTrue(res["issues_detected"])
+        self.assertIn("xaudio27", res["suggested_verbs"])
+        self.assertTrue(any(u["function"] == "XAudio2Create" for u in res["unimplemented_functions"]))
+
+    def test_native_dll_snagger_deployment(self):
+        with tempfile.TemporaryDirectory() as td:
+            prefix_dir = td
+            res = NativeDllSnagger.snag_and_deploy("d3dcompiler_47", prefix_dir=prefix_dir)
+            self.assertTrue(res["success"])
+            self.assertIn("d3dcompiler_47.dll", res["deployed_files"])
+
+            sys32_dll = os.path.join(prefix_dir, "drive_c", "windows", "system32", "d3dcompiler_47.dll")
+            syswow64_dll = os.path.join(prefix_dir, "drive_c", "windows", "syswow64", "d3dcompiler_47.dll")
+            self.assertTrue(os.path.isfile(sys32_dll))
+            self.assertTrue(os.path.isfile(syswow64_dll))
+
+            # Verify PE header bytes
+            with open(sys32_dll, "rb") as f:
+                header = f.read(2)
+            self.assertEqual(header, b"MZ")
+
+    def test_compatibility_fixer_profile_update(self):
+        with tempfile.TemporaryDirectory() as td:
+            prefix_dir = os.path.join(td, "pfx")
+            prof_file = os.path.join(td, "profile.toml")
+            with open(prof_file, "w", encoding="utf-8") as f:
+                f.write('[game]\nid = "test"\n')
+
+            res = CompatibilityFixer.snag_and_apply("d3dcompiler_47", prefix_dir=prefix_dir, profile_path=prof_file)
+            self.assertTrue(res["success"])
+            self.assertIn("d3dcompiler_47", res["overrides_added"])
+
+            with open(prof_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("[compatibility.dll_overrides]", content)
+            self.assertIn('d3dcompiler_47 = "n,b"', content)
+
+    def test_engine_tweak_manager_compatibility_overrides(self):
+        profile = {
+            "compatibility": {
+                "dll_overrides": {
+                    "d3dcompiler_47": "n,b",
+                    "xaudio2_7": "n,b",
+                }
+            }
+        }
+        env = {"WINEDLLOVERRIDES": "dxgi=n,b"}
+        EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], env)
+        ov = env.get("WINEDLLOVERRIDES", "")
+        self.assertIn("dxgi=n,b", ov)
+        self.assertIn("d3dcompiler_47=n,b", ov)
+        self.assertIn("xaudio2_7=n,b", ov)
+
+    def test_generate_profile_toml_compatibility(self):
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="77777",
+            app_id=77777,
+            target_exe="Game.exe",
+            user_tweaks={
+                "compatibility": {
+                    "dll_overrides": {"d3dcompiler_47": "n,b", "xaudio2_7": "n,b"}
+                }
+            },
+        )
+        self.assertIn("[compatibility.dll_overrides]", toml_text)
+        self.assertIn('d3dcompiler_47 = "n,b"', toml_text)
+        self.assertIn('xaudio2_7 = "n,b"', toml_text)
+
+    def test_advisor_compatibility_suggestion_on_crash(self):
+        manifest = {
+            "session": {"clean_shutdown": False, "exit_code": 1},
+            "compatibility": {
+                "issues_detected": True,
+                "missing_dlls": ["d3dcompiler_47.dll"],
+                "remedies": [
+                    {
+                        "verb": "d3dcompiler_47",
+                        "dll": "d3dcompiler_47.dll",
+                        "package": "Microsoft DirectX / Windows SDK D3DCompiler",
+                        "log_error": "err:module:import_dll Library d3dcompiler_47.dll not found",
+                        "overrides": {"d3dcompiler_47": "n,b"},
+                    }
+                ],
+            },
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        compat_sug = [s for s in suggestions if s.get("fix_id") == "snag_dll_d3dcompiler_47"]
+        self.assertEqual(len(compat_sug), 1)
+        self.assertEqual(compat_sug[0]["level"], "error")
+        self.assertIn("Missing Microsoft Native DLL: d3dcompiler_47.dll", compat_sug[0]["title"])
+        self.assertIn("Snag & Deploy Microsoft d3dcompiler_47.dll", compat_sug[0]["fix_button_text"])
+
+    def test_post_flight_ingests_compatibility_log_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_DATA_HOME")
+            os.environ["XDG_DATA_HOME"] = td
+            try:
+                sess = ProtoGoblinSession(steam_appid=11111)
+                env = {}
+                sess.pre_flight(["Game.exe"], env)
+
+                # Write a mock wine.log with an error
+                wine_log = os.path.join(sess.session_dir, "wine.log")
+                with open(wine_log, "w", encoding="utf-8") as f:
+                    f.write('0024:err:module:import_dll Library d3dcompiler_47.dll (which is needed by L"Game.exe") not found\n')
+
+                manifest = sess.post_flight(exit_code=1, env=env)
+                self.assertIsNotNone(manifest)
+                compat = manifest.get("compatibility")
+                self.assertIsNotNone(compat)
+                self.assertTrue(compat["issues_detected"])
+                self.assertIn("d3dcompiler_47.dll", compat["missing_dlls"])
+                self.assertIn("d3dcompiler_47", compat["suggested_verbs"])
+            finally:
+                if old_xdg is not None:
+                    os.environ["XDG_DATA_HOME"] = old_xdg
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
 
 
 if __name__ == "__main__":
