@@ -3166,33 +3166,12 @@ class ProtoGoblinCommandApp:
         os.makedirs(profile_dir, exist_ok=True)
         profile_file = os.path.join(profile_dir, f"{steam_id}.toml")
 
+        eng_info = tgt.get("engine") or {}
+        eng_name = eng_info.get("engine", "")
+
         user_tweaks = {
             "mode": self.var_profile_mode.get(),
             "atelier_sync_fix": self.var_atelier_sync_fix.get(),
-            "unreal": {
-                "disable_motion_blur": self.var_ue_motion_blur.get(),
-                "disable_depth_of_field": self.var_ue_depth_of_field.get(),
-                "disable_chromatic_aberration": self.var_ue_chromatic_aberration.get(),
-                "disable_film_grain": self.var_ue_film_grain.get(),
-                "disable_lens_flare": self.var_ue_lens_flare.get(),
-                "disable_bloom": self.var_ue_bloom.get() if hasattr(self, "var_ue_bloom") else False,
-                "disable_volumetric_fog": self.var_ue_volumetric_fog.get(),
-                "disable_lumen_reflections": self.var_ue_lumen.get(),
-                "optimize_lumen": self.var_ue_optimize_lumen.get(),
-                "optimize_vsm": self.var_ue_optimize_vsm.get(),
-                "optimize_nanite": self.var_ue_optimize_nanite.get(),
-                "disable_virtual_shadows": self.var_ue_disable_vsm.get(),
-            },
-            "unity": {
-                "native_gfx_jobs": self.var_unity_native_jobs.get(),
-                "disable_vr": self.var_unity_disable_vr.get(),
-                "force_vulkan": self.var_unity_vulkan.get(),
-            },
-            "godot": {
-                "rendering_driver": "vulkan" if self.var_godot_vulkan.get() else "opengl3",
-                "disable_vsync": self.var_godot_vsync.get(),
-                "max_fps": 0,
-            },
             "graphics": {
                 "backend": self.current_manifest.get("graphics", {}).get("active_backend", "dxvk"),
                 "force_vsync": "off" if self.var_gfx_vsync_off.get() else "auto",
@@ -3230,7 +3209,34 @@ class ProtoGoblinCommandApp:
             },
         }
 
-        eng_info = tgt.get("engine") or {}
+        if eng_name in ["unreal_4", "unreal_5", "unreal"]:
+            user_tweaks["unreal"] = {
+                "disable_motion_blur": self.var_ue_motion_blur.get(),
+                "disable_depth_of_field": self.var_ue_depth_of_field.get(),
+                "disable_chromatic_aberration": self.var_ue_chromatic_aberration.get(),
+                "disable_film_grain": self.var_ue_film_grain.get(),
+                "disable_lens_flare": self.var_ue_lens_flare.get(),
+                "disable_bloom": self.var_ue_bloom.get() if hasattr(self, "var_ue_bloom") else False,
+                "disable_volumetric_fog": self.var_ue_volumetric_fog.get(),
+                "disable_lumen_reflections": self.var_ue_lumen.get(),
+                "optimize_lumen": self.var_ue_optimize_lumen.get(),
+                "optimize_vsm": self.var_ue_optimize_vsm.get(),
+                "optimize_nanite": self.var_ue_optimize_nanite.get(),
+                "disable_virtual_shadows": self.var_ue_disable_vsm.get(),
+            }
+        elif eng_name == "unity":
+            user_tweaks["unity"] = {
+                "native_gfx_jobs": self.var_unity_native_jobs.get(),
+                "disable_vr": self.var_unity_disable_vr.get(),
+                "force_vulkan": self.var_unity_vulkan.get(),
+            }
+        elif eng_name in ["godot", "godot_3", "godot_4"]:
+            user_tweaks["godot"] = {
+                "rendering_driver": "vulkan" if self.var_godot_vulkan.get() else "opengl3",
+                "disable_vsync": self.var_godot_vsync.get(),
+                "max_fps": 0,
+            }
+
         sync_backend = self.current_manifest.get("synchronization", {}).get("sync_backend", "ntsync")
 
         toml_content = protogoblin.EngineTweakManager.generate_profile_toml(

@@ -489,6 +489,10 @@ class TestProfileBannerHUD(unittest.TestCase):
             self.assertIn("exec=", config)
             self.assertIn("position=top-right", config)
             self.assertIn("text_color=39FF14", config)
+            self.assertIn("blacklist=steam.exe", config)
+            self.assertIn("blacklist=tabtip.exe", config)
+            self.assertIn("blacklist=iscriptevaluator.exe", config)
+            self.assertIn("blacklist=winedevice.exe", config)
 
             # Inactive profiling banner
             self.assertEqual(session.get_hud_status(), "ProtoGoblin: Press alt-f11 to start Profiling")
@@ -825,6 +829,35 @@ class TestEngineTweakManager(unittest.TestCase):
         self.assertIn("--rendering-driver", g_argv)
         self.assertIn("vulkan", g_argv)
         self.assertIn("--max-fps=120", g_argv)
+
+    def test_engine_tweak_guarding_for_unknown_engines(self):
+        profile = {
+            "game": {"detected_engine": "unknown"},
+            "engine": {
+                "unreal": {"disable_motion_blur": True},
+                "unity": {"force_vulkan": True},
+                "godot": {"rendering_driver": "vulkan", "max_fps": 120},
+            }
+        }
+        # When engine is unknown, no engine-specific argv flags should be injected
+        out_argv = EngineTweakManager.apply_tweaks(profile, {"engine": "unknown"}, ["Game.exe"], {})
+        self.assertEqual(out_argv, ["Game.exe"])
+
+        # Also when engine_info is empty
+        out_argv2 = EngineTweakManager.apply_tweaks(profile, {}, ["Game.exe"], {})
+        self.assertEqual(out_argv2, ["Game.exe"])
+
+    def test_generate_profile_toml_omits_irrelevant_engines(self):
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id="386140",
+            app_id=386140,
+            target_exe="Game.exe",
+            engine_info={"engine": "unknown"},
+            user_tweaks={"mode": "profile"},
+        )
+        self.assertNotIn("[engine.unreal]", toml_text)
+        self.assertNotIn("[engine.unity]", toml_text)
+        self.assertNotIn("[engine.godot]", toml_text)
 
     def test_dxvk_graphics_intercepts(self):
         profile = {

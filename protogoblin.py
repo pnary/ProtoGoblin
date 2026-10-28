@@ -556,7 +556,7 @@ class EngineTweakManager:
         eng_name = engine_info.get("engine", "") if engine_info else ""
         is_ue = eng_name in ["unreal_4", "unreal_5", "unreal"]
         is_unity = eng_name == "unity"
-        is_godot = eng_name == "godot"
+        is_godot = eng_name in ["godot", "godot_3", "godot_4"]
 
         ue_cfg = tweaks.get("unreal", cls.DEFAULTS["unreal"])
         unity_cfg = tweaks.get("unity", cls.DEFAULTS["unity"])
@@ -606,7 +606,7 @@ class EngineTweakManager:
             f'ntsync = {"true" if tweaks.get("synchronization", {}).get("ntsync", True) else "false"}',
         ]
 
-        if is_ue or "unreal" in tweaks:
+        if is_ue or (not eng_name and "unreal" in tweaks):
             lines.extend([
                 "",
                 "[engine.unreal]",
@@ -634,7 +634,7 @@ class EngineTweakManager:
                 f'single_queue = {"true" if vkd3d_cfg.get("single_queue", False) else "false"}',
             ])
 
-        if is_unity or "unity" in tweaks:
+        if is_unity or (not eng_name and "unity" in tweaks):
             lines.extend([
                 "",
                 "[engine.unity]",
@@ -643,7 +643,7 @@ class EngineTweakManager:
                 f'force_vulkan = {"true" if unity_cfg.get("force_vulkan", False) else "false"}',
             ])
 
-        if is_godot or "godot" in tweaks:
+        if is_godot or (not eng_name and "godot" in tweaks):
             lines.extend([
                 "",
                 "[engine.godot]",
@@ -750,6 +750,8 @@ class EngineTweakManager:
             return argv
 
         eng_name = engine_info.get("engine", "") if engine_info else ""
+        if not eng_name and isinstance(profile, dict):
+            eng_name = profile.get("game", {}).get("detected_engine", "")
         engine_sec = profile.get("engine", {})
         gfx_sec = profile.get("graphics", {})
         sync_sec = profile.get("synchronization", {})
@@ -759,7 +761,7 @@ class EngineTweakManager:
         # 1. Unreal Engine command-line cvars
         ue_cfg = engine_sec.get("unreal", {})
         cvars = []
-        if ue_cfg or eng_name in ["unreal_4", "unreal_5", "unreal"]:
+        if eng_name in ["unreal_4", "unreal_5", "unreal"]:
             for option_key, active in ue_cfg.items():
                 if active and option_key in cls.UNREAL_CVAR_MAP:
                     cvars.extend(cls.UNREAL_CVAR_MAP[option_key])
@@ -768,18 +770,20 @@ class EngineTweakManager:
                 new_argv.append(exec_arg)
 
         # 2. Unity command-line flags
-        unity_cfg = engine_sec.get("unity", {})
-        if unity_cfg.get("force_vulkan"):
-            if "-force-vulkan" not in new_argv:
-                new_argv.append("-force-vulkan")
+        if eng_name == "unity":
+            unity_cfg = engine_sec.get("unity", {})
+            if unity_cfg.get("force_vulkan"):
+                if "-force-vulkan" not in new_argv:
+                    new_argv.append("-force-vulkan")
 
         # 3. Godot command-line flags
-        godot_cfg = engine_sec.get("godot", {})
-        if godot_cfg.get("rendering_driver"):
-            driver = godot_cfg["rendering_driver"]
-            new_argv.extend(["--rendering-driver", driver])
-        if godot_cfg.get("max_fps", 0) > 0:
-            new_argv.append(f"--max-fps={godot_cfg['max_fps']}")
+        if eng_name in ["godot", "godot_3", "godot_4"]:
+            godot_cfg = engine_sec.get("godot", {})
+            if godot_cfg.get("rendering_driver"):
+                driver = godot_cfg["rendering_driver"]
+                new_argv.extend(["--rendering-driver", driver])
+            if godot_cfg.get("max_fps", 0) > 0:
+                new_argv.append(f"--max-fps={godot_cfg['max_fps']}")
 
         # 4. DXVK & Synchronization layer intercepts
         dxvk_items = []
@@ -2426,9 +2430,26 @@ class ProtoGoblinSession:
             config_parts = [
                 f"output_folder={self.session_dir}",
                 "log_interval=100",
-                "fps_metrics=avg,0.01,0.001",
+                "fps_metrics=avg+0.01+0.001",
                 f"toggle_logging={mangohud_key}",
             ]
+            blacklist_helpers = [
+                "steam.exe",
+                "Steam.exe",
+                "steam",
+                "tabtip.exe",
+                "xalia.exe",
+                "iscriptevaluator.exe",
+                "conhost.exe",
+                "winedevice.exe",
+                "services.exe",
+                "explorer.exe",
+                "svchost.exe",
+                "rpcss.exe",
+                "plugplay.exe",
+            ]
+            for helper in blacklist_helpers:
+                config_parts.append(f"blacklist={helper}")
             if os.environ.get("PROTOGOBLIN_OVERLAY") == "0":
                 config_parts.append("no_display=1")
             else:
