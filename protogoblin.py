@@ -2426,7 +2426,7 @@ class ProtoGoblinSession:
             config_parts = [
                 f"output_folder={self.session_dir}",
                 "log_interval=100",
-                "benchmark_percentiles=0.001;0.01;0.97;0.99",
+                "fps_metrics=avg,0.01,0.001",
                 f"toggle_logging={mangohud_key}",
             ]
             if os.environ.get("PROTOGOBLIN_OVERLAY") == "0":

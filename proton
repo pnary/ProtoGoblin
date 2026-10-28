@@ -3028,8 +3028,20 @@ if __name__ == "__main__":
         setup_steam_dir_drive()
         rc = g_session.run()
     elif sys.argv[1] == "waitforexitandrun":
-        #wait for wineserver to shut down
-        g_session.run_proc([g_proton.wineserver_bin, "-w"])
+        #wait for wineserver to shut down with timeout to prevent indefinite launch hangs
+        try:
+            wait_proc = subprocess.Popen([g_proton.wineserver_bin, "-w"], env=g_session.env)
+            wait_proc.wait(timeout=4.0)
+        except subprocess.TimeoutExpired:
+            log("wineserver -w timed out after 4s; terminating stale wineserver")
+            try:
+                subprocess.run([g_proton.wineserver_bin, "-k"], env=g_session.env, timeout=2.0)
+            except Exception:
+                pass
+            try:
+                wait_proc.kill()
+            except Exception:
+                pass
         #then run
         rc = g_session.run()
     elif sys.argv[1] == "runinprefix":

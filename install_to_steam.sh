@@ -423,20 +423,20 @@ install_protogoblin_components() {
             cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${HOME}/.local/share/vulkan/implicit_layer.d/" 2>/dev/null || true
         fi
 
-        # Install 64-bit MangoHud library
-        if [[ -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" ]]; then
+        # Install 64-bit MangoHud library and dependencies
+        if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64" ]]; then
             mkdir -p "${TOOL_DIR}/files/lib/x86_64-linux-gnu" "${TOOL_DIR}/files/lib64" "${HOME}/.local/lib/mangohud"
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" "${TOOL_DIR}/files/lib/x86_64-linux-gnu/"
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" "${TOOL_DIR}/files/lib64/" 2>/dev/null || true
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" "${HOME}/.local/lib/mangohud/"
+            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/"* "${TOOL_DIR}/files/lib/x86_64-linux-gnu/" 2>/dev/null || true
+            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/"* "${TOOL_DIR}/files/lib64/" 2>/dev/null || true
+            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/"* "${HOME}/.local/lib/mangohud/" 2>/dev/null || true
         fi
 
-        # Install 32-bit MangoHud library
-        if [[ -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" ]]; then
+        # Install 32-bit MangoHud library and dependencies (e.g. 32-bit libxkbcommon)
+        if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32" ]]; then
             mkdir -p "${TOOL_DIR}/files/lib/i386-linux-gnu" "${TOOL_DIR}/files/lib" "${HOME}/.local/lib32/mangohud"
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" "${TOOL_DIR}/files/lib/i386-linux-gnu/"
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" "${TOOL_DIR}/files/lib/" 2>/dev/null || true
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" "${HOME}/.local/lib32/mangohud/"
+            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/"* "${TOOL_DIR}/files/lib/i386-linux-gnu/" 2>/dev/null || true
+            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/"* "${TOOL_DIR}/files/lib/" 2>/dev/null || true
+            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/"* "${HOME}/.local/lib32/mangohud/" 2>/dev/null || true
         fi
 
         # Install mangohud CLI wrapper if present
