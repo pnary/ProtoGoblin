@@ -33,6 +33,33 @@ from protogoblin_command import (
 )
 
 
+def setUpModule():
+    global _MODULE_TEMP_DIR, _ORIG_XDG_DATA, _ORIG_XDG_CONFIG, _ORIG_SESSIONS_DIR
+    _MODULE_TEMP_DIR = tempfile.TemporaryDirectory()
+    _ORIG_XDG_DATA = os.environ.get("XDG_DATA_HOME")
+    _ORIG_XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME")
+    _ORIG_SESSIONS_DIR = os.environ.get("PROTOGOBLIN_SESSIONS_DIR")
+    os.environ["XDG_DATA_HOME"] = os.path.join(_MODULE_TEMP_DIR.name, "data")
+    os.environ["XDG_CONFIG_HOME"] = os.path.join(_MODULE_TEMP_DIR.name, "config")
+    os.environ["PROTOGOBLIN_SESSIONS_DIR"] = os.path.join(_MODULE_TEMP_DIR.name, "data", "protogoblin", "sessions")
+
+
+def tearDownModule():
+    _MODULE_TEMP_DIR.cleanup()
+    if _ORIG_XDG_DATA is not None:
+        os.environ["XDG_DATA_HOME"] = _ORIG_XDG_DATA
+    else:
+        os.environ.pop("XDG_DATA_HOME", None)
+    if _ORIG_XDG_CONFIG is not None:
+        os.environ["XDG_CONFIG_HOME"] = _ORIG_XDG_CONFIG
+    else:
+        os.environ.pop("XDG_CONFIG_HOME", None)
+    if _ORIG_SESSIONS_DIR is not None:
+        os.environ["PROTOGOBLIN_SESSIONS_DIR"] = _ORIG_SESSIONS_DIR
+    else:
+        os.environ.pop("PROTOGOBLIN_SESSIONS_DIR", None)
+
+
 class TestDiagnosticAdvisor(unittest.TestCase):
     def test_optimal_fastpath_session(self):
         manifest = {
