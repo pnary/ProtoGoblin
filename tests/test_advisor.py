@@ -488,6 +488,94 @@ class TestProfileBannerHUD(unittest.TestCase):
                 os.environ.pop("PROTOGOBLIN_OVERLAY", None)
 
 
+class TestSessionInitialModeSelection(unittest.TestCase):
+    def test_first_run_defaults_to_profile_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg_data = os.environ.get("XDG_DATA_HOME")
+            old_xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+            old_mode_env = os.environ.pop("PROTOGOBLIN_MODE", None)
+            os.environ["XDG_DATA_HOME"] = os.path.join(td, "data")
+            os.environ["XDG_CONFIG_HOME"] = os.path.join(td, "config")
+            try:
+                sess = ProtoGoblinSession(steam_appid=44444)
+                env = {}
+                sess.pre_flight(["BrandNewGame.exe"], env)
+                self.assertEqual(sess.mode, "profile")
+                self.assertEqual(env.get("MANGOHUD"), "1")
+                self.assertIn("custom_text=Goblin-ing", env.get("MANGOHUD_CONFIG", ""))
+            finally:
+                if old_mode_env:
+                    os.environ["PROTOGOBLIN_MODE"] = old_mode_env
+                if old_xdg_data:
+                    os.environ["XDG_DATA_HOME"] = old_xdg_data
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                if old_xdg_cfg:
+                    os.environ["XDG_CONFIG_HOME"] = old_xdg_cfg
+                else:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+
+    def test_subsequent_run_without_profile_defaults_to_play_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg_data = os.environ.get("XDG_DATA_HOME")
+            old_xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+            old_mode_env = os.environ.pop("PROTOGOBLIN_MODE", None)
+            data_dir = os.path.join(td, "data")
+            os.environ["XDG_DATA_HOME"] = data_dir
+            os.environ["XDG_CONFIG_HOME"] = os.path.join(td, "config")
+            try:
+                # Simulate prior session manifest existing
+                prior_sess_dir = os.path.join(data_dir, "protogoblin", "sessions", "44444", "20261028T010000Z-0001")
+                os.makedirs(prior_sess_dir, exist_ok=True)
+                with open(os.path.join(prior_sess_dir, "utilization.json"), "w", encoding="utf-8") as f:
+                    json.dump({"session": {"mode": "profile"}}, f)
+
+                sess = ProtoGoblinSession(steam_appid=44444)
+                env = {}
+                sess.pre_flight(["BrandNewGame.exe"], env)
+                self.assertEqual(sess.mode, "play")
+                self.assertIsNone(env.get("MANGOHUD"))
+            finally:
+                if old_mode_env:
+                    os.environ["PROTOGOBLIN_MODE"] = old_mode_env
+                if old_xdg_data:
+                    os.environ["XDG_DATA_HOME"] = old_xdg_data
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                if old_xdg_cfg:
+                    os.environ["XDG_CONFIG_HOME"] = old_xdg_cfg
+                else:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+
+    def test_explicit_play_mode_override_on_first_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg_data = os.environ.get("XDG_DATA_HOME")
+            old_xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+            old_mode_env = os.environ.get("PROTOGOBLIN_MODE")
+            os.environ["PROTOGOBLIN_MODE"] = "play"
+            os.environ["XDG_DATA_HOME"] = os.path.join(td, "data")
+            os.environ["XDG_CONFIG_HOME"] = os.path.join(td, "config")
+            try:
+                sess = ProtoGoblinSession(steam_appid=44444)
+                env = {}
+                sess.pre_flight(["BrandNewGame.exe"], env)
+                self.assertEqual(sess.mode, "play")
+                self.assertIsNone(env.get("MANGOHUD"))
+            finally:
+                if old_mode_env:
+                    os.environ["PROTOGOBLIN_MODE"] = old_mode_env
+                else:
+                    os.environ.pop("PROTOGOBLIN_MODE", None)
+                if old_xdg_data:
+                    os.environ["XDG_DATA_HOME"] = old_xdg_data
+                else:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                if old_xdg_cfg:
+                    os.environ["XDG_CONFIG_HOME"] = old_xdg_cfg
+                else:
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+
+
 class TestEngineTweakManager(unittest.TestCase):
     def test_unreal_engine_tweak_injection(self):
         profile = {

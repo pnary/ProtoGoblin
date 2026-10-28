@@ -1988,6 +1988,7 @@ class ProtoGoblinSession:
         self.start_iso = datetime.now(timezone.utc).isoformat()
         self.start_monotonic = time.monotonic()
 
+        self.explicit_mode = (mode is not None)
         self.mode = mode or os.environ.get("PROTOGOBLIN_MODE", "play").lower().strip()
         if self.mode not in ["play", "profile"]:
             self.mode = "play"
@@ -2150,8 +2151,8 @@ class ProtoGoblinSession:
 
         self.initial_exe = target_path
 
-        # Check per-game profile for configured mode if PROTOGOBLIN_MODE wasn't explicitly provided in environment
-        if "PROTOGOBLIN_MODE" not in os.environ:
+        # Check per-game profile or initial run mode if PROTOGOBLIN_MODE wasn't explicitly provided in environment
+        if "PROTOGOBLIN_MODE" not in os.environ and not getattr(self, "explicit_mode", False):
             profile_path = self.find_game_profile()
             if profile_path:
                 prof_data = EngineTweakManager.load_profile(profile_path)
@@ -2163,6 +2164,12 @@ class ProtoGoblinSession:
                     )
                     if prof_mode in ["profile", "play"]:
                         self.mode = prof_mode
+            else:
+                # First time ProtoGoblin is run on this title (no existing profile and no prior session exists):
+                # Automatically default to profile mode for initial telemetry and bottleneck profiling.
+                prev_manifest = self.find_latest_session_manifest()
+                if not prev_manifest:
+                    self.mode = "profile"
 
         # Anti-cheat scan
         self.anti_cheat = AntiCheatDetector.scan(target_path)
