@@ -2889,18 +2889,25 @@ class Session:
         if local_env is None:
             local_env = self.env
         prefix_dir = getattr(g_compatdata, "prefix_dir", None) if "g_compatdata" in globals() else None
+        protogoblin.log(f"Proton run_proc: args={args}")
         proc = subprocess.Popen(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
+        protogoblin.log(f"Proton run_proc: spawned PID={proc.pid}")
         protogoblin.g_protogoblin.start_process_tree_monitor(proc.pid, prefix_dir)
         try:
-            return proc.wait()
+            rc = proc.wait()
+            protogoblin.log(f"Proton run_proc: PID={proc.pid} exited with rc={rc}")
+            return rc
         finally:
             protogoblin.g_protogoblin.stop_process_tree_monitor()
 
     def run(self):
         prefix_dir = getattr(g_compatdata, "prefix_dir", None) if "g_compatdata" in globals() else None
+        protogoblin.log(f"Proton Session.run: initial sys.argv={sys.argv}")
+        protogoblin.log(f"Proton Session.run: SteamAppId={os.environ.get('SteamAppId')}, SteamGameId={os.environ.get('SteamGameId')}")
         tweaked_argv = protogoblin.g_protogoblin.pre_flight(sys.argv[2:], self.env, prefix_dir)
         if tweaked_argv and tweaked_argv != sys.argv[2:]:
             sys.argv = sys.argv[:2] + tweaked_argv
+        protogoblin.log(f"Proton Session.run: tweaked sys.argv={sys.argv}")
         log("ProtoGoblin session initialized: " + protogoblin.g_protogoblin.session_id)
         umu_without_steam = "UMU_ID" in os.environ and os.environ.get("UMU_USE_STEAM") != "1"
         if umu_without_steam:
@@ -2952,7 +2959,9 @@ class Session:
             else:
                 argv = [g_proton.wine_bin, "c:\\windows\\system32\\steam.exe"]
 
-        rc = self.run_proc(adverb + argv + sys.argv[2:] + self.cmdlineappend)
+        full_cmd = adverb + argv + sys.argv[2:] + self.cmdlineappend
+        protogoblin.log(f"Proton Session.run: launching full_cmd={full_cmd}")
+        rc = self.run_proc(full_cmd)
 
         if remote_debug_proc:
             remote_debug_proc.kill()
@@ -3022,6 +3031,7 @@ if __name__ == "__main__":
 
     #determine mode
     rc = 0
+    protogoblin.log(f"Proton verb={sys.argv[1] if len(sys.argv) > 1 else 'none'}, sys.argv={sys.argv}")
     if sys.argv[1] == "run":
         #start target app
         setup_game_dir_drive()
@@ -3045,6 +3055,7 @@ if __name__ == "__main__":
         #then run
         rc = g_session.run()
     elif sys.argv[1] == "runinprefix":
+        protogoblin.log(f"Proton runinprefix args={sys.argv[2:]}")
         rc = g_session.run_proc([g_proton.wine_bin] + sys.argv[2:])
     elif sys.argv[1] == "destroyprefix":
         g_compatdata.remove_tracked_files()

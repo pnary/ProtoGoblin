@@ -23,6 +23,46 @@ from pathlib import Path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def log(msg: str):
+    """Unified logger that emits to sys.stderr, global protogoblin.log, and active session log."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    formatted = f"[{ts}] [ProtoGoblin] {msg}"
+    try:
+        sys.stderr.write(formatted + os.linesep)
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+    try:
+        xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        log_dir = os.path.join(xdg_data, "protogoblin")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "protogoblin.log"), "a", encoding="utf-8") as f:
+            f.write(formatted + "\n")
+    except Exception:
+        pass
+
+    global g_protogoblin
+    if "g_protogoblin" in globals() and g_protogoblin:
+        s_dir = getattr(g_protogoblin, "session_dir", None)
+        if s_dir:
+            try:
+                os.makedirs(s_dir, exist_ok=True)
+                with open(os.path.join(s_dir, "session.log"), "a", encoding="utf-8") as f:
+                    f.write(formatted + "\n")
+            except Exception:
+                pass
+
+        try:
+            app_id = getattr(g_protogoblin, "steam_appid", None) or "unknown_game"
+            latest_log = os.path.join(xdg_data, "protogoblin", "sessions", str(app_id), "latest.log")
+            os.makedirs(os.path.dirname(latest_log), exist_ok=True)
+            with open(latest_log, "a", encoding="utf-8") as f:
+                f.write(formatted + "\n")
+        except Exception:
+            pass
+
+
 class PEInfo:
     """Helper to inspect Windows PE binaries without external dependencies."""
 
@@ -1054,6 +1094,7 @@ class ProcessTreeTracker:
         self.peak_thread_count = 1
         self.peak_process_count = 1
         self.all_seen_pids = set([root_pid]) if root_pid else set()
+        self.logged_pids = set()
         # map: resolved_path -> {'peak_threads': int, 'first_seen': float, 'last_seen': float}
         self.discovered_executables = {}
 
@@ -1139,6 +1180,22 @@ class ProcessTreeTracker:
             now = time.monotonic()
 
             for pid in tree_pids:
+                if pid not in self.logged_pids:
+                    self.logged_pids.add(pid)
+                    comm = ""
+                    cmdline = ""
+                    try:
+                        with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="ignore") as f:
+                            comm = f.read().strip()
+                    except Exception:
+                        pass
+                    try:
+                        with open(f"/proc/{pid}/cmdline", "rb") as f:
+                            cmdline = f.read().replace(b"\0", b" ").decode("utf-8", errors="ignore").strip()
+                    except Exception:
+                        pass
+                    log(f"ProcessTreeTracker: tracked process PID={pid}, comm='{comm}', cmdline='{cmdline[:250]}'")
+
                 try:
                     with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="ignore") as f:
                         for line in f:
@@ -1162,6 +1219,7 @@ class ProcessTreeTracker:
                             if base not in self.SYSTEM_HELPER_EXES:
                                 resolved = self.resolve_wine_path(token, self.prefix_dir)
                                 if resolved not in self.discovered_executables:
+                                    log(f"ProcessTreeTracker: discovered candidate game executable '{resolved}' (PID={pid})")
                                     self.discovered_executables[resolved] = {
                                         "first_seen": now,
                                         "last_seen": now,
@@ -2279,6 +2337,13 @@ class ProtoGoblinSession:
         except OSError:
             pass
 
+        log(f"=== Session Pre-Flight: {self.session_id} ===")
+        log(f"PID={os.getpid()}, PPID={os.getppid()}, steam_appid={self.steam_appid}, initial_mode={self.mode}")
+        log(f"CWD={os.getcwd()}")
+        log(f"Input argv={argv}")
+        log(f"prefix_dir={prefix_dir}")
+        log(f"Environment: SteamAppId={os.environ.get('SteamAppId')}, SteamGameId={os.environ.get('SteamGameId')}, PROTOGOBLIN_MODE={os.environ.get('PROTOGOBLIN_MODE')}, PROTON_LOG={os.environ.get('PROTON_LOG')}")
+
         env["PROTOGOBLIN_SESSION_DIR"] = self.session_dir
 
         target_path = None
@@ -2301,6 +2366,7 @@ class ProtoGoblinSession:
                         break
 
         self.initial_exe = target_path
+        log(f"Target executable identified: {target_path}")
 
         # Check if user requested dropping profile / re-profiling via environment
         if os.environ.get("PROTOGOBLIN_DROP_PROFILE") == "1" or os.environ.get("PROTOGOBLIN_REPROFILE") == "1":
@@ -2427,6 +2493,7 @@ class ProtoGoblinSession:
             except OSError:
                 pass
 
+            log(f"Configuring MangoHud for profiling: hotkey={assigned_key}")
             config_parts = [
                 f"output_folder={self.session_dir}",
                 "log_interval=100",
@@ -2465,6 +2532,9 @@ class ProtoGoblinSession:
                     "text_outline_color=000000",
                 ])
             env["MANGOHUD_CONFIG"] = ",".join(config_parts)
+            log(f"MANGOHUD_CONFIG={env['MANGOHUD_CONFIG']}")
+            log(f"LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH')}")
+            log(f"VK_ADD_LAYER_PATH={env.get('VK_ADD_LAYER_PATH')}")
 
         # Initial target info and engine detection
         if target_path:
@@ -2501,6 +2571,7 @@ class ProtoGoblinSession:
         if profile_path and not is_raw:
             profile = EngineTweakManager.load_profile(profile_path)
             if profile:
+                log(f"Loaded game profile: {profile_path}")
                 argv = EngineTweakManager.apply_tweaks(
                     profile,
                     self.detected_engine,
@@ -2509,10 +2580,12 @@ class ProtoGoblinSession:
                     prefix_dir,
                     proton_dir=self.proton_dir,
                 )
+                log(f"Applied engine tweaks from profile. Resulting argv={argv}")
         elif not is_raw and presets_enabled:
             # Automatic preset bootstrap from PresetDatabase if no custom profile exists
             preset = PresetDatabase.get_preset(self.steam_appid)
             if preset and preset.get("recommended_tweaks"):
+                log(f"Loaded built-in preset for AppID {self.steam_appid}")
                 recs = preset["recommended_tweaks"]
                 for k, v in recs.get("env", {}).items():
                     if k not in env:
@@ -2520,6 +2593,7 @@ class ProtoGoblinSession:
                 for a in recs.get("args", []):
                     if a not in argv:
                         argv.append(a)
+                log(f"Applied built-in preset tweaks. Resulting argv={argv}")
 
         if profile and profile.get("runtime", {}).get("dev_mode"):
             self.dev_mode = True
@@ -2527,37 +2601,39 @@ class ProtoGoblinSession:
         # Active Subsystem Pruning in Play Mode based on prior profiling telemetry
         if not is_raw:
             self.prune_subsystems(env, profile=profile)
+            if self.pruned_subsystems:
+                log(f"Pruned unutilized subsystems: {self.pruned_subsystems}")
 
-        # Developer Debug Logging & Artifact Dump
-        if self.dev_mode:
-            env["PROTOGOBLIN_DEV"] = "1"
-            try:
-                os.makedirs(self.session_dir, exist_ok=True)
-                with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "w", encoding="utf-8") as f:
-                    f.write("=== ProtoGoblin Dev Debug Log ===\n")
-                    f.write(f"Session ID:         {self.session_id}\n")
-                    f.write(f"Timestamp:          {self.start_iso}\n")
-                    f.write(f"Steam AppID:        {self.steam_appid}\n")
-                    f.write(f"Target Executable:  {target_path}\n")
-                    f.write(f"Engine Detected:    {self.detected_engine.get('engine')} (confidence: {self.detected_engine.get('confidence')})\n")
-                    f.write(f"Anti-Cheat Policy:  {self.anti_cheat}\n")
-                    f.write(f"Pruned Subsystems:  {self.pruned_subsystems}\n")
-                    f.write(f"Final Arguments:    {argv}\n")
-                    f.write("\n--- Environment Overrides ---\n")
-                    for k, v in sorted(env.items()):
-                        if any(k.startswith(pfx) for pfx in ["PROTOGOBLIN", "WINEDLL", "DXVK", "VKD3D", "PROTON", "MANGOHUD"]):
-                            f.write(f"{k}={v}\n")
-                with open(os.path.join(self.session_dir, "debug_env.json"), "w", encoding="utf-8") as f:
-                    json.dump(dict(env), f, indent=2)
-                with open(os.path.join(self.session_dir, "debug_cmdline.json"), "w", encoding="utf-8") as f:
-                    json.dump({"argv": argv}, f, indent=2)
-            except Exception:
-                pass
+        # Always dump debug artifacts for inspection
+        try:
+            os.makedirs(self.session_dir, exist_ok=True)
+            with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "w", encoding="utf-8") as f:
+                f.write("=== ProtoGoblin Dev Debug Log ===\n")
+                f.write(f"Session ID:         {self.session_id}\n")
+                f.write(f"Timestamp:          {self.start_iso}\n")
+                f.write(f"Steam AppID:        {self.steam_appid}\n")
+                f.write(f"Target Executable:  {target_path}\n")
+                f.write(f"Engine Detected:    {self.detected_engine.get('engine')} (confidence: {self.detected_engine.get('confidence')})\n")
+                f.write(f"Anti-Cheat Policy:  {self.anti_cheat}\n")
+                f.write(f"Pruned Subsystems:  {self.pruned_subsystems}\n")
+                f.write(f"Final Arguments:    {argv}\n")
+                f.write("\n--- Environment Overrides ---\n")
+                for k, v in sorted(env.items()):
+                    if any(k.startswith(pfx) for pfx in ["PROTOGOBLIN", "WINEDLL", "DXVK", "VKD3D", "PROTON", "MANGOHUD"]):
+                        f.write(f"{k}={v}\n")
+            with open(os.path.join(self.session_dir, "debug_env.json"), "w", encoding="utf-8") as f:
+                json.dump(dict(env), f, indent=2)
+            with open(os.path.join(self.session_dir, "debug_cmdline.json"), "w", encoding="utf-8") as f:
+                json.dump({"argv": argv}, f, indent=2)
+        except Exception:
+            pass
 
+        log(f"pre_flight complete. Final argv={argv}")
         return argv
 
     def start_process_tree_monitor(self, root_pid, prefix_dir=None):
         """Starts monitoring child processes spawned by root_pid."""
+        log(f"start_process_tree_monitor: root_pid={root_pid}, prefix_dir={prefix_dir}")
         self.tracker = ProcessTreeTracker(root_pid, prefix_dir)
         self.tracker.start()
 
@@ -2566,6 +2642,8 @@ class ProtoGoblinSession:
         if self.tracker:
             self.tracker.stop()
             launcher_path, target_path = self.tracker.evaluate_executables(self.initial_exe)
+            log(f"stop_process_tree_monitor: all_seen_pids={self.tracker.all_seen_pids}, peak_processes={self.tracker.peak_process_count}, peak_threads={self.tracker.peak_thread_count}")
+            log(f"stop_process_tree_monitor: evaluated launcher_path={launcher_path}, target_path={target_path}")
 
             if launcher_path:
                 self.launcher_exe = PEInfo.inspect(launcher_path) or {
@@ -2794,20 +2872,22 @@ class ProtoGoblinSession:
             os.makedirs(self.session_dir, exist_ok=True)
             with open(self.manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
-            sys.stderr.write(f"[ProtoGoblin] Emitted Tier-1 manifest: {self.manifest_path}\n")
+            log(f"Emitted Tier-1 manifest: {self.manifest_path}")
         except OSError as e:
-            sys.stderr.write(f"[ProtoGoblin] Failed to write manifest: {e}\n")
+            log(f"Failed to write manifest: {e}")
 
-        if self.dev_mode:
-            try:
-                with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "a", encoding="utf-8") as f:
-                    f.write("\n=== Post-Flight Completion ===\n")
-                    f.write(f"Exit Code:        {exit_code}\n")
-                    f.write(f"Duration:         {duration_seconds:.2f}s\n")
-                    f.write(f"Process Count:    {self.process_tree_count}\n")
-                    f.write(f"Peak Threads:     {self.peak_thread_count}\n")
-            except Exception:
-                pass
+        log(f"=== Session Post-Flight: {self.session_id} ===")
+        log(f"Exit Code: {exit_code}, Duration: {duration_seconds:.2f}s, Processes: {self.process_tree_count}, Peak Threads: {self.peak_thread_count}")
+
+        try:
+            with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "a", encoding="utf-8") as f:
+                f.write("\n=== Post-Flight Completion ===\n")
+                f.write(f"Exit Code:        {exit_code}\n")
+                f.write(f"Duration:         {duration_seconds:.2f}s\n")
+                f.write(f"Process Count:    {self.process_tree_count}\n")
+                f.write(f"Peak Threads:     {self.peak_thread_count}\n")
+        except Exception:
+            pass
 
         return manifest
 
