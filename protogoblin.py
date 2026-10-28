@@ -2024,7 +2024,7 @@ class ProtoGoblinSession:
                     return f.read().strip()
             except OSError:
                 pass
-        return "ProtoGoblin-0.01"
+        return "ProtoGoblin-0.02"
 
     def find_game_profile(self):
         """Locates the per-game optimization profile TOML if one exists."""

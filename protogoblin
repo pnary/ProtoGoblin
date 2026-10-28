@@ -316,7 +316,7 @@ def cmd_inspect(args):
 
 def cmd_version(args):
     v_file = os.path.join(SCRIPT_DIR, "VERSION")
-    version = "ProtoGoblin-0.01"
+    version = "ProtoGoblin-0.02"
     if os.path.isfile(v_file):
         try:
             with open(v_file, "r") as f:

@@ -240,6 +240,7 @@ get_outdated_components() {
         "vulkan.py"
         "filelock.py"
         "default_pfx.py"
+        "VERSION"
     )
     for f in "${CORE_FILES[@]}"; do
         if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
@@ -348,6 +349,9 @@ install_protogoblin_components() {
     fi
     if [[ -f "${SCRIPT_DIR}/default_pfx.py" ]]; then
         cp -f "${SCRIPT_DIR}/default_pfx.py" "${TOOL_DIR}/default_pfx.py"
+    fi
+    if [[ -f "${SCRIPT_DIR}/VERSION" ]]; then
+        cp -f "${SCRIPT_DIR}/VERSION" "${TOOL_DIR}/VERSION"
     fi
     chmod +x "${TOOL_DIR}/proton" "${TOOL_DIR}/protogoblin.py" "${TOOL_DIR}/protogoblin_command.py" "${TOOL_DIR}/protogoblin"
 

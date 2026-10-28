@@ -40,7 +40,7 @@ Unlike traditional external profilers or opaque compatibility wrappers, ProtoGob
 ## Roadmap
 
 * **Phase 0 — Linux PoC & Tier-1 Manifest (Current):**
-  * Custom Steam compatibility tool registration (`ProtoGoblin-0.01`).
+  * Custom Steam compatibility tool registration (`ProtoGoblin-0.02`).
   * Process-tree tracking through game launchers.
   * Tier-1 always-on subsystem tracking and `utilization.json` generation.
 * **Phase 1 — Profiling MVP & Tier-2 Boundary Histograms:**

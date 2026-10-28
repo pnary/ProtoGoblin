@@ -3,7 +3,7 @@
 set -eu
 
 SRCDIR="$(dirname "$0")"
-DEFAULT_BUILD_NAME="protogoblin-0.01" # If no --build-name specified
+DEFAULT_BUILD_NAME="protogoblin-0.02" # If no --build-name specified
 
 # Output helpers
 COLOR_ERR=""

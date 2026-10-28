@@ -51,7 +51,7 @@ except ImportError:
 import utilities
 import protogoblin
 
-CURRENT_PREFIX_VERSION="10.0-ProtoGoblin-0.01"
+CURRENT_PREFIX_VERSION="10.0-ProtoGoblin-0.02"
 
 PFX="ProtoGoblin: "
 ld_path_var = "LD_LIBRARY_PATH"
