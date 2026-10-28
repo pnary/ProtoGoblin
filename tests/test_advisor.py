@@ -484,7 +484,7 @@ class TestProfileBannerHUD(unittest.TestCase):
 
             self.assertEqual(env.get("MANGOHUD"), "1")
             config = env.get("MANGOHUD_CONFIG", "")
-            self.assertIn("custom_text=ProtoGoblin:", config)
+            self.assertIn("custom_text=ProtoGoblin\\:", config)
             self.assertIn("toggle_logging=Alt_L+F11", config)
             self.assertIn("exec=", config)
             self.assertIn("position=top-right", config)
@@ -548,7 +548,7 @@ class TestProfileBannerHUD(unittest.TestCase):
             self.assertEqual(env.get("MANGOHUD"), "1")
             config = env.get("MANGOHUD_CONFIG", "")
             self.assertIn("no_display=1", config)
-            self.assertNotIn("custom_text=ProtoGoblin:", config)
+            self.assertNotIn("custom_text=ProtoGoblin", config)
         finally:
             if old_mode is not None:
                 os.environ["PROTOGOBLIN_MODE"] = old_mode
@@ -574,7 +574,7 @@ class TestSessionInitialModeSelection(unittest.TestCase):
                 sess.pre_flight(["BrandNewGame.exe"], env)
                 self.assertEqual(sess.mode, "profile")
                 self.assertEqual(env.get("MANGOHUD"), "1")
-                self.assertIn("custom_text=ProtoGoblin:", env.get("MANGOHUD_CONFIG", ""))
+                self.assertIn("custom_text=ProtoGoblin\\:", env.get("MANGOHUD_CONFIG", ""))
             finally:
                 if old_mode_env:
                     os.environ["PROTOGOBLIN_MODE"] = old_mode_env
@@ -646,6 +646,22 @@ class TestSessionInitialModeSelection(unittest.TestCase):
                     os.environ["XDG_CONFIG_HOME"] = old_xdg_cfg
                 else:
                     os.environ.pop("XDG_CONFIG_HOME", None)
+
+    def test_non_exe_binary_detection_and_layer_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            dummy_bin = os.path.join(td, "MinamiLane.x86_64")
+            with open(dummy_bin, "wb") as f:
+                f.write(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 56)
+            os.chmod(dummy_bin, 0o755)
+
+            sess = ProtoGoblinSession(steam_appid=2678990)
+            env = {}
+            sess.pre_flight([dummy_bin], env)
+            self.assertEqual(sess.initial_exe, dummy_bin)
+            self.assertEqual(sess.target_exe.get("arch"), "x86_64")
+            if sess.mode == "profile":
+                self.assertIn("VK_ADD_LAYER_PATH", env)
+                self.assertIn("LD_LIBRARY_PATH", env)
 
     def test_first_run_with_anticheat_suppresses_profiling(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1116,7 +1132,7 @@ class TestEngineTweakManager(unittest.TestCase):
                 sess.pre_flight(["TestGame.exe"], env)
                 self.assertEqual(sess.mode, "profile")
                 self.assertEqual(env.get("MANGOHUD"), "1")
-                self.assertIn("custom_text=ProtoGoblin:", env.get("MANGOHUD_CONFIG", ""))
+                self.assertIn("custom_text=ProtoGoblin\\:", env.get("MANGOHUD_CONFIG", ""))
             finally:
                 os.environ.pop("PROTOGOBLIN_PROFILE", None)
                 if old_mode_env:

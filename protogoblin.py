@@ -55,6 +55,8 @@ class PEInfo:
                 # DOS Header
                 dos_header = f.read(64)
                 if len(dos_header) < 64 or dos_header[0:2] != b"MZ":
+                    if len(dos_header) >= 5 and dos_header[0:4] == b"\x7fELF":
+                        result["arch"] = "x86_64" if dos_header[4] == 2 else "x86"
                     return result  # Not a PE binary (could be shell script/ELF)
 
                 e_lfanew = struct.unpack_from("<I", dos_header, 0x3C)[0]
@@ -2281,6 +2283,19 @@ class ProtoGoblinSession:
                 target_path = arg
                 break
 
+        # Fallback for native Linux executables or non-.exe binaries
+        if not target_path:
+            for arg in argv:
+                if not arg or arg.startswith("-"):
+                    continue
+                if os.path.isfile(arg):
+                    base = os.path.basename(arg).lower()
+                    if base in ["proton", "protogoblin", "protogoblin.py", "python", "python3", "bash", "sh"]:
+                        continue
+                    if os.access(arg, os.X_OK) or base.endswith((".x86_64", ".x86", ".bin", ".elf")):
+                        target_path = arg
+                        break
+
         self.initial_exe = target_path
 
         # Check if user requested dropping profile / re-profiling via environment
@@ -2335,6 +2350,46 @@ class ProtoGoblinSession:
             assigned_key = self.get_assigned_profile_key()
             mangohud_key = self._format_mangohud_hotkey(assigned_key)
 
+            # Ensure Vulkan loader and MangoHud layer discover layer manifests and libraries
+            proto_root = os.path.dirname(os.path.abspath(__file__))
+            layer_dirs = [
+                os.path.join(proto_root, "files", "share", "mangohud", "implicit_layer.d"),
+                os.path.join(proto_root, "share", "protogoblin", "mangohud", "implicit_layer.d"),
+                os.path.join(proto_root, "share", "mangohud", "implicit_layer.d"),
+                os.path.expanduser("~/.local/share/vulkan/implicit_layer.d"),
+                "/usr/share/vulkan/implicit_layer.d",
+            ]
+            valid_layer_dirs = [d for d in layer_dirs if os.path.isdir(d)]
+            if valid_layer_dirs:
+                for l_var in ["VK_ADD_LAYER_PATH", "VK_IMPLICIT_LAYER_PATH"]:
+                    existing = env.get(l_var, "")
+                    parts = [p for p in existing.split(":") if p] if existing else []
+                    for d in valid_layer_dirs:
+                        if d not in parts:
+                            parts.append(d)
+                    env[l_var] = ":".join(parts)
+
+            lib_dirs = [
+                os.path.join(proto_root, "files", "lib", "x86_64-linux-gnu"),
+                os.path.join(proto_root, "files", "lib", "i386-linux-gnu"),
+                os.path.join(proto_root, "files", "lib64"),
+                os.path.join(proto_root, "files", "lib"),
+                os.path.join(proto_root, "share", "protogoblin", "mangohud", "lib64"),
+                os.path.join(proto_root, "share", "protogoblin", "mangohud", "lib32"),
+                os.path.expanduser("~/.local/lib/mangohud"),
+                os.path.expanduser("~/.local/lib32/mangohud"),
+                "/usr/lib/mangohud",
+                "/usr/lib32/mangohud",
+            ]
+            valid_lib_dirs = [d for d in lib_dirs if os.path.isdir(d)]
+            if valid_lib_dirs:
+                existing_ld = env.get("LD_LIBRARY_PATH", "")
+                ld_parts = [p for p in existing_ld.split(":") if p] if existing_ld else []
+                for d in valid_lib_dirs:
+                    if d not in ld_parts:
+                        ld_parts.insert(0, d)
+                env["LD_LIBRARY_PATH"] = ":".join(ld_parts)
+
             hud_script_path = os.path.join(self.session_dir, "hud_status.sh")
             try:
                 with open(hud_script_path, "w", encoding="utf-8") as f:
@@ -2380,7 +2435,7 @@ class ProtoGoblinSession:
                 config_parts.extend([
                     "legacy_layout=0",
                     "position=top-right",
-                    "custom_text=ProtoGoblin:",
+                    "custom_text=ProtoGoblin\\:",
                     f"exec={hud_script_path}",
                     "text_color=39FF14",
                     "font_size=26",

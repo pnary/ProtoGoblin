@@ -296,6 +296,17 @@ get_outdated_components() {
         fi
     fi
 
+    if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud" ]]; then
+        local mh_json="${TOOL_DIR}/files/share/mangohud/implicit_layer.d/MangoHud.x86_64.json"
+        if [[ ! -f "$mh_json" ]]; then
+            outdated+=("files/share/mangohud/implicit_layer.d/MangoHud.x86_64.json")
+        fi
+        local mh_lib64="${TOOL_DIR}/files/lib/x86_64-linux-gnu/libMangoHud.so"
+        if [[ ! -f "$mh_lib64" ]]; then
+            outdated+=("files/lib/x86_64-linux-gnu/libMangoHud.so")
+        fi
+    fi
+
     local vdf="${TOOL_DIR}/compatibilitytool.vdf"
     if [[ ! -f "$vdf" ]] || ! grep -q "\"${BUILD_NAME}\"" "$vdf" 2>/dev/null; then
         outdated+=("compatibilitytool.vdf")
@@ -393,6 +404,47 @@ install_protogoblin_components() {
                 log_info "Building libprotogoblin_io_cache.so..."
                 g++ -O2 -fPIC -shared -std=c++17 "${SCRIPT_DIR}/vklayers/io-cache/io_cache.cpp" -o "$so_path" -ldl -lpthread 2>/dev/null || true
             fi
+        fi
+    fi
+
+    # Install MangoHud overlay libraries and layer manifests
+    if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud" ]]; then
+        log_info "Synchronizing bundled MangoHud overlay libraries and layer manifests..."
+        mkdir -p "${TOOL_DIR}/share/protogoblin/mangohud"
+        cp -rf "${SCRIPT_DIR}/share/protogoblin/mangohud/"* "${TOOL_DIR}/share/protogoblin/mangohud/" 2>/dev/null || true
+
+        # Install into files/ for Proton runtime
+        mkdir -p "${TOOL_DIR}/files/share/mangohud/implicit_layer.d"
+        mkdir -p "${TOOL_DIR}/share/vulkan/implicit_layer.d"
+        mkdir -p "${HOME}/.local/share/vulkan/implicit_layer.d"
+        if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d" ]]; then
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${TOOL_DIR}/files/share/mangohud/implicit_layer.d/" 2>/dev/null || true
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${TOOL_DIR}/share/vulkan/implicit_layer.d/" 2>/dev/null || true
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${HOME}/.local/share/vulkan/implicit_layer.d/" 2>/dev/null || true
+        fi
+
+        # Install 64-bit MangoHud library
+        if [[ -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" ]]; then
+            mkdir -p "${TOOL_DIR}/files/lib/x86_64-linux-gnu" "${TOOL_DIR}/files/lib64" "${HOME}/.local/lib/mangohud"
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" "${TOOL_DIR}/files/lib/x86_64-linux-gnu/"
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" "${TOOL_DIR}/files/lib64/" 2>/dev/null || true
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/libMangoHud.so" "${HOME}/.local/lib/mangohud/"
+        fi
+
+        # Install 32-bit MangoHud library
+        if [[ -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" ]]; then
+            mkdir -p "${TOOL_DIR}/files/lib/i386-linux-gnu" "${TOOL_DIR}/files/lib" "${HOME}/.local/lib32/mangohud"
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" "${TOOL_DIR}/files/lib/i386-linux-gnu/"
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" "${TOOL_DIR}/files/lib/" 2>/dev/null || true
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/libMangoHud.so" "${HOME}/.local/lib32/mangohud/"
+        fi
+
+        # Install mangohud CLI wrapper if present
+        if [[ -f "${SCRIPT_DIR}/share/protogoblin/mangohud/bin/mangohud" ]]; then
+            mkdir -p "${TOOL_DIR}/tools" "${HOME}/.local/bin"
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/bin/mangohud" "${TOOL_DIR}/tools/"
+            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/bin/mangohud" "${HOME}/.local/bin/"
+            chmod +x "${TOOL_DIR}/tools/mangohud" "${HOME}/.local/bin/mangohud" 2>/dev/null || true
         fi
     fi
 
