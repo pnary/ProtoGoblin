@@ -775,6 +775,7 @@ class EngineTweakManager:
             candidate_dirs = [
                 os.path.join(p_dir, "share", "protogoblin", "lib64"),
                 os.path.join(p_dir, "share", "protogoblin", "lib32"),
+                os.path.join(p_dir, "share", "protogoblin", "staging-sync-fix"),
                 os.path.join(p_dir, "vklayers", "staging-sync-fix"),
             ]
             for cdir in candidate_dirs:

@@ -184,15 +184,22 @@ find_base_proton() {
 
     for base in "${SEARCH_DIRS[@]}"; do
         if [[ -d "$base" ]]; then
-            # Look for GE-Proton or Proton Experimental
+            # Look for GE-Proton or Proton Experimental (excluding current tool destination if present)
             local match
-            match="$(find "$base" -maxdepth 2 -type f -name "proton" 2>/dev/null | head -n 1 || true)"
+            match="$(find "$base" -maxdepth 2 -type f -name "proton" 2>/dev/null | grep -v "/${BUILD_NAME}/" | head -n 1 || true)"
             if [[ -n "$match" ]]; then
                 dirname "$match"
                 return
             fi
         fi
     done
+
+    # Fallback to current tool directory if already populated
+    if [[ -f "${TOOL_DIR}/proton" ]]; then
+        echo "${TOOL_DIR}"
+        return
+    fi
+
     echo ""
 }
 
@@ -274,6 +281,17 @@ elif [[ "$DEV_OVERLAY" == true ]]; then
     if [[ -d "${SCRIPT_DIR}/vklayers/staging-sync-fix" ]]; then
         mkdir -p "${TOOL_DIR}/share/protogoblin/staging-sync-fix"
         cp -rf "${SCRIPT_DIR}/vklayers/staging-sync-fix/"* "${TOOL_DIR}/share/protogoblin/staging-sync-fix/" 2>/dev/null || true
+        mkdir -p "${TOOL_DIR}/vklayers/staging-sync-fix"
+        cp -rf "${SCRIPT_DIR}/vklayers/staging-sync-fix/"* "${TOOL_DIR}/vklayers/staging-sync-fix/" 2>/dev/null || true
+    fi
+    if [[ -d "${SCRIPT_DIR}/vklayers/io-cache" ]]; then
+        mkdir -p "${TOOL_DIR}/vklayers/io-cache"
+        cp -rf "${SCRIPT_DIR}/vklayers/io-cache/"* "${TOOL_DIR}/vklayers/io-cache/" 2>/dev/null || true
+        if command -v g++ &>/dev/null; then
+            mkdir -p "${TOOL_DIR}/share/protogoblin/lib64"
+            log_info "Building libprotogoblin_io_cache.so..."
+            g++ -O2 -fPIC -shared -std=c++17 "${SCRIPT_DIR}/vklayers/io-cache/io_cache.cpp" -o "${TOOL_DIR}/share/protogoblin/lib64/libprotogoblin_io_cache.so" -ldl -lpthread 2>/dev/null || true
+        fi
     fi
 
 else
