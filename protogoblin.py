@@ -568,6 +568,394 @@ class PresetDatabase:
         return cls._CACHE
 
 
+
+
+class ExperimentStatus:
+    DETECTED = "detected"
+    APPLIED = "applied"
+    BENCHMARKED = "benchmarked"
+    VALIDATED = "validated"
+    REJECTED = "rejected"
+
+
+def compute_session_diff(manifest_a, manifest_b):
+    """Computes an A/B delta comparison between two ProtoGoblin session manifests.
+
+    manifest_a: Baseline session (e.g. before / raw / unoptimized)
+    manifest_b: Target session (e.g. after / tweaked / optimized)
+    """
+    sess_a = manifest_a.get("session") or {}
+    sess_b = manifest_b.get("session") or {}
+    tgt_a = manifest_a.get("target") or {}
+    tgt_b = manifest_b.get("target") or {}
+    t_exe_a = os.path.basename((tgt_a.get("target_executable") or {}).get("path", "Unknown"))
+    t_exe_b = os.path.basename((tgt_b.get("target_executable") or {}).get("path", "Unknown"))
+    app_id_a = tgt_a.get("steam_appid") or "-"
+    app_id_b = tgt_b.get("steam_appid") or "-"
+
+    roi_a = manifest_a.get("roi_telemetry") or manifest_a.get("roi") or {}
+    roi_b = manifest_b.get("roi_telemetry") or manifest_b.get("roi") or {}
+
+    has_roi_a = bool(roi_a.get("roi_enabled") and roi_a.get("frame_metrics"))
+    has_roi_b = bool(roi_b.get("roi_enabled") and roi_b.get("frame_metrics"))
+
+    fm_a = roi_a.get("frame_metrics") or {}
+    fm_b = roi_b.get("frame_metrics") or {}
+    pacing_a = roi_a.get("pacing") or {}
+    pacing_b = roi_b.get("pacing") or {}
+
+    def _delta(a_val, b_val):
+        a_f = float(a_val or 0.0)
+        b_f = float(b_val or 0.0)
+        diff = b_f - a_f
+        pct = (diff / a_f * 100.0) if a_f > 0 else 0.0
+        return round(diff, 2), round(pct, 1)
+
+    diff_fps_avg, pct_fps_avg = _delta(fm_a.get("fps_avg"), fm_b.get("fps_avg"))
+    diff_fps_1p, pct_fps_1p = _delta(fm_a.get("fps_1_pct_low"), fm_b.get("fps_1_pct_low"))
+    diff_fps_01p, pct_fps_01p = _delta(fm_a.get("fps_0_1_pct_low"), fm_b.get("fps_0_1_pct_low"))
+    diff_ft_avg, pct_ft_avg = _delta(fm_a.get("frametime_avg_ms"), fm_b.get("frametime_avg_ms"))
+    diff_jitter, pct_jitter = _delta(fm_a.get("frametime_jitter_ms"), fm_b.get("frametime_jitter_ms"))
+
+    bot_a = roi_a.get("bottleneck_classification", "unknown")
+    bot_b = roi_b.get("bottleneck_classification", "unknown")
+
+    cpu_busy_a = float(pacing_a.get("cpu_busy_pct", 0.0))
+    cpu_busy_b = float(pacing_b.get("cpu_busy_pct", 0.0))
+    cpu_wait_a = float(pacing_a.get("cpu_wait_pct", 0.0))
+    cpu_wait_b = float(pacing_b.get("cpu_wait_pct", 0.0))
+    gpu_busy_a = float(pacing_a.get("gpu_busy_pct", 0.0))
+    gpu_busy_b = float(pacing_b.get("gpu_busy_pct", 0.0))
+
+    # Determine verdict and qualitative notes
+    verdict = "NEUTRAL"
+    notes = []
+    if pct_fps_avg >= 5.0 or pct_fps_1p >= 10.0 or (float(fm_a.get("frametime_jitter_ms", 0)) > 5.0 and pct_jitter <= -20.0):
+        verdict = "IMPROVED"
+        if pct_fps_avg >= 5.0:
+            notes.append(f"Average FPS +{pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+        if pct_fps_1p >= 10.0:
+            notes.append(f"1% lows +{pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+        if pct_jitter <= -20.0:
+            notes.append(f"Frametime jitter {pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
+    elif pct_fps_avg <= -5.0 or pct_fps_1p <= -10.0:
+        verdict = "REGRESSED"
+        if pct_fps_avg <= -5.0:
+            notes.append(f"Average FPS {pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+        if pct_fps_1p <= -10.0:
+            notes.append(f"1% lows {pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+
+    if bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]:
+        notes.append(f"Sync lockstep stall resolved ({bot_a} -> {bot_b})")
+        if verdict == "NEUTRAL":
+            verdict = "IMPROVED"
+
+    diff_result = {
+        "session_a": {
+            "id": sess_a.get("id", "Session A"),
+            "target_exe": t_exe_a,
+            "steam_appid": app_id_a,
+            "mode": sess_a.get("mode", "play"),
+            "has_roi": has_roi_a,
+            "bottleneck": bot_a,
+            "anti_cheat": manifest_a.get("anti_cheat") or {},
+        },
+        "session_b": {
+            "id": sess_b.get("id", "Session B"),
+            "target_exe": t_exe_b,
+            "steam_appid": app_id_b,
+            "mode": sess_b.get("mode", "play"),
+            "has_roi": has_roi_b,
+            "bottleneck": bot_b,
+            "anti_cheat": manifest_b.get("anti_cheat") or {},
+        },
+        "metrics": {
+            "fps_avg": {"a": fm_a.get("fps_avg", 0.0), "b": fm_b.get("fps_avg", 0.0), "delta": diff_fps_avg, "pct": pct_fps_avg},
+            "fps_1_pct_low": {"a": fm_a.get("fps_1_pct_low", 0.0), "b": fm_b.get("fps_1_pct_low", 0.0), "delta": diff_fps_1p, "pct": pct_fps_1p},
+            "fps_0_1_pct_low": {"a": fm_a.get("fps_0_1_pct_low", 0.0), "b": fm_b.get("fps_0_1_pct_low", 0.0), "delta": diff_fps_01p, "pct": pct_fps_01p},
+            "frametime_avg_ms": {"a": fm_a.get("frametime_avg_ms", 0.0), "b": fm_b.get("frametime_avg_ms", 0.0), "delta": diff_ft_avg, "pct": pct_ft_avg},
+            "frametime_jitter_ms": {"a": fm_a.get("frametime_jitter_ms", 0.0), "b": fm_b.get("frametime_jitter_ms", 0.0), "delta": diff_jitter, "pct": pct_jitter},
+        },
+        "bottleneck": {
+            "a": bot_a,
+            "b": bot_b,
+            "transition": f"{bot_a} -> {bot_b}",
+            "resolved": (bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]),
+        },
+        "hardware": {
+            "cpu_busy_pct": {"a": cpu_busy_a, "b": cpu_busy_b, "delta": round(cpu_busy_b - cpu_busy_a, 1)},
+            "cpu_wait_pct": {"a": cpu_wait_a, "b": cpu_wait_b, "delta": round(cpu_wait_b - cpu_wait_a, 1)},
+            "gpu_busy_pct": {"a": gpu_busy_a, "b": gpu_busy_b, "delta": round(gpu_busy_b - gpu_busy_a, 1)},
+        },
+        "verdict": verdict,
+        "notes": notes,
+        "summary": "; ".join(notes) if notes else "Performance metrics comparable.",
+    }
+    return diff_result
+
+
+def format_diff_report(diff):
+    """Formats an A/B session comparison dict into a clean human-readable ASCII report."""
+    s_a = diff["session_a"]
+    s_b = diff["session_b"]
+    m = diff["metrics"]
+    bot = diff["bottleneck"]
+    hw = diff["hardware"]
+
+    v_icon = "🚀 " if diff["verdict"] == "IMPROVED" else ("⚠️ " if diff["verdict"] == "REGRESSED" else "⚖️ ")
+    verdict_str = f"{v_icon}{diff['verdict']}: {diff['summary']}"
+
+    lines = [
+        "=" * 82,
+        " PROTOGOBLIN A/B SESSION COMPARISON & REGRESSION DIFF",
+        "=" * 82,
+        f" Baseline Session (A - Before):  {s_a['id']} [{s_a['mode'].upper()}] - {s_a['target_exe']} ({s_a['steam_appid']})",
+        f" Target   Session (B - After):   {s_b['id']} [{s_b['mode'].upper()}] - {s_b['target_exe']} ({s_b['steam_appid']})",
+        f" Comparison Verdict:            {verdict_str}",
+        "=" * 82,
+        "",
+    ]
+
+    if not s_a.get("has_roi") or not s_b.get("has_roi"):
+        lines.extend([
+            " [!] NOTICE: One or both sessions were executed without ROI telemetry.",
+            "",
+        ])
+
+    lines.extend([
+        " FRAMETIME & PACING BENCHMARK",
+        "-" * 82,
+        f" {'Metric':<28} {'Session A (Before)':<20} {'Session B (After)':<20} {'Delta':<14}",
+        "-" * 82,
+    ])
+
+    def _fmt_row(title, metric_dict, unit, higher_is_better=True):
+        a_val = float(metric_dict.get("a") or 0.0)
+        b_val = float(metric_dict.get("b") or 0.0)
+        delta = float(metric_dict.get("delta") or 0.0)
+        pct = float(metric_dict.get("pct") or 0.0)
+        sign = "+" if delta > 0 else ""
+        arrow = "▲" if ((delta > 0 and higher_is_better) or (delta < 0 and not higher_is_better)) else ("▼" if delta != 0 else "=")
+        a_str = f"{a_val:.1f} {unit}"
+        b_str = f"{b_val:.1f} {unit}"
+        d_str = f"{sign}{delta:.1f} {unit} ({sign}{pct:.1f}%) {arrow}"
+        return f" {title:<28} {a_str:<20} {b_str:<20} {d_str:<14}"
+
+    lines.append(_fmt_row("Average Framerate:", m["fps_avg"], "FPS", higher_is_better=True))
+    lines.append(_fmt_row("1% Low Framerate:", m["fps_1_pct_low"], "FPS", higher_is_better=True))
+    lines.append(_fmt_row("0.1% Low Framerate:", m["fps_0_1_pct_low"], "FPS", higher_is_better=True))
+    lines.append(_fmt_row("Average Frametime:", m["frametime_avg_ms"], "ms", higher_is_better=False))
+    lines.append(_fmt_row("Frametime Jitter (StdDev):", m["frametime_jitter_ms"], "ms", higher_is_better=False))
+
+    lines.extend(["=" * 82, ""])
+    return "\n".join(lines)
+
+
+class ExperimentalValidationEngine:
+    """Manages the A/B experimental validation lifecycle for optimizations:
+    Detected -> Applied -> Benchmarked -> Validated (or Rejected/Rollback).
+
+    Ensures optimizations are backed by empirical measurement before becoming
+    permanent Play Mode defaults.
+    """
+
+    @classmethod
+    def start_experiment(cls, profile_path, fix_id, baseline_session_id=None, baseline_metrics=None, auto_rollback=True):
+        """Starts an isolated experiment for fix_id against a baseline session."""
+        prof = EngineTweakManager.load_profile(profile_path) or {}
+        if "experiments" not in prof:
+            prof["experiments"] = {"fixes": {}}
+        if "fixes" not in prof["experiments"]:
+            prof["experiments"]["fixes"] = {}
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        prof["experiments"]["active_experiment"] = fix_id
+        if baseline_session_id:
+            prof["experiments"]["baseline_session_id"] = baseline_session_id
+
+        # Enable the specific tweak under test in the profile
+        cls._enable_tweak_in_profile(prof, fix_id)
+
+        prof["experiments"]["fixes"][fix_id] = {
+            "fix_id": fix_id,
+            "status": ExperimentStatus.APPLIED,
+            "detected_at": prof["experiments"]["fixes"].get(fix_id, {}).get("detected_at", now_iso),
+            "applied_at": now_iso,
+            "baseline_session_id": baseline_session_id,
+            "baseline_metrics": baseline_metrics or {},
+            "benchmarked_metrics": {},
+            "verdict": "PENDING",
+            "auto_rollback": auto_rollback,
+        }
+
+        cls._save_profile_dict(profile_path, prof)
+        log(f"Started experiment for fix '{fix_id}' (Baseline: {baseline_session_id or 'none'})")
+        return prof["experiments"]["fixes"][fix_id]
+
+    @classmethod
+    def evaluate_experiment(cls, profile_path, session_manifest, baseline_manifest=None):
+        """Evaluates an active experiment by comparing session against baseline.
+        Graduates to VALIDATED if performance improved, or rolls back to REJECTED if regressed.
+        """
+        if not profile_path or not os.path.isfile(profile_path):
+            return None
+        prof = EngineTweakManager.load_profile(profile_path)
+        if not prof:
+            return None
+
+        exp_sec = prof.get("experiments", {})
+        active_exp = exp_sec.get("active_experiment")
+        if not active_exp:
+            return None
+
+        fixes = exp_sec.get("fixes", {})
+        fix_info = fixes.get(active_exp, {})
+        current_status = fix_info.get("status", ExperimentStatus.APPLIED)
+
+        if current_status in (ExperimentStatus.VALIDATED, ExperimentStatus.REJECTED):
+            return fix_info
+
+        # Resolve baseline manifest if not passed
+        base_id = fix_info.get("baseline_session_id") or exp_sec.get("baseline_session_id")
+        if not baseline_manifest and base_id:
+            xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+            app_id = str((session_manifest.get("target") or {}).get("steam_appid") or "")
+            cand = os.path.join(xdg_data, "protogoblin", "sessions", app_id, base_id, "utilization.json")
+            if os.path.isfile(cand):
+                try:
+                    with open(cand, "r", encoding="utf-8") as f:
+                        baseline_manifest = json.load(f)
+                except Exception:
+                    pass
+
+        if not baseline_manifest:
+            fix_info["status"] = ExperimentStatus.BENCHMARKED
+            cls._save_profile_dict(profile_path, prof)
+            return fix_info
+
+        diff = compute_session_diff(baseline_manifest, session_manifest)
+        verdict = diff.get("verdict", "NEUTRAL")
+        m = diff.get("metrics", {})
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        fix_info["benchmarked_session_id"] = (session_manifest.get("session") or {}).get("id")
+        fix_info["benchmarked_at"] = now_iso
+        fix_info["verdict"] = verdict
+        fix_info["metrics_benchmarked"] = {
+            "fps_avg": m.get("fps_avg", {}).get("b", 0.0),
+            "fps_1_pct_low": m.get("fps_1_pct_low", {}).get("b", 0.0),
+            "frametime_jitter_ms": m.get("frametime_jitter_ms", {}).get("b", 0.0),
+        }
+        fix_info["comparison_summary"] = diff.get("summary", "")
+
+        if verdict == "IMPROVED":
+            fix_info["status"] = ExperimentStatus.VALIDATED
+            fix_info["validated_at"] = now_iso
+            exp_sec["active_experiment"] = None
+            cls._save_profile_dict(profile_path, prof)
+            log(f"Experiment VALIDATED for '{active_exp}': {diff.get('summary')} (Promoted to Play Mode default)")
+        elif verdict == "REGRESSED":
+            fix_info["status"] = ExperimentStatus.REJECTED
+            fix_info["rejected_at"] = now_iso
+            if fix_info.get("auto_rollback", True):
+                cls._rollback_tweak_in_profile(prof, active_exp)
+                exp_sec["active_experiment"] = None
+                log(f"Experiment REGRESSED for '{active_exp}': {diff.get('summary')} (Automatically rolled back to stock)")
+            cls._save_profile_dict(profile_path, prof)
+        else: # NEUTRAL
+            fix_info["status"] = ExperimentStatus.BENCHMARKED
+            cls._save_profile_dict(profile_path, prof)
+
+        return fix_info
+
+    @classmethod
+    def get_experiment_status(cls, profile_path, fix_id):
+        """Returns the current lifecycle status for a given fix in a game profile."""
+        if not profile_path or not os.path.isfile(profile_path):
+            return ExperimentStatus.DETECTED
+        prof = EngineTweakManager.load_profile(profile_path)
+        if not prof:
+            return ExperimentStatus.DETECTED
+        fix_info = prof.get("experiments", {}).get("fixes", {}).get(fix_id)
+        if fix_info and fix_info.get("status"):
+            return fix_info["status"]
+        return ExperimentStatus.DETECTED
+
+    @classmethod
+    def _enable_tweak_in_profile(cls, prof, fix_id):
+        """Enables the specific tweak in the profile dictionary."""
+        if fix_id == "atelier_sync_fix":
+            prof.setdefault("synchronization", {})["atelier_sync_fix"] = True
+        elif fix_id == "state_dedup":
+            prof.setdefault("synchronization", {})["state_dedup"] = True
+        elif fix_id == "swapchain_debounce":
+            prof.setdefault("synchronization", {})["swapchain_debounce"] = True
+        elif fix_id in ("state_dedup_and_debounce", "state_dedup"):
+            prof.setdefault("synchronization", {})["state_dedup"] = True
+            prof.setdefault("synchronization", {})["swapchain_debounce"] = True
+        elif fix_id == "precision_timers" or fix_id == "enable_precision_timers":
+            prof.setdefault("timing", {})["precision_timers"] = True
+        elif fix_id == "io_cache" or fix_id == "enable_io_cache":
+            prof.setdefault("filesystem", {})["io_cache"] = True
+        elif fix_id == "enable_descriptor_buffer":
+            prof.setdefault("graphics", {})["descriptor_buffer"] = True
+        elif fix_id == "local_shader_cache":
+            prof.setdefault("graphics", {})["local_shader_cache"] = True
+        elif fix_id == "async_shader_compile":
+            prof.setdefault("graphics", {})["async_shader_compile"] = True
+
+    @classmethod
+    def _rollback_tweak_in_profile(cls, prof, fix_id):
+        """Disables/rolls back a tweak in the profile dictionary."""
+        if fix_id == "atelier_sync_fix":
+            if "synchronization" in prof:
+                prof["synchronization"]["atelier_sync_fix"] = False
+        elif fix_id == "state_dedup":
+            if "synchronization" in prof:
+                prof["synchronization"]["state_dedup"] = False
+        elif fix_id == "swapchain_debounce":
+            if "synchronization" in prof:
+                prof["synchronization"]["swapchain_debounce"] = False
+        elif fix_id in ("state_dedup_and_debounce", "state_dedup"):
+            if "synchronization" in prof:
+                prof["synchronization"]["state_dedup"] = False
+                prof["synchronization"]["swapchain_debounce"] = False
+        elif fix_id in ("precision_timers", "enable_precision_timers"):
+            if "timing" in prof:
+                prof["timing"]["precision_timers"] = False
+        elif fix_id in ("io_cache", "enable_io_cache"):
+            if "filesystem" in prof:
+                prof["filesystem"]["io_cache"] = False
+        elif fix_id == "enable_descriptor_buffer":
+            if "graphics" in prof:
+                prof["graphics"]["descriptor_buffer"] = False
+        elif fix_id == "local_shader_cache":
+            if "graphics" in prof:
+                prof["graphics"]["local_shader_cache"] = False
+        elif fix_id == "async_shader_compile":
+            if "graphics" in prof:
+                prof["graphics"]["async_shader_compile"] = False
+
+    @classmethod
+    def _save_profile_dict(cls, profile_path, prof):
+        """Serializes and writes updated profile dictionary to file."""
+        game_sec = prof.get("game", {})
+        game_id = game_sec.get("id", os.path.splitext(os.path.basename(profile_path))[0])
+        app_id = game_sec.get("steam_appid", 0)
+        t_exe = game_sec.get("target_executable", f"game_{game_id}.exe")
+        sync_b = prof.get("synchronization", {}).get("preferred_backend", "ntsync")
+
+        toml_text = EngineTweakManager.generate_profile_toml(
+            game_id=str(game_id),
+            app_id=str(app_id),
+            target_exe=t_exe,
+            sync_backend=sync_b,
+            user_tweaks=prof,
+        )
+        os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+        with open(profile_path, "w", encoding="utf-8") as f:
+            f.write(toml_text)
+
 class EngineTweakManager:
     """Manages engine-specific visual tweaks, command-line overrides, and graphics layer intercepts."""
 
@@ -636,6 +1024,24 @@ class EngineTweakManager:
         ],
         "disable_virtual_shadows": ["r.Shadow.Virtual.Enable 0"],
     }
+
+    @classmethod
+    def is_feature_enabled(cls, val):
+        """Safely evaluates whether a feature setting is active.
+        Accepts booleans, integers, strings, or dictionaries (e.g. {'enabled': False}).
+        Guards against nonempty dictionaries with enabled=false being evaluated as truthy.
+        """
+        if val is None:
+            return False
+        if isinstance(val, dict):
+            return bool(val.get("enabled", False))
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.lower().strip() in ("1", "true", "yes", "on", "enable", "enabled")
+        return bool(val)
 
     @classmethod
     def load_profile(cls, path):
@@ -853,7 +1259,7 @@ class EngineTweakManager:
         elif preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
             atelier_sync = True
 
-        if atelier_sync:
+        if cls.is_feature_enabled(atelier_sync):
             lines.extend([
                 "",
                 "[synchronization.atelier_sync_fix]",
@@ -866,7 +1272,7 @@ class EngineTweakManager:
             state_dedup = tweaks["state_dedup"]
         elif "synchronization" in tweaks and "state_dedup" in tweaks["synchronization"]:
             state_dedup = tweaks["synchronization"]["state_dedup"]
-        if state_dedup:
+        if cls.is_feature_enabled(state_dedup):
             lines.extend([
                 "",
                 "[synchronization.state_dedup]",
@@ -879,7 +1285,7 @@ class EngineTweakManager:
             swapchain_debounce = tweaks["swapchain_debounce"]
         elif "synchronization" in tweaks and "swapchain_debounce" in tweaks["synchronization"]:
             swapchain_debounce = tweaks["synchronization"]["swapchain_debounce"]
-        if swapchain_debounce:
+        if cls.is_feature_enabled(swapchain_debounce):
             lines.extend([
                 "",
                 "[synchronization.swapchain_debounce]",
@@ -892,7 +1298,7 @@ class EngineTweakManager:
             io_cache = tweaks["io_cache"]
         elif "filesystem" in tweaks and "io_cache" in tweaks["filesystem"]:
             io_cache = tweaks["filesystem"]["io_cache"]
-        if io_cache:
+        if cls.is_feature_enabled(io_cache):
             lines.extend([
                 "",
                 "[filesystem.io_cache]",
@@ -907,13 +1313,41 @@ class EngineTweakManager:
             precision_timers = tweaks["timing"]["precision_timers"]
         elif "synchronization" in tweaks and "precision_timers" in tweaks["synchronization"]:
             precision_timers = tweaks["synchronization"]["precision_timers"]
-        if precision_timers:
+        if cls.is_feature_enabled(precision_timers):
             lines.extend([
                 "",
                 "[timing.precision_timers]",
                 "enabled = true",
                 "# Enforce sub-millisecond QPC sleep-spin hybrid pacing to eliminate timer wake overshoot",
             ])
+
+        # Serialize Experimental Validation Lifecycle state if present
+        exp_sec = tweaks.get("experiments", {})
+        if exp_sec:
+            lines.extend([
+                "",
+                "[experiments]",
+            ])
+            if exp_sec.get("active_experiment"):
+                lines.append(f'active_experiment = "{exp_sec["active_experiment"]}"')
+            if exp_sec.get("baseline_session_id"):
+                lines.append(f'baseline_session_id = "{exp_sec["baseline_session_id"]}"')
+            fixes = exp_sec.get("fixes", {})
+            for f_id, f_data in sorted(fixes.items()):
+                lines.extend([
+                    "",
+                    f"[experiments.fixes.{f_id}]",
+                    f'status = "{f_data.get("status", "applied")}"',
+                    f'verdict = "{f_data.get("verdict", "")}"',
+                ])
+                if f_data.get("baseline_session_id"):
+                    lines.append(f'baseline_session_id = "{f_data["baseline_session_id"]}"')
+                if f_data.get("applied_at"):
+                    lines.append(f'applied_at = "{f_data["applied_at"]}"')
+                if f_data.get("validated_at"):
+                    lines.append(f'validated_at = "{f_data["validated_at"]}"')
+                if f_data.get("rejected_at"):
+                    lines.append(f'rejected_at = "{f_data["rejected_at"]}"')
 
         hotkey = tweaks.get("hotkey") or tweaks.get("profiling", {}).get("hotkey")
         if hotkey:
@@ -983,29 +1417,47 @@ class EngineTweakManager:
         # 4. DXVK & Synchronization layer intercepts
         dxvk_items = []
 
-        # Check for D3D11 / DXGI intercept wrapper features
-        sync_fix_enabled = (
-            sync_sec.get("atelier_sync_fix")
-            or (isinstance(sync_sec.get("atelier_sync_fix"), dict) and sync_sec["atelier_sync_fix"].get("enabled"))
-            or (isinstance(sync_sec, dict) and sync_sec.get("enabled") and "atelier" in str(sync_sec))
-            or engine_sec.get("gust", {}).get("atelier_sync_fix")
-        )
-        state_dedup_enabled = (
-            sync_sec.get("state_dedup")
-            or (isinstance(sync_sec.get("state_dedup"), dict) and sync_sec["state_dedup"].get("enabled"))
-        )
-        swapchain_debounce_enabled = (
-            sync_sec.get("swapchain_debounce")
-            or (isinstance(sync_sec.get("swapchain_debounce"), dict) and sync_sec["swapchain_debounce"].get("enabled"))
-        )
+        # Safely evaluate features via is_feature_enabled to guard against nonempty dicts with enabled=false
+        sync_fix_val = sync_sec.get("atelier_sync_fix")
+        if sync_fix_val is None:
+            sync_fix_val = engine_sec.get("gust", {}).get("atelier_sync_fix")
+        sync_fix_enabled = cls.is_feature_enabled(sync_fix_val)
+
+        state_dedup_enabled = cls.is_feature_enabled(sync_sec.get("state_dedup"))
+        swapchain_debounce_enabled = cls.is_feature_enabled(sync_sec.get("swapchain_debounce"))
+
         timing_sec = profile.get("timing", {})
-        precision_timers_enabled = (
-            timing_sec.get("precision_timers")
-            or (isinstance(timing_sec.get("precision_timers"), dict) and timing_sec["precision_timers"].get("enabled"))
-            or sync_sec.get("precision_timers")
-            or (isinstance(sync_sec.get("precision_timers"), dict) and sync_sec["precision_timers"].get("enabled"))
-            or profile.get("precision_timers")
-        )
+        p_val = timing_sec.get("precision_timers")
+        if p_val is None:
+            p_val = sync_sec.get("precision_timers")
+        if p_val is None:
+            p_val = profile.get("precision_timers")
+        precision_timers_enabled = cls.is_feature_enabled(p_val)
+
+        # Enforce Experimental Validation Lifecycle:
+        # In Play Mode (production / zero-injection), only validated fixes or non-experimental tweaks
+        # become permanent defaults. Unvalidated experiments are tested in Profile Mode.
+        # If an experiment was rejected due to regression, it is strictly suppressed.
+        mode = env.get("PROTOGOBLIN_MODE", "").lower().strip() or profile.get("runtime", {}).get("mode", "play")
+        experiments = profile.get("experiments", {}).get("fixes", {})
+
+        def _filter_by_experiment(fix_id, active):
+            if not active:
+                return False
+            f_info = experiments.get(fix_id)
+            if not f_info:
+                return True # Standard non-experimental tweak
+            st = f_info.get("status", ExperimentStatus.APPLIED)
+            if st == ExperimentStatus.REJECTED:
+                return False # Rolled back!
+            if mode == "play" and f_info.get("require_validated_for_play", True):
+                return st == ExperimentStatus.VALIDATED
+            return st in (ExperimentStatus.APPLIED, ExperimentStatus.BENCHMARKED, ExperimentStatus.VALIDATED)
+
+        sync_fix_enabled = _filter_by_experiment("atelier_sync_fix", sync_fix_enabled)
+        state_dedup_enabled = _filter_by_experiment("state_dedup", state_dedup_enabled)
+        swapchain_debounce_enabled = _filter_by_experiment("swapchain_debounce", swapchain_debounce_enabled)
+        precision_timers_enabled = _filter_by_experiment("precision_timers", precision_timers_enabled)
 
         wrapper_required = sync_fix_enabled or state_dedup_enabled or swapchain_debounce_enabled or precision_timers_enabled
         if wrapper_required:
@@ -1102,11 +1554,11 @@ class EngineTweakManager:
 
         # 6. Filesystem & Asset Streaming I/O Cache
         fs_sec = profile.get("filesystem", {})
-        io_cache_enabled = (
-            fs_sec.get("io_cache")
-            or (isinstance(fs_sec.get("io_cache"), dict) and fs_sec["io_cache"].get("enabled"))
-            or profile.get("io_cache")
-        )
+        io_val = fs_sec.get("io_cache")
+        if io_val is None:
+            io_val = profile.get("io_cache")
+        io_cache_enabled = cls.is_feature_enabled(io_val)
+        io_cache_enabled = _filter_by_experiment("io_cache", io_cache_enabled)
         if io_cache_enabled:
             env["PROTOGOBLIN_IO_CACHE"] = "1"
             p_dir = proton_dir or os.environ.get("PROTOGOBLIN_DIR") or os.path.dirname(os.path.abspath(__file__))
@@ -2693,7 +3145,7 @@ class ProtoGoblinSession:
             self.anti_cheat["profiling_suppressed"] = True
             self.anti_cheat["suppression_reason"] = (
                 f"Active {self.anti_cheat.get('provider', 'Anti-Cheat')} detected. Profiling hooks and HUD overlay "
-                "were disabled to enforce strict zero-injection passthrough and prevent client bans or disconnections."
+                "were disabled to enforce strict zero-injection passthrough and minimize ban risk or client disconnections."
             )
 
         # Upstream ntsync auto-detection: if /dev/ntsync is exposed by host kernel (Linux 6.13+)
@@ -3166,6 +3618,18 @@ class ProtoGoblinSession:
             with open(self.manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
             log(f"Emitted Tier-1 manifest: {self.manifest_path}")
+
+            # Automatically evaluate any active A/B validation experiment
+            try:
+                p_file = self.find_game_profile()
+                if p_file:
+                    exp_eval = ExperimentalValidationEngine.evaluate_experiment(p_file, manifest)
+                    if exp_eval:
+                        manifest["experiment_evaluation"] = exp_eval
+                        with open(self.manifest_path, "w", encoding="utf-8") as f:
+                            json.dump(manifest, f, indent=2)
+            except Exception as e:
+                log(f"Experiment evaluation warning: {e}")
         except OSError as e:
             log(f"Failed to write manifest: {e}")
 

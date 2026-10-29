@@ -19,6 +19,8 @@ from protogoblin import (
     CompatibilityLogAnalyzer,
     EngineDetector,
     EngineTweakManager,
+    ExperimentStatus,
+    ExperimentalValidationEngine,
     NativeDllSnagger,
     PresetDatabase,
     ProtoGoblinSession,
@@ -128,7 +130,7 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertTrue(any("Significant Frame Pacing Volatility" in t for t in titles))
         self.assertTrue(any("GPU Bound" in t for t in titles))
 
-    def test_frametime_jitter_state_dedup_suggestion(self):
+    def test_frametime_jitter_tightened_rule(self):
         manifest = {
             "roi_telemetry": {
                 "roi_enabled": True,
@@ -140,10 +142,12 @@ class TestDiagnosticAdvisor(unittest.TestCase):
             }
         }
         suggestions = DiagnosticAdvisor.analyze(manifest)
-        jitter_suggs = [s for s in suggestions if s.get("fix_id") == "state_dedup_and_debounce"]
+        # Tightened rule: Jitter alone does not prove constant buffer or swapchain issues.
+        # It must propose frame rate pacing and avoid premature wrapper shims.
+        jitter_suggs = [s for s in suggestions if "Elevated Presentation Frametime Jitter" in s["title"]]
         self.assertEqual(len(jitter_suggs), 1)
-        self.assertIn("Elevated Presentation & SwapChain Jitter Detected", jitter_suggs[0]["title"])
-        self.assertIn("Enable State Dedup & Debounce", jitter_suggs[0]["fix_button_text"])
+        self.assertEqual(jitter_suggs[0]["fix_id"], "cap_framerate")
+        self.assertFalse(any(s.get("fix_id") == "state_dedup_and_debounce" for s in suggestions))
 
     def test_direct_d3d11_wrapper_stats_cb_spam(self):
         # 1. Unoptimized case: state_dedup_active = False -> warning + fix action
@@ -2397,6 +2401,211 @@ mode = "profile"
         self.assertEqual(len(self.launched_commands), 1)
         cmd, _ = self.launched_commands[0]
         self.assertIn("steam://rungameid/480", " ".join(cmd))
+
+
+
+
+class TestExperimentalValidationLifecycleAndBugFixes(unittest.TestCase):
+    """Tests for the Experimental Validation Engine, tightened diagnostic rules, and bug fixes."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.profile_path = os.path.join(self.td.name, "test_game.toml")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_apply_tweaks_dictionary_enabled_false_bugfix(self):
+        """Tests that nonempty dicts with enabled=false do NOT activate features (bugfix)."""
+        # Profile has dictionary with enabled = false
+        profile = {
+            "synchronization": {
+                "state_dedup": {"enabled": False},
+                "swapchain_debounce": {"enabled": False},
+                "atelier_sync_fix": {"enabled": False},
+            },
+            "timing": {
+                "precision_timers": {"enabled": False},
+            },
+            "filesystem": {
+                "io_cache": {"enabled": False},
+            },
+            "graphics": {
+                "async_shader_compile": False,
+            },
+        }
+
+        env = {}
+        new_argv = EngineTweakManager.apply_tweaks(
+            profile=profile,
+            engine_info={"engine": "unreal_4"},
+            argv=["game.exe"],
+            env=env,
+        )
+
+        # None of the wrapper shims or env flags should be enabled!
+        self.assertNotIn("PROTOGOBLIN_STATE_DEDUP", env)
+        self.assertNotIn("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE", env)
+        self.assertNotIn("PROTOGOBLIN_STAGING_SYNC_FIX", env)
+        self.assertNotIn("PROTOGOBLIN_HIGH_PRECISION_TIMERS", env)
+        self.assertNotIn("PROTOGOBLIN_IO_CACHE", env)
+        self.assertNotIn("DXVK_ASYNC", env)
+        self.assertNotIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
+
+    def test_apply_tweaks_dictionary_enabled_true_active(self):
+        """Tests that dicts with enabled=true or boolean True properly activate features."""
+        profile = {
+            "synchronization": {
+                "state_dedup": {"enabled": True},
+                "swapchain_debounce": True,
+            },
+            "timing": {
+                "precision_timers": {"enabled": True},
+            },
+            "runtime": {
+                "mode": "profile",
+            },
+        }
+
+        env = {}
+        EngineTweakManager.apply_tweaks(
+            profile=profile,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env,
+        )
+
+        self.assertEqual(env.get("PROTOGOBLIN_STATE_DEDUP"), "1")
+        self.assertEqual(env.get("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE"), "1")
+        self.assertEqual(env.get("PROTOGOBLIN_HIGH_PRECISION_TIMERS"), "1")
+        self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
+
+    def test_experimental_validation_lifecycle_workflow(self):
+        """Tests the full lifecycle: Detected -> Applied -> Benchmarked -> Validated / Rollback."""
+        # Initial baseline profile
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="12345",
+            app_id="12345",
+            target_exe="game.exe",
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        # 1. State: DETECTED initially
+        st = ExperimentalValidationEngine.get_experiment_status(self.profile_path, "state_dedup")
+        self.assertEqual(st, ExperimentStatus.DETECTED)
+
+        # 2. Start experiment -> APPLIED
+        baseline_metrics = {"fps_avg": 50.0, "fps_1_pct_low": 30.0, "frametime_jitter_ms": 10.0}
+        exp_info = ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="state_dedup",
+            baseline_session_id="baseline_sess_01",
+            baseline_metrics=baseline_metrics,
+        )
+        self.assertEqual(exp_info["status"], ExperimentStatus.APPLIED)
+        self.assertEqual(ExperimentalValidationEngine.get_experiment_status(self.profile_path, "state_dedup"), ExperimentStatus.APPLIED)
+
+        # 3. Enforce: In Play Mode, unvalidated experiment is NOT active
+        env_play = {}
+        prof_curr = EngineTweakManager.load_profile(self.profile_path)
+        EngineTweakManager.apply_tweaks(
+            profile=prof_curr,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env_play,
+        )
+        # Since it's play mode and status is 'applied' (unvalidated), it should NOT be active
+        self.assertNotIn("PROTOGOBLIN_STATE_DEDUP", env_play)
+
+        # In Profile Mode (benchmark test), it IS active
+        env_prof = {"PROTOGOBLIN_MODE": "profile"}
+        EngineTweakManager.apply_tweaks(
+            profile=prof_curr,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env_prof,
+        )
+        self.assertEqual(env_prof.get("PROTOGOBLIN_STATE_DEDUP"), "1")
+
+        # 4. Evaluate experiment with IMPROVED metrics -> VALIDATED
+        baseline_manifest = {
+            "session": {"id": "baseline_sess_01", "mode": "profile"},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": baseline_metrics,
+            },
+        }
+        improved_manifest = {
+            "session": {"id": "benchmark_sess_02", "mode": "profile"},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 55.0, "fps_1_pct_low": 38.0, "frametime_jitter_ms": 6.0},
+            },
+        }
+        res = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=improved_manifest,
+            baseline_manifest=baseline_manifest,
+        )
+        self.assertEqual(res["status"], ExperimentStatus.VALIDATED)
+        self.assertEqual(res["verdict"], "IMPROVED")
+
+        # Now in Play mode, the VALIDATED fix IS applied as permanent default!
+        env_play_validated = {}
+        prof_val = EngineTweakManager.load_profile(self.profile_path)
+        EngineTweakManager.apply_tweaks(
+            profile=prof_val,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env_play_validated,
+        )
+        self.assertEqual(env_play_validated.get("PROTOGOBLIN_STATE_DEDUP"), "1")
+
+    def test_experimental_validation_rollback_on_regression(self):
+        """Tests that an experiment with regressed metrics is automatically rolled back."""
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="777",
+            app_id="777",
+            target_exe="game.exe",
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        # Start experiment
+        ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="swapchain_debounce",
+            baseline_session_id="base_01",
+        )
+
+        baseline_manifest = {
+            "session": {"id": "base_01", "mode": "profile"},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 60.0, "fps_1_pct_low": 50.0, "frametime_jitter_ms": 4.0},
+            },
+        }
+        # Regressed manifest: average FPS dropped by 10%
+        regressed_manifest = {
+            "session": {"id": "bench_02", "mode": "profile"},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 53.0, "fps_1_pct_low": 42.0, "frametime_jitter_ms": 9.0},
+            },
+        }
+
+        res = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=regressed_manifest,
+            baseline_manifest=baseline_manifest,
+        )
+        self.assertEqual(res["status"], ExperimentStatus.REJECTED)
+        self.assertEqual(res["verdict"], "REGRESSED")
+
+        # Verify automatic rollback disabled the tweak in profile
+        prof_after = EngineTweakManager.load_profile(self.profile_path)
+        self.assertFalse(EngineTweakManager.is_feature_enabled(prof_after.get("synchronization", {}).get("swapchain_debounce")))
 
 
 if __name__ == "__main__":

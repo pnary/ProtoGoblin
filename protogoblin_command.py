@@ -21,6 +21,12 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import protogoblin
+from protogoblin import (
+    compute_session_diff,
+    format_diff_report,
+    ExperimentStatus,
+    ExperimentalValidationEngine,
+)
 
 
 class DiagnosticAdvisor:
@@ -49,8 +55,8 @@ class DiagnosticAdvisor:
                     "title": f"🛡️ Anti-Cheat Active ({provider}) — Profiling Suppressed",
                     "description": (
                         f"Game is protected by {provider}. ProtoGoblin automatically suppressed Profile Mode and HUD/overlay "
-                        f"hooks to enforce strict Zero-Injection Passthrough (Play Mode). This ensures anti-cheat integrity "
-                        f"and prevents client disconnects or account penalties."
+                        f"hooks to enforce strict Zero-Injection Passthrough (Play Mode). This minimizes client disconnects "
+                        f"and ban risk by strictly avoiding in-process hooks and overlay injection."
                     ),
                     "action": "Game runs in clean Play Mode. In-process shims and profiling hooks are intentionally disabled.",
                 }
@@ -83,14 +89,33 @@ class DiagnosticAdvisor:
         time_ms = sh.get("total_time_ms", 0.0)
         hit_rate = sh.get("pipeline_cache_hit_rate", 1.0)
         if count > 50 and time_ms > 200:
+            dxvk_info = gfx.get("dxvk") or {}
+            async_supported = bool(dxvk_info.get("async_supported", False))
+            if async_supported:
+                desc = (
+                    f"{count} pipelines compiled during session taking {time_ms:.1f}ms total (cache hit rate: {hit_rate:.1%}). "
+                    "DXVK build supports asynchronous pipeline compilation."
+                )
+                action = "Enable local shader caching (PROTON_LOCAL_SHADER_CACHE=1) or asynchronous compilation (dxvk.enableAsync = true)."
+                fix_id = "async_shader_compile"
+                btn_text = "⚡ Enable Async Shader Compilation"
+            else:
+                desc = (
+                    f"{count} pipelines compiled during session taking {time_ms:.1f}ms total (cache hit rate: {hit_rate:.1%}). "
+                    "Standard forward path is Vulkan Graphics Pipeline Libraries (GPL) driver pre-compilation."
+                )
+                action = "Enable local shader caching (PROTON_LOCAL_SHADER_CACHE=1) and ensure Vulkan GPL is active."
+                fix_id = "local_shader_cache"
+                btn_text = "⚡ Enable Local Shader Cache (GPL)"
+
             suggestions.append(
                 {
                     "level": "warning",
                     "title": "Shader Compilation Stuttering Observed",
-                    "description": f"{count} pipelines compiled during session taking {time_ms:.1f}ms total. Pipeline cache hit rate was {hit_rate:.1%}.",
-                    "action": "Enable local shader caching (PROTON_LOCAL_SHADER_CACHE=1) or asynchronous compilation (DXVK_ASYNC=1) to prevent gameplay hitching.",
-                    "fix_id": "async_shader_compile",
-                    "fix_button_text": "⚡ Enable Async Shader Compilation",
+                    "description": desc,
+                    "action": action,
+                    "fix_id": fix_id,
+                    "fix_button_text": btn_text,
                 }
             )
 
@@ -192,19 +217,23 @@ class DiagnosticAdvisor:
                 )
 
             if jitter >= 8.0:
-                suggestions.append(
-                    {
-                        "level": "warning",
-                        "title": "Elevated Presentation & SwapChain Jitter Detected",
-                        "description": (
-                            f"Frametime jitter is elevated ({jitter:.1f}ms), typically caused by high-frequency "
-                            "constant buffer state updates or window/swapchain resize spikes."
-                        ),
-                        "action": "Enable D3D11 Constant Buffer Deduplication and SwapChain Resize Debouncing in the synchronization profile.",
-                        "fix_id": "state_dedup_and_debounce",
-                        "fix_button_text": "⚡ Enable State Dedup & Debounce",
-                    }
-                )
+                # Tightened diagnostic rule: Jitter alone does NOT establish constant buffer spam
+                # or swapchain resize storms. Only recommend wrapper debouncing when wrapper telemetry confirms it.
+                w_stats_check = gfx.get("d3d11_wrapper_stats")
+                if not w_stats_check:
+                    suggestions.append(
+                        {
+                            "level": "warning",
+                            "title": "Elevated Presentation Frametime Jitter",
+                            "description": (
+                                f"Frametime jitter is elevated ({jitter:.1f}ms). Presentation pacing varies across frames."
+                            ),
+                            "action": "Set a presentation frame rate limiter (DXVK_FRAME_RATE) to stabilize frame pacing, or run in Profile Mode to capture D3D11 wrapper telemetry.",
+                            "fix_id": "cap_framerate",
+                            "fix_button_text": f"⚡ Cap Frame Rate ({max(30, int(fps_avg or 60))} FPS)",
+                            "cap_target": max(30, int(fps_avg or 60)),
+                        }
+                    )
 
         # 4b. D3D11 / DXGI Wrapper Introspective Live Telemetry
         w_stats = gfx.get("d3d11_wrapper_stats")
@@ -2401,6 +2430,40 @@ class ProtoGoblinCommandApp:
                 is_active = self.is_suggestion_enabled(s)
                 cb_var = tk.BooleanVar(value=is_active)
 
+                # Experiment lifecycle status
+                fix_id = s.get("fix_id")
+                tgt_appid = (data.get("target") or {}).get("steam_appid")
+                p_file_curr = self.find_game_profile_path(tgt_appid)
+                exp_st = protogoblin.ExperimentalValidationEngine.get_experiment_status(p_file_curr, fix_id) if fix_id else None
+
+                if exp_st == protogoblin.ExperimentStatus.VALIDATED:
+                    st_badge = "✅ VALIDATED (Play Default)"
+                    badge_fg = "#2ecc71"
+                elif exp_st == protogoblin.ExperimentStatus.APPLIED:
+                    st_badge = "🧪 EXPERIMENT (In Test)"
+                    badge_fg = "#f39c12"
+                elif exp_st == protogoblin.ExperimentStatus.BENCHMARKED:
+                    st_badge = "📊 BENCHMARKED"
+                    badge_fg = "#58a6ff"
+                elif exp_st == protogoblin.ExperimentStatus.REJECTED:
+                    st_badge = "❌ REGRESSED (Rolled Back)"
+                    badge_fg = "#e74c3c"
+                elif fix_id:
+                    st_badge = "💡 CANDIDATE (Ready to Test)"
+                    badge_fg = "#8b949e"
+                else:
+                    st_badge = None
+
+                if st_badge:
+                    lbl_badge = tk.Label(
+                        header_frame,
+                        text=st_badge,
+                        font=("Segoe UI", 8, "bold"),
+                        bg="#161b22",
+                        fg=badge_fg,
+                    )
+                    lbl_badge.pack(side=tk.RIGHT, padx=6)
+
                 chk = tk.Checkbutton(
                     header_frame,
                     text="Applied" if is_active else "Enable",
@@ -2825,6 +2888,66 @@ class ProtoGoblinCommandApp:
                 "app_id": app_id_str,
             }
 
+    def find_game_profile_path(self, app_id):
+        """Resolves the profile path for a given AppID."""
+        if not app_id:
+            return None
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        p_file = os.path.join(xdg_config, "protogoblin", "games", f"{app_id}.toml")
+        return p_file
+
+    def start_validation_experiment(self, suggestion):
+        """Starts an isolated A/B validation experiment for a suggested fix."""
+        fix_id = suggestion.get("fix_id")
+        if not fix_id or not self.current_manifest:
+            return
+
+        tgt = self.current_manifest.get("target") or {}
+        app_id = tgt.get("steam_appid")
+        sess_id = (self.current_manifest.get("session") or {}).get("id")
+        t_exe = os.path.basename((tgt.get("target_executable") or {}).get("path", f"game_{app_id}.exe"))
+        p_file = self.find_game_profile_path(app_id)
+
+        try:
+            confirm = messagebox.askyesno(
+                "Start Validation Experiment",
+                f"Start isolated A/B validation experiment for:\n\n"
+                f"• Optimization: {suggestion['title']}\n"
+                f"• Baseline Session: {sess_id}\n"
+                f"• Target Game: {t_exe} ({app_id})\n\n"
+                f"Validation Engine Workflow:\n"
+                f"1. Applies this fix in isolated Profile Mode\n"
+                f"2. Measures subsequent benchmark session against baseline\n"
+                f"3. Automatically promotes to permanent Play Mode default IF performance improves\n"
+                f"4. Automatically rolls back to stock IF performance regresses\n\n"
+                f"Start experiment now?",
+            )
+        except Exception:
+            confirm = True
+
+        if not confirm:
+            return
+
+        protogoblin.ExperimentalValidationEngine.start_experiment(
+            profile_path=p_file,
+            fix_id=fix_id,
+            baseline_session_id=sess_id,
+            baseline_metrics=(self.current_manifest.get("roi_telemetry") or {}).get("frame_metrics"),
+        )
+        self.var_profile_mode.set("profile")
+        self._update_header_mode_button("profile")
+        self.set_status(f"🧪 Experiment started for {fix_id}! Launch game to benchmark.", fg="#f39c12")
+        self.refresh_sessions(preserve_selection=True)
+
+        try:
+            messagebox.showinfo(
+                "Experiment Active",
+                f"Experiment for '{fix_id}' is now APPLIED and active in Profile Mode.\n\n"
+                f"Click '🚀 Launch Game' to run the benchmark session. The results will automatically be evaluated and displayed here upon session completion!",
+            )
+        except Exception:
+            pass
+
     def launch_selected_game(self):
         """Launches the currently selected game from the dashboard, or opens the library dialog."""
         if not self.current_manifest:
@@ -2896,10 +3019,32 @@ class ProtoGoblinCommandApp:
                         app_id = (m_data.get("target") or {}).get("steam_appid")
                         m_mode = (m_data.get("session") or {}).get("mode", "play").upper()
                         g_title = self.resolve_game_name(app_id)
-                        self.set_status(
-                            f"✨ New session [{m_mode}] detected for {g_title}! Dashboard auto-updated.",
-                            fg="#39FF14",
-                        )
+                        exp_eval = m_data.get("experiment_evaluation")
+                        if exp_eval:
+                            v = exp_eval.get("verdict", "")
+                            f_id = exp_eval.get("fix_id", "")
+                            st = exp_eval.get("status", "")
+                            summary = exp_eval.get("comparison_summary", "")
+                            if st == protogoblin.ExperimentStatus.VALIDATED:
+                                self.set_status(
+                                    f"🎉 Experiment VALIDATED for {f_id}: {summary}! Graduated to Play Mode default.",
+                                    fg="#39FF14",
+                                )
+                            elif st == protogoblin.ExperimentStatus.REJECTED:
+                                self.set_status(
+                                    f"⚠️ Experiment REGRESSED for {f_id}: {summary}. Automatically rolled back to stock!",
+                                    fg="#e74c3c",
+                                )
+                            else:
+                                self.set_status(
+                                    f"📊 Experiment Benchmarked for {f_id}: {summary}",
+                                    fg="#58a6ff",
+                                )
+                        else:
+                            self.set_status(
+                                f"✨ New session [{m_mode}] detected for {g_title}! Dashboard auto-updated.",
+                                fg="#39FF14",
+                            )
                     except Exception:
                         self.set_status("✨ New session detected! Dashboard auto-updated.", fg="#39FF14")
         except Exception:
