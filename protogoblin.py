@@ -4,6 +4,7 @@ ProtoGoblin - Session Manager & Introspective Telemetry Engine
 Phase 0: Process-Tree Tracking, Anti-Cheat Pre-Flight, and Tier-1 Manifest Generation
 """
 
+import copy
 import csv
 import glob
 import hashlib
@@ -578,8 +579,184 @@ class ExperimentStatus:
     REJECTED = "rejected"
 
 
+class ExperimentVerdict:
+    IMPROVED = "IMPROVED"
+    REGRESSED = "REGRESSED"
+    MIXED = "MIXED"
+    NEUTRAL = "NEUTRAL"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+
+class FixDefinition:
+    def __init__(self, fix_id, title, constituent_features, profile_targets, description=""):
+        self.fix_id = fix_id
+        self.title = title
+        self.constituent_features = list(constituent_features)
+        self.profile_targets = profile_targets
+        self.description = description
+
+
+class FixRegistry:
+    """Central registry mapping optimization recommendation IDs to constituent features,
+    profile adjustments, and runtime gating tags.
+    """
+    _ALIASES = {
+        "enable_precision_timers": "precision_timers",
+        "enable_io_cache": "io_cache",
+        "enable_descriptor_buffer": "descriptor_buffer",
+        "dxvk_async": "async_shader_compile",
+    }
+
+    _REGISTRY = {
+        "state_dedup_and_debounce": FixDefinition(
+            fix_id="state_dedup_and_debounce",
+            title="State Deduplication & SwapChain Resize Debounce",
+            constituent_features=["state_dedup", "swapchain_debounce"],
+            profile_targets=[
+                (("synchronization", "state_dedup"), True),
+                (("synchronization", "swapchain_debounce"), True),
+            ],
+            description="Filters redundant D3D11 constant buffer updates and debounces rapid DXGI swapchain resizes.",
+        ),
+        "state_dedup": FixDefinition(
+            fix_id="state_dedup",
+            title="Constant Buffer State Deduplication",
+            constituent_features=["state_dedup"],
+            profile_targets=[
+                (("synchronization", "state_dedup"), True),
+            ],
+            description="Filters redundant constant buffer uploads to avoid Vulkan descriptor set thrashing.",
+        ),
+        "swapchain_debounce": FixDefinition(
+            fix_id="swapchain_debounce",
+            title="SwapChain Resize Debounce",
+            constituent_features=["swapchain_debounce"],
+            profile_targets=[
+                (("synchronization", "swapchain_debounce"), True),
+            ],
+            description="Debounces rapid bursts and identical-dimension SwapChain ResizeBuffers calls.",
+        ),
+        "cap_framerate": FixDefinition(
+            fix_id="cap_framerate",
+            title="Presentation Frame Rate Limiter",
+            constituent_features=["cap_framerate", "max_fps"],
+            profile_targets=[
+                (("graphics", "max_fps"), 60),
+            ],
+            description="Enforces presentation rate cap via DXVK and VKD3D-Proton to stabilize frame pacing intervals.",
+        ),
+        "atelier_sync_fix": FixDefinition(
+            fix_id="atelier_sync_fix",
+            title="Atelier / Gust D3D11 Staging Buffer Sync Fix",
+            constituent_features=["atelier_sync_fix"],
+            profile_targets=[
+                (("synchronization", "atelier_sync_fix"), True),
+                (("graphics", "force_vsync"), "off"),
+            ],
+            description="Applies D3D11 staging buffer shadow copies and unlocks VSync to resolve GPU starvation.",
+        ),
+        "precision_timers": FixDefinition(
+            fix_id="precision_timers",
+            title="High-Precision Win32 Sleep Timers",
+            constituent_features=["precision_timers"],
+            profile_targets=[
+                (("timing", "precision_timers"), True),
+            ],
+            description="Hybrid QPC sleep-spin pacing to eliminate 1-4ms coarse Wine timer overshoot.",
+        ),
+        "io_cache": FixDefinition(
+            fix_id="io_cache",
+            title="Adaptive Traversal File I/O Cache",
+            constituent_features=["io_cache"],
+            profile_targets=[
+                (("filesystem", "io_cache"), True),
+            ],
+            description="Kernel-level read-ahead RAM caching to eliminate synchronous traversal asset hitches.",
+        ),
+        "descriptor_buffer": FixDefinition(
+            fix_id="descriptor_buffer",
+            title="Vulkan Descriptor Buffer Extension",
+            constituent_features=["descriptor_buffer"],
+            profile_targets=[
+                (("graphics", "descriptor_buffer"), True),
+            ],
+            description="Direct GPU memory descriptor binding to bypass driver descriptor set pools.",
+        ),
+        "local_shader_cache": FixDefinition(
+            fix_id="local_shader_cache",
+            title="Local Pipeline & Shader Cache",
+            constituent_features=["local_shader_cache"],
+            profile_targets=[
+                (("graphics", "local_shader_cache"), True),
+            ],
+            description="Forces local prefix PSO and shader caching via PROTON_LOCAL_SHADER_CACHE=1.",
+        ),
+        "async_shader_compile": FixDefinition(
+            fix_id="async_shader_compile",
+            title="DXVK Asynchronous Shader Pipeline Compilation",
+            constituent_features=["async_shader_compile"],
+            profile_targets=[
+                (("graphics", "async_shader_compile"), True),
+            ],
+            description="Asynchronous shader compilation fallback when Vulkan Graphics Pipeline Libraries are unavailable.",
+        ),
+        "optimize_ue5_lumen_vsm": FixDefinition(
+            fix_id="optimize_ue5_lumen_vsm",
+            title="Unreal Engine 5 Lumen & VSM Optimization",
+            constituent_features=["optimize_ue5_lumen_vsm"],
+            profile_targets=[
+                (("engine", "unreal", "optimize_lumen"), True),
+                (("engine", "unreal", "optimize_vsm"), True),
+                (("engine", "unreal", "disable_virtual_shadows"), True),
+            ],
+            description="Downsamples Lumen screen probes and throttles virtual shadow ray samples under VKD3D-Proton.",
+        ),
+    }
+
+    @classmethod
+    def canonical_id(cls, fix_id):
+        if not fix_id:
+            return None
+        return cls._ALIASES.get(fix_id, fix_id)
+
+    @classmethod
+    def is_registered(cls, fix_id):
+        return cls.canonical_id(fix_id) in cls._REGISTRY
+
+    @classmethod
+    def get(cls, fix_id):
+        cid = cls.canonical_id(fix_id)
+        return cls._REGISTRY.get(cid)
+
+    @classmethod
+    def get_constituent_features(cls, fix_id):
+        defn = cls.get(fix_id)
+        return defn.constituent_features if defn else []
+
+    @classmethod
+    def find_governing_experiments(cls, feature_id, experiments_fixes):
+        """Finds any active or recorded experiments governing feature_id."""
+        if not experiments_fixes or not isinstance(experiments_fixes, dict):
+            return []
+        matches = []
+        for f_id, f_data in experiments_fixes.items():
+            cid = cls.canonical_id(f_id)
+            if cid == feature_id or f_id == feature_id:
+                matches.append(f_data)
+                continue
+            defn = cls.get(cid)
+            if defn and feature_id in defn.constituent_features:
+                matches.append(f_data)
+        return matches
+
+
 def compute_session_diff(manifest_a, manifest_b):
     """Computes an A/B delta comparison between two ProtoGoblin session manifests.
+
+    Enforces empirical validation requirements:
+    - Rejects insufficient data (missing ROI telemetry, zero rendered frames, corrupt durations).
+    - Ensures identical game target compatibility.
+    - Evaluates performance regressions with strict precedence over improvements.
 
     manifest_a: Baseline session (e.g. before / raw / unoptimized)
     manifest_b: Target session (e.g. after / tweaked / optimized)
@@ -604,6 +781,16 @@ def compute_session_diff(manifest_a, manifest_b):
     pacing_a = roi_a.get("pacing") or {}
     pacing_b = roi_b.get("pacing") or {}
 
+    bot_a = roi_a.get("bottleneck_classification", "unknown")
+    bot_b = roi_b.get("bottleneck_classification", "unknown")
+
+    cpu_busy_a = float(pacing_a.get("cpu_busy_pct", 0.0))
+    cpu_busy_b = float(pacing_b.get("cpu_busy_pct", 0.0))
+    cpu_wait_a = float(pacing_a.get("cpu_wait_pct", 0.0))
+    cpu_wait_b = float(pacing_b.get("cpu_wait_pct", 0.0))
+    gpu_busy_a = float(pacing_a.get("gpu_busy_pct", 0.0))
+    gpu_busy_b = float(pacing_b.get("gpu_busy_pct", 0.0))
+
     def _delta(a_val, b_val):
         a_f = float(a_val or 0.0)
         b_f = float(b_val or 0.0)
@@ -617,81 +804,143 @@ def compute_session_diff(manifest_a, manifest_b):
     diff_ft_avg, pct_ft_avg = _delta(fm_a.get("frametime_avg_ms"), fm_b.get("frametime_avg_ms"))
     diff_jitter, pct_jitter = _delta(fm_a.get("frametime_jitter_ms"), fm_b.get("frametime_jitter_ms"))
 
-    bot_a = roi_a.get("bottleneck_classification", "unknown")
-    bot_b = roi_b.get("bottleneck_classification", "unknown")
+    def _build_result(verdict_val, notes_list):
+        return {
+            "session_a": {
+                "id": sess_a.get("id", "Session A"),
+                "target_exe": t_exe_a,
+                "steam_appid": app_id_a,
+                "mode": sess_a.get("mode", "play"),
+                "has_roi": has_roi_a,
+                "bottleneck": bot_a,
+                "anti_cheat": manifest_a.get("anti_cheat") or {},
+            },
+            "session_b": {
+                "id": sess_b.get("id", "Session B"),
+                "target_exe": t_exe_b,
+                "steam_appid": app_id_b,
+                "mode": sess_b.get("mode", "play"),
+                "has_roi": has_roi_b,
+                "bottleneck": bot_b,
+                "anti_cheat": manifest_b.get("anti_cheat") or {},
+            },
+            "metrics": {
+                "fps_avg": {"a": fm_a.get("fps_avg", 0.0), "b": fm_b.get("fps_avg", 0.0), "delta": diff_fps_avg, "pct": pct_fps_avg},
+                "fps_1_pct_low": {"a": fm_a.get("fps_1_pct_low", 0.0), "b": fm_b.get("fps_1_pct_low", 0.0), "delta": diff_fps_1p, "pct": pct_fps_1p},
+                "fps_0_1_pct_low": {"a": fm_a.get("fps_0_1_pct_low", 0.0), "b": fm_b.get("fps_0_1_pct_low", 0.0), "delta": diff_fps_01p, "pct": pct_fps_01p},
+                "frametime_avg_ms": {"a": fm_a.get("frametime_avg_ms", 0.0), "b": fm_b.get("frametime_avg_ms", 0.0), "delta": diff_ft_avg, "pct": pct_ft_avg},
+                "frametime_jitter_ms": {"a": fm_a.get("frametime_jitter_ms", 0.0), "b": fm_b.get("frametime_jitter_ms", 0.0), "delta": diff_jitter, "pct": pct_jitter},
+            },
+            "bottleneck": {
+                "a": bot_a,
+                "b": bot_b,
+                "transition": f"{bot_a} -> {bot_b}",
+                "resolved": (bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]),
+            },
+            "hardware": {
+                "cpu_busy_pct": {"a": cpu_busy_a, "b": cpu_busy_b, "delta": round(cpu_busy_b - cpu_busy_a, 1)},
+                "cpu_wait_pct": {"a": cpu_wait_a, "b": cpu_wait_b, "delta": round(cpu_wait_b - cpu_wait_a, 1)},
+                "gpu_busy_pct": {"a": gpu_busy_a, "b": gpu_busy_b, "delta": round(gpu_busy_b - gpu_busy_a, 1)},
+            },
+            "verdict": verdict_val,
+            "notes": notes_list,
+            "summary": "; ".join(notes_list) if notes_list else "Performance metrics comparable.",
+        }
 
-    cpu_busy_a = float(pacing_a.get("cpu_busy_pct", 0.0))
-    cpu_busy_b = float(pacing_b.get("cpu_busy_pct", 0.0))
-    cpu_wait_a = float(pacing_a.get("cpu_wait_pct", 0.0))
-    cpu_wait_b = float(pacing_b.get("cpu_wait_pct", 0.0))
-    gpu_busy_a = float(pacing_a.get("gpu_busy_pct", 0.0))
-    gpu_busy_b = float(pacing_b.get("gpu_busy_pct", 0.0))
+    # 1. Compatibility Check: Target Game Identity
+    str_a = str(app_id_a).strip()
+    str_b = str(app_id_b).strip()
+    if str_a and str_b and str_a not in ("-", "0", "None") and str_b not in ("-", "0", "None"):
+        if str_a != str_b:
+            return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Incompatible target AppIDs: {str_a} vs {str_b}"])
 
-    # Determine verdict and qualitative notes
-    verdict = "NEUTRAL"
-    notes = []
-    if pct_fps_avg >= 5.0 or pct_fps_1p >= 10.0 or (float(fm_a.get("frametime_jitter_ms", 0)) > 5.0 and pct_jitter <= -20.0):
-        verdict = "IMPROVED"
-        if pct_fps_avg >= 5.0:
-            notes.append(f"Average FPS +{pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
-        if pct_fps_1p >= 10.0:
-            notes.append(f"1% lows +{pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
-        if pct_jitter <= -20.0:
-            notes.append(f"Frametime jitter {pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
-    elif pct_fps_avg <= -5.0 or pct_fps_1p <= -10.0:
-        verdict = "REGRESSED"
-        if pct_fps_avg <= -5.0:
-            notes.append(f"Average FPS {pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
-        if pct_fps_1p <= -10.0:
-            notes.append(f"1% lows {pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+    if t_exe_a != "Unknown" and t_exe_b != "Unknown" and t_exe_a.lower() != t_exe_b.lower():
+        return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Incompatible target binaries: {t_exe_a} vs {t_exe_b}"])
 
+    # 2. Session Integrity Check: Abort/Crash detection
+    exit_a = sess_a.get("exit_code")
+    exit_b = sess_b.get("exit_code")
+    clean_a = sess_a.get("clean_shutdown")
+    clean_b = sess_b.get("clean_shutdown")
+
+    if (exit_b is not None and exit_b != 0) or clean_b is False:
+        if (exit_a is None or exit_a == 0) and clean_a is not False:
+            return _build_result(ExperimentVerdict.REGRESSED, [f"Benchmark session crashed with exit code {exit_b} while baseline completed cleanly"])
+        return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Benchmark session aborted with exit code {exit_b}"])
+
+    if (exit_a is not None and exit_a != 0) or clean_a is False:
+        return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Baseline session aborted with exit code {exit_a}; cannot establish baseline"])
+
+    # 3. Telemetry Completeness Check: ROI Telemetry & Frame Counts
+    if not has_roi_a or not has_roi_b:
+        ac_a = manifest_a.get("anti_cheat") or {}
+        ac_b = manifest_b.get("anti_cheat") or {}
+        if ac_a.get("detected") or ac_b.get("detected"):
+            p = ac_a.get("provider") or ac_b.get("provider") or "Anti-Cheat"
+            return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Active {p} detected; profiling hooks suppressed"])
+        return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, ["One or both sessions missing ROI telemetry"])
+
+    fps_avg_a = float(fm_a.get("fps_avg") or 0.0)
+    fps_avg_b = float(fm_b.get("fps_avg") or 0.0)
+    if fps_avg_a <= 0.0 or fps_avg_b <= 0.0:
+        return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, ["Zero or negative average framerate captured"])
+
+    fc_a = roi_a.get("frame_count") or fm_a.get("frame_count")
+    fc_b = roi_b.get("frame_count") or fm_b.get("frame_count")
+    if (fc_a is not None and fc_a <= 0) or (fc_b is not None and fc_b <= 0):
+        return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, ["Zero frames recorded in sample window"])
+
+    # 4. Capture Duration Sanity Check
+    dur_a = float(sess_a.get("duration_seconds") or roi_a.get("duration_seconds") or 0.0)
+    dur_b = float(sess_b.get("duration_seconds") or roi_b.get("duration_seconds") or 0.0)
+    if dur_a > 0.0 and dur_b > 0.0:
+        if (dur_b < 0.15 * dur_a and dur_a - dur_b > 5.0) or (dur_a < 0.15 * dur_b and dur_b - dur_a > 5.0):
+            return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Non-comparable capture durations ({dur_a:.1f}s vs {dur_b:.1f}s)"])
+
+    # 5. Evaluate Metrics with Regression Precedence
+    regressions = []
+    improvements = []
+
+    # Check regressions first
+    if pct_fps_1p <= -10.0:
+        regressions.append(f"1% lows {pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+    if pct_fps_01p <= -15.0:
+        regressions.append(f"0.1% lows {pct_fps_01p:.1f}% ({fm_a.get('fps_0_1_pct_low', 0):.1f} -> {fm_b.get('fps_0_1_pct_low', 0):.1f})")
+    if pct_fps_avg <= -5.0:
+        regressions.append(f"Average FPS {pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+    if float(fm_a.get("frametime_jitter_ms", 0.0)) > 3.0 and pct_jitter >= 25.0:
+        regressions.append(f"Frametime jitter +{pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
+
+    # Check improvements
+    if pct_fps_avg >= 5.0:
+        improvements.append(f"Average FPS +{pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+    if pct_fps_1p >= 10.0:
+        improvements.append(f"1% lows +{pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+    if float(fm_a.get("frametime_jitter_ms", 0.0)) > 5.0 and pct_jitter <= -20.0:
+        improvements.append(f"Frametime jitter {pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
     if bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]:
-        notes.append(f"Sync lockstep stall resolved ({bot_a} -> {bot_b})")
-        if verdict == "NEUTRAL":
-            verdict = "IMPROVED"
+        improvements.append(f"Sync lockstep stall resolved ({bot_a} -> {bot_b})")
 
-    diff_result = {
-        "session_a": {
-            "id": sess_a.get("id", "Session A"),
-            "target_exe": t_exe_a,
-            "steam_appid": app_id_a,
-            "mode": sess_a.get("mode", "play"),
-            "has_roi": has_roi_a,
-            "bottleneck": bot_a,
-            "anti_cheat": manifest_a.get("anti_cheat") or {},
-        },
-        "session_b": {
-            "id": sess_b.get("id", "Session B"),
-            "target_exe": t_exe_b,
-            "steam_appid": app_id_b,
-            "mode": sess_b.get("mode", "play"),
-            "has_roi": has_roi_b,
-            "bottleneck": bot_b,
-            "anti_cheat": manifest_b.get("anti_cheat") or {},
-        },
-        "metrics": {
-            "fps_avg": {"a": fm_a.get("fps_avg", 0.0), "b": fm_b.get("fps_avg", 0.0), "delta": diff_fps_avg, "pct": pct_fps_avg},
-            "fps_1_pct_low": {"a": fm_a.get("fps_1_pct_low", 0.0), "b": fm_b.get("fps_1_pct_low", 0.0), "delta": diff_fps_1p, "pct": pct_fps_1p},
-            "fps_0_1_pct_low": {"a": fm_a.get("fps_0_1_pct_low", 0.0), "b": fm_b.get("fps_0_1_pct_low", 0.0), "delta": diff_fps_01p, "pct": pct_fps_01p},
-            "frametime_avg_ms": {"a": fm_a.get("frametime_avg_ms", 0.0), "b": fm_b.get("frametime_avg_ms", 0.0), "delta": diff_ft_avg, "pct": pct_ft_avg},
-            "frametime_jitter_ms": {"a": fm_a.get("frametime_jitter_ms", 0.0), "b": fm_b.get("frametime_jitter_ms", 0.0), "delta": diff_jitter, "pct": pct_jitter},
-        },
-        "bottleneck": {
-            "a": bot_a,
-            "b": bot_b,
-            "transition": f"{bot_a} -> {bot_b}",
-            "resolved": (bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]),
-        },
-        "hardware": {
-            "cpu_busy_pct": {"a": cpu_busy_a, "b": cpu_busy_b, "delta": round(cpu_busy_b - cpu_busy_a, 1)},
-            "cpu_wait_pct": {"a": cpu_wait_a, "b": cpu_wait_b, "delta": round(cpu_wait_b - cpu_wait_a, 1)},
-            "gpu_busy_pct": {"a": gpu_busy_a, "b": gpu_busy_b, "delta": round(gpu_busy_b - gpu_busy_a, 1)},
-        },
-        "verdict": verdict,
-        "notes": notes,
-        "summary": "; ".join(notes) if notes else "Performance metrics comparable.",
-    }
-    return diff_result
+    # Verdict synthesis
+    if regressions and improvements:
+        # Severe regression in stutter/frame-pacing outweighs modest average framerate gains
+        if pct_fps_1p <= -15.0 or pct_jitter >= 30.0 or pct_fps_avg <= -10.0:
+            verdict = ExperimentVerdict.REGRESSED
+            notes = regressions + [f"Gains overridden by stutter regression: {', '.join(improvements)}"]
+        else:
+            verdict = ExperimentVerdict.MIXED
+            notes = [f"Mixed outcome: {', '.join(improvements)} alongside {', '.join(regressions)}"]
+    elif regressions:
+        verdict = ExperimentVerdict.REGRESSED
+        notes = regressions
+    elif improvements:
+        verdict = ExperimentVerdict.IMPROVED
+        notes = improvements
+    else:
+        verdict = ExperimentVerdict.NEUTRAL
+        notes = ["Performance metrics comparable."]
+
+    return _build_result(verdict, notes)
 
 
 def format_diff_report(diff):
@@ -702,8 +951,19 @@ def format_diff_report(diff):
     bot = diff["bottleneck"]
     hw = diff["hardware"]
 
-    v_icon = "🚀 " if diff["verdict"] == "IMPROVED" else ("⚠️ " if diff["verdict"] == "REGRESSED" else "⚖️ ")
-    verdict_str = f"{v_icon}{diff['verdict']}: {diff['summary']}"
+    v_val = diff.get("verdict", "NEUTRAL")
+    if v_val == ExperimentVerdict.IMPROVED:
+        v_icon = "🚀 "
+    elif v_val == ExperimentVerdict.REGRESSED:
+        v_icon = "⚠️ "
+    elif v_val == ExperimentVerdict.MIXED:
+        v_icon = "⚖️ "
+    elif v_val == ExperimentVerdict.INSUFFICIENT_DATA:
+        v_icon = "❓ "
+    else:
+        v_icon = "⚖️ "
+
+    verdict_str = f"{v_icon}{v_val}: {diff.get('summary', '')}"
 
     lines = [
         "=" * 82,
@@ -717,10 +977,23 @@ def format_diff_report(diff):
     ]
 
     if not s_a.get("has_roi") or not s_b.get("has_roi"):
-        lines.extend([
-            " [!] NOTICE: One or both sessions were executed without ROI telemetry.",
-            "",
-        ])
+        ac_a = s_a.get("anti_cheat") or {}
+        ac_b = s_b.get("anti_cheat") or {}
+        if ac_a.get("detected") or ac_b.get("detected"):
+            provider = ac_a.get("provider") or ac_b.get("provider") or "Anti-Cheat"
+            lines.extend([
+                f" [🛡️] ANTI-CHEAT NOTICE: Active {provider} detected.",
+                "     Profiling hooks and ROI telemetry were automatically suppressed to enforce",
+                "     strict zero-injection passthrough and prevent client bans or disconnections.",
+                "",
+            ])
+        else:
+            lines.extend([
+                " [!] NOTICE: One or both sessions were executed in PLAY mode without ROI telemetry.",
+                "     Detailed frame percentiles and jitter require sessions launched with:",
+                "       PROTOGOBLIN_MODE=profile %command%",
+                "",
+            ])
 
     lines.extend([
         " FRAMETIME & PACING BENCHMARK",
@@ -747,6 +1020,25 @@ def format_diff_report(diff):
     lines.append(_fmt_row("Average Frametime:", m["frametime_avg_ms"], "ms", higher_is_better=False))
     lines.append(_fmt_row("Frametime Jitter (StdDev):", m["frametime_jitter_ms"], "ms", higher_is_better=False))
 
+    bot_res_str = " (Stall Resolved!)" if bot.get("resolved") else ""
+    lines.extend([
+        f" {'Bottleneck Classification:':<28} {s_a['bottleneck'].upper():<20} {s_b['bottleneck'].upper():<20} {bot.get('transition', '')}{bot_res_str}",
+        "",
+        " HARDWARE RESOURCE ALLOCATION",
+        "-" * 82,
+        f" {'Component':<28} {'Session A (Before)':<20} {'Session B (After)':<20} {'Shift':<14}",
+        "-" * 82,
+    ])
+
+    for comp_name, key in [("CPU Busy Utilization:", "cpu_busy_pct"), ("CPU Wait / Blocked:", "cpu_wait_pct"), ("GPU Busy Utilization:", "gpu_busy_pct")]:
+        h_data = hw.get(key, {})
+        a_str = f"{float(h_data.get('a', 0.0)):.1f}%"
+        b_str = f"{float(h_data.get('b', 0.0)):.1f}%"
+        delta_val = float(h_data.get('delta', 0.0))
+        s = "+" if delta_val > 0 else ""
+        d_str = f"{s}{delta_val:.1f}%"
+        lines.append(f" {comp_name:<28} {a_str:<20} {b_str:<20} {d_str:<14}")
+
     lines.extend(["=" * 82, ""])
     return "\n".join(lines)
 
@@ -760,8 +1052,12 @@ class ExperimentalValidationEngine:
     """
 
     @classmethod
-    def start_experiment(cls, profile_path, fix_id, baseline_session_id=None, baseline_metrics=None, auto_rollback=True):
+    def start_experiment(cls, profile_path, fix_id, baseline_session_id=None, baseline_metrics=None, auto_rollback=True, required_runs=1, **params):
         """Starts an isolated experiment for fix_id against a baseline session."""
+        if not FixRegistry.is_registered(fix_id):
+            raise ValueError(f"Unknown optimization fix '{fix_id}'. Must be registered in FixRegistry.")
+
+        canon_id = FixRegistry.canonical_id(fix_id)
         prof = EngineTweakManager.load_profile(profile_path) or {}
         if "experiments" not in prof:
             prof["experiments"] = {"fixes": {}}
@@ -769,33 +1065,36 @@ class ExperimentalValidationEngine:
             prof["experiments"]["fixes"] = {}
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        prof["experiments"]["active_experiment"] = fix_id
+        prof["experiments"]["active_experiment"] = canon_id
         if baseline_session_id:
             prof["experiments"]["baseline_session_id"] = baseline_session_id
 
-        # Enable the specific tweak under test in the profile
-        cls._enable_tweak_in_profile(prof, fix_id)
+        # Enable tweak under test and record transactional before-state snapshot
+        snapshot = cls._enable_tweak_in_profile(prof, canon_id, **params)
 
-        prof["experiments"]["fixes"][fix_id] = {
-            "fix_id": fix_id,
+        prof["experiments"]["fixes"][canon_id] = {
+            "fix_id": canon_id,
             "status": ExperimentStatus.APPLIED,
-            "detected_at": prof["experiments"]["fixes"].get(fix_id, {}).get("detected_at", now_iso),
+            "detected_at": prof["experiments"]["fixes"].get(canon_id, {}).get("detected_at", now_iso),
             "applied_at": now_iso,
             "baseline_session_id": baseline_session_id,
             "baseline_metrics": baseline_metrics or {},
             "benchmarked_metrics": {},
             "verdict": "PENDING",
             "auto_rollback": auto_rollback,
+            "required_validation_runs": max(1, int(required_runs)),
+            "runs": [],
+            "before_snapshot": snapshot,
         }
 
         cls._save_profile_dict(profile_path, prof)
-        log(f"Started experiment for fix '{fix_id}' (Baseline: {baseline_session_id or 'none'})")
-        return prof["experiments"]["fixes"][fix_id]
+        log(f"Started experiment for fix '{canon_id}' (Baseline: {baseline_session_id or 'none'}, Required Runs: {required_runs})")
+        return prof["experiments"]["fixes"][canon_id]
 
     @classmethod
     def evaluate_experiment(cls, profile_path, session_manifest, baseline_manifest=None):
         """Evaluates an active experiment by comparing session against baseline.
-        Graduates to VALIDATED if performance improved, or rolls back to REJECTED if regressed.
+        Graduates to VALIDATED if performance improved across required runs, or rolls back to REJECTED if regressed/mixed.
         """
         if not profile_path or not os.path.isfile(profile_path):
             return None
@@ -810,6 +1109,16 @@ class ExperimentalValidationEngine:
 
         fixes = exp_sec.get("fixes", {})
         fix_info = fixes.get(active_exp, {})
+        if not fix_info.get("before_snapshot") and fix_info.get("snapshot_json"):
+            try:
+                fix_info["before_snapshot"] = json.loads(fix_info["snapshot_json"])
+            except Exception:
+                pass
+        if not fix_info.get("runs") and fix_info.get("runs_json"):
+            try:
+                fix_info["runs"] = json.loads(fix_info["runs_json"])
+            except Exception:
+                pass
         current_status = fix_info.get("status", ExperimentStatus.APPLIED)
 
         if current_status in (ExperimentStatus.VALIDATED, ExperimentStatus.REJECTED):
@@ -834,11 +1143,12 @@ class ExperimentalValidationEngine:
             return fix_info
 
         diff = compute_session_diff(baseline_manifest, session_manifest)
-        verdict = diff.get("verdict", "NEUTRAL")
+        verdict = diff.get("verdict", ExperimentVerdict.NEUTRAL)
         m = diff.get("metrics", {})
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        fix_info["benchmarked_session_id"] = (session_manifest.get("session") or {}).get("id")
+        bench_sess_id = (session_manifest.get("session") or {}).get("id")
+        fix_info["benchmarked_session_id"] = bench_sess_id
         fix_info["benchmarked_at"] = now_iso
         fix_info["verdict"] = verdict
         fix_info["metrics_benchmarked"] = {
@@ -848,24 +1158,49 @@ class ExperimentalValidationEngine:
         }
         fix_info["comparison_summary"] = diff.get("summary", "")
 
-        if verdict == "IMPROVED":
-            fix_info["status"] = ExperimentStatus.VALIDATED
-            fix_info["validated_at"] = now_iso
-            exp_sec["active_experiment"] = None
+        # Record benchmark run in experiment history
+        runs = fix_info.setdefault("runs", [])
+        runs.append({
+            "session_id": bench_sess_id,
+            "timestamp": now_iso,
+            "verdict": verdict,
+            "summary": diff.get("summary", ""),
+        })
+
+        if verdict == ExperimentVerdict.INSUFFICIENT_DATA:
+            fix_info["status"] = ExperimentStatus.BENCHMARKED
             cls._save_profile_dict(profile_path, prof)
-            log(f"Experiment VALIDATED for '{active_exp}': {diff.get('summary')} (Promoted to Play Mode default)")
-        elif verdict == "REGRESSED":
+            log(f"Experiment for '{active_exp}' has INSUFFICIENT_DATA: {diff.get('summary')} (Remains under test)")
+            return fix_info
+
+        if verdict in (ExperimentVerdict.REGRESSED, ExperimentVerdict.MIXED):
             fix_info["status"] = ExperimentStatus.REJECTED
             fix_info["rejected_at"] = now_iso
             if fix_info.get("auto_rollback", True):
                 cls._rollback_tweak_in_profile(prof, active_exp)
                 exp_sec["active_experiment"] = None
-                log(f"Experiment REGRESSED for '{active_exp}': {diff.get('summary')} (Automatically rolled back to stock)")
+                log(f"Experiment {verdict} for '{active_exp}': {diff.get('summary')} (Automatically rolled back to baseline)")
             cls._save_profile_dict(profile_path, prof)
-        else: # NEUTRAL
-            fix_info["status"] = ExperimentStatus.BENCHMARKED
-            cls._save_profile_dict(profile_path, prof)
+            return fix_info
 
+        if verdict == ExperimentVerdict.IMPROVED:
+            req_runs = int(fix_info.get("required_validation_runs", 1))
+            improved_count = sum(1 for r in runs if r.get("verdict") == ExperimentVerdict.IMPROVED)
+            if improved_count >= req_runs:
+                fix_info["status"] = ExperimentStatus.VALIDATED
+                fix_info["validated_at"] = now_iso
+                exp_sec["active_experiment"] = None
+                cls._save_profile_dict(profile_path, prof)
+                log(f"Experiment VALIDATED for '{active_exp}': {diff.get('summary')} ({improved_count}/{req_runs} runs passed - promoted to Play Mode default)")
+            else:
+                fix_info["status"] = ExperimentStatus.BENCHMARKED
+                cls._save_profile_dict(profile_path, prof)
+                log(f"Experiment run {improved_count}/{req_runs} IMPROVED for '{active_exp}'. Additional run required to reach validation threshold.")
+            return fix_info
+
+        # NEUTRAL
+        fix_info["status"] = ExperimentStatus.BENCHMARKED
+        cls._save_profile_dict(profile_path, prof)
         return fix_info
 
     @classmethod
@@ -876,65 +1211,109 @@ class ExperimentalValidationEngine:
         prof = EngineTweakManager.load_profile(profile_path)
         if not prof:
             return ExperimentStatus.DETECTED
-        fix_info = prof.get("experiments", {}).get("fixes", {}).get(fix_id)
-        if fix_info and fix_info.get("status"):
-            return fix_info["status"]
+        canon_id = FixRegistry.canonical_id(fix_id)
+        fixes = prof.get("experiments", {}).get("fixes", {})
+        if canon_id in fixes and fixes[canon_id].get("status"):
+            return fixes[canon_id]["status"]
+        governing = FixRegistry.find_governing_experiments(canon_id, fixes)
+        if governing:
+            return governing[0].get("status", ExperimentStatus.DETECTED)
         return ExperimentStatus.DETECTED
 
     @classmethod
-    def _enable_tweak_in_profile(cls, prof, fix_id):
-        """Enables the specific tweak in the profile dictionary."""
-        if fix_id == "atelier_sync_fix":
-            prof.setdefault("synchronization", {})["atelier_sync_fix"] = True
-        elif fix_id == "state_dedup":
-            prof.setdefault("synchronization", {})["state_dedup"] = True
-        elif fix_id == "swapchain_debounce":
-            prof.setdefault("synchronization", {})["swapchain_debounce"] = True
-        elif fix_id in ("state_dedup_and_debounce", "state_dedup"):
-            prof.setdefault("synchronization", {})["state_dedup"] = True
-            prof.setdefault("synchronization", {})["swapchain_debounce"] = True
-        elif fix_id == "precision_timers" or fix_id == "enable_precision_timers":
-            prof.setdefault("timing", {})["precision_timers"] = True
-        elif fix_id == "io_cache" or fix_id == "enable_io_cache":
-            prof.setdefault("filesystem", {})["io_cache"] = True
-        elif fix_id == "enable_descriptor_buffer":
-            prof.setdefault("graphics", {})["descriptor_buffer"] = True
-        elif fix_id == "local_shader_cache":
-            prof.setdefault("graphics", {})["local_shader_cache"] = True
-        elif fix_id == "async_shader_compile":
-            prof.setdefault("graphics", {})["async_shader_compile"] = True
+    def _enable_tweak_in_profile(cls, prof, fix_id, **params):
+        """Enables the specific tweak in the profile dictionary and returns a transactional before-snapshot."""
+        defn = FixRegistry.get(fix_id)
+        if not defn:
+            raise ValueError(f"Unknown optimization fix '{fix_id}'. Must be registered in FixRegistry.")
+
+        snapshot = {}
+        for path_tuple, default_val in defn.profile_targets:
+            val_to_set = default_val
+            if fix_id == "cap_framerate" and "cap_target" in params:
+                val_to_set = int(params["cap_target"])
+            elif "value" in params:
+                val_to_set = params["value"]
+
+            # Capture snapshot before mutating
+            curr = prof
+            existed = True
+            for seg in path_tuple[:-1]:
+                if not isinstance(curr, dict) or seg not in curr:
+                    existed = False
+                    break
+                curr = curr[seg]
+
+            path_str = ".".join(path_tuple)
+            if existed and isinstance(curr, dict) and path_tuple[-1] in curr:
+                snapshot[path_str] = {
+                    "existed": True,
+                    "value": copy.deepcopy(curr[path_tuple[-1]]),
+                    "path": list(path_tuple),
+                }
+            else:
+                snapshot[path_str] = {
+                    "existed": False,
+                    "value": None,
+                    "path": list(path_tuple),
+                }
+
+            # Apply tweak
+            curr = prof
+            for seg in path_tuple[:-1]:
+                curr = curr.setdefault(seg, {})
+            curr[path_tuple[-1]] = val_to_set
+
+        return snapshot
 
     @classmethod
-    def _rollback_tweak_in_profile(cls, prof, fix_id):
-        """Disables/rolls back a tweak in the profile dictionary."""
-        if fix_id == "atelier_sync_fix":
-            if "synchronization" in prof:
-                prof["synchronization"]["atelier_sync_fix"] = False
-        elif fix_id == "state_dedup":
-            if "synchronization" in prof:
-                prof["synchronization"]["state_dedup"] = False
-        elif fix_id == "swapchain_debounce":
-            if "synchronization" in prof:
-                prof["synchronization"]["swapchain_debounce"] = False
-        elif fix_id in ("state_dedup_and_debounce", "state_dedup"):
-            if "synchronization" in prof:
-                prof["synchronization"]["state_dedup"] = False
-                prof["synchronization"]["swapchain_debounce"] = False
-        elif fix_id in ("precision_timers", "enable_precision_timers"):
-            if "timing" in prof:
-                prof["timing"]["precision_timers"] = False
-        elif fix_id in ("io_cache", "enable_io_cache"):
-            if "filesystem" in prof:
-                prof["filesystem"]["io_cache"] = False
-        elif fix_id == "enable_descriptor_buffer":
-            if "graphics" in prof:
-                prof["graphics"]["descriptor_buffer"] = False
-        elif fix_id == "local_shader_cache":
-            if "graphics" in prof:
-                prof["graphics"]["local_shader_cache"] = False
-        elif fix_id == "async_shader_compile":
-            if "graphics" in prof:
-                prof["graphics"]["async_shader_compile"] = False
+    def _rollback_tweak_in_profile(cls, prof, fix_id, snapshot=None):
+        """Disables/rolls back a tweak in the profile dictionary restoring exact pre-experiment state."""
+        canon_id = FixRegistry.canonical_id(fix_id)
+        if snapshot is None:
+            fix_info = prof.get("experiments", {}).get("fixes", {}).get(canon_id, {})
+            snapshot = fix_info.get("before_snapshot")
+            if not snapshot and fix_info.get("snapshot_json"):
+                try:
+                    snapshot = json.loads(fix_info["snapshot_json"])
+                except Exception:
+                    snapshot = None
+
+        if snapshot:
+            for path_str, snap in snapshot.items():
+                path = snap.get("path") or path_str.split(".")
+                existed = snap.get("existed", False)
+                orig_val = snap.get("value")
+                curr = prof
+                parents = []
+                for seg in path[:-1]:
+                    if not isinstance(curr, dict) or seg not in curr:
+                        curr = None
+                        break
+                    parents.append((curr, seg))
+                    curr = curr[seg]
+                if curr is not None and isinstance(curr, dict):
+                    last_key = path[-1]
+                    if existed:
+                        curr[last_key] = orig_val
+                    else:
+                        curr.pop(last_key, None)
+                    # Clean up empty parent sections
+                    for parent_dict, seg in reversed(parents):
+                        if seg in parent_dict and not parent_dict[seg]:
+                            del parent_dict[seg]
+        else:
+            defn = FixRegistry.get(canon_id)
+            if defn:
+                for path_tuple, _ in defn.profile_targets:
+                    curr = prof
+                    for seg in path_tuple[:-1]:
+                        if not isinstance(curr, dict) or seg not in curr:
+                            curr = None
+                            break
+                        curr = curr[seg]
+                    if curr and isinstance(curr, dict):
+                        curr[path_tuple[-1]] = False
 
     @classmethod
     def _save_profile_dict(cls, profile_path, prof):
@@ -952,7 +1331,9 @@ class ExperimentalValidationEngine:
             sync_backend=sync_b,
             user_tweaks=prof,
         )
-        os.makedirs(os.path.dirname(profile_path), exist_ok=True)
+        dir_name = os.path.dirname(profile_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
         with open(profile_path, "w", encoding="utf-8") as f:
             f.write(toml_text)
 
@@ -1179,7 +1560,7 @@ class EngineTweakManager:
             "[graphics]",
             f'backend = "{gfx_cfg.get("backend", "dxvk")}"',
             f'force_vsync = "{gfx_cfg.get("force_vsync", "off")}"',
-            f'max_fps = {gfx_cfg.get("max_fps", 0)}',
+            f'max_fps = {int(gfx_cfg.get("max_fps", 0)) if isinstance(gfx_cfg.get("max_fps", 0), (int, float)) and not isinstance(gfx_cfg.get("max_fps", 0), bool) else 0}',
             f'anisotropic_filtering = {gfx_cfg.get("anisotropic_filtering", 16)}',
             f'async_shader_compile = {"true" if gfx_cfg.get("async_shader_compile", True) else "false"}',
             f'low_latency = {"true" if gfx_cfg.get("low_latency", True) else "false"}',
@@ -1348,6 +1729,22 @@ class EngineTweakManager:
                     lines.append(f'validated_at = "{f_data["validated_at"]}"')
                 if f_data.get("rejected_at"):
                     lines.append(f'rejected_at = "{f_data["rejected_at"]}"')
+                if f_data.get("required_validation_runs"):
+                    lines.append(f'required_validation_runs = {int(f_data["required_validation_runs"])}')
+                snap_to_write = f_data.get("before_snapshot")
+                if snap_to_write:
+                    raw_snap = json.dumps(snap_to_write).replace('\\', '\\\\').replace('"', '\\"')
+                    lines.append(f'snapshot_json = "{raw_snap}"')
+                elif f_data.get("snapshot_json"):
+                    raw_snap = str(f_data["snapshot_json"]).replace('\\', '\\\\').replace('"', '\\"')
+                    lines.append(f'snapshot_json = "{raw_snap}"')
+                runs_to_write = f_data.get("runs")
+                if runs_to_write:
+                    raw_runs = json.dumps(runs_to_write).replace('\\', '\\\\').replace('"', '\\"')
+                    lines.append(f'runs_json = "{raw_runs}"')
+                elif f_data.get("runs_json"):
+                    raw_runs = str(f_data["runs_json"]).replace('\\', '\\\\').replace('"', '\\"')
+                    lines.append(f'runs_json = "{raw_runs}"')
 
         hotkey = tweaks.get("hotkey") or tweaks.get("profiling", {}).get("hotkey")
         if hotkey:
@@ -1441,18 +1838,20 @@ class EngineTweakManager:
         mode = env.get("PROTOGOBLIN_MODE", "").lower().strip() or profile.get("runtime", {}).get("mode", "play")
         experiments = profile.get("experiments", {}).get("fixes", {})
 
-        def _filter_by_experiment(fix_id, active):
+        def _filter_by_experiment(feature_id, active):
             if not active:
                 return False
-            f_info = experiments.get(fix_id)
-            if not f_info:
+            governing = FixRegistry.find_governing_experiments(feature_id, experiments)
+            if not governing:
                 return True # Standard non-experimental tweak
-            st = f_info.get("status", ExperimentStatus.APPLIED)
-            if st == ExperimentStatus.REJECTED:
-                return False # Rolled back!
-            if mode == "play" and f_info.get("require_validated_for_play", True):
-                return st == ExperimentStatus.VALIDATED
-            return st in (ExperimentStatus.APPLIED, ExperimentStatus.BENCHMARKED, ExperimentStatus.VALIDATED)
+            # If any governing experiment was rejected, it is suppressed
+            if any(g.get("status") == ExperimentStatus.REJECTED for g in governing):
+                return False
+            # In Play Mode, only validated fixes are applied
+            if mode == "play":
+                return all(g.get("status") == ExperimentStatus.VALIDATED for g in governing)
+            # In Profile Mode (benchmarking), applied/benchmarked/validated are permitted
+            return any(g.get("status") in (ExperimentStatus.APPLIED, ExperimentStatus.BENCHMARKED, ExperimentStatus.VALIDATED) for g in governing)
 
         sync_fix_enabled = _filter_by_experiment("atelier_sync_fix", sync_fix_enabled)
         state_dedup_enabled = _filter_by_experiment("state_dedup", state_dedup_enabled)
@@ -1493,7 +1892,7 @@ class EngineTweakManager:
         elif gfx_sec.get("force_vsync") == "on":
             dxvk_items.extend(["dxgi.syncInterval = 1", "d3d11.syncInterval = 1"])
 
-        if gfx_sec.get("max_fps", 0) > 0:
+        if gfx_sec.get("max_fps", 0) > 0 and _filter_by_experiment("cap_framerate", True):
             limit = gfx_sec["max_fps"]
             dxvk_items.append(f"dxgi.maxFrameRate = {limit}")
             env["VKD3D_FRAME_RATE"] = str(limit)
@@ -1502,7 +1901,7 @@ class EngineTweakManager:
         if af and int(af) > 0:
             dxvk_items.append(f"d3d11.samplerAnisotropy = {af}")
 
-        if gfx_sec.get("async_shader_compile"):
+        if gfx_sec.get("async_shader_compile") and _filter_by_experiment("async_shader_compile", True):
             env["DXVK_ASYNC"] = "1"
             dxvk_items.append("dxvk.enableAsync = true")
 
@@ -1511,7 +1910,7 @@ class EngineTweakManager:
             dxvk_items.append("dxvk.nvLowLatency2 = true")
             env["DXVK_NVAPI_ENABLE_REFLEX"] = "1"
 
-        if gfx_sec.get("descriptor_buffer"):
+        if gfx_sec.get("descriptor_buffer") and _filter_by_experiment("descriptor_buffer", True):
             dxvk_items.append("dxvk.enableDescriptorBuffer = true")
 
         if sync_sec.get("ntsync") or sync_sec.get("preferred_backend") == "ntsync":

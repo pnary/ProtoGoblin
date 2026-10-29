@@ -20,7 +20,9 @@ from protogoblin import (
     EngineDetector,
     EngineTweakManager,
     ExperimentStatus,
+    ExperimentVerdict,
     ExperimentalValidationEngine,
+    FixRegistry,
     NativeDllSnagger,
     PresetDatabase,
     ProtoGoblinSession,
@@ -1293,7 +1295,7 @@ class TestSessionComparison(unittest.TestCase):
         }
 
         diff = compute_session_diff(manifest_a, manifest_b)
-        self.assertEqual(diff["verdict"], "NEUTRAL")
+        self.assertEqual(diff["verdict"], "INSUFFICIENT_DATA")
         report = format_diff_report(diff)
         self.assertIn("NOTICE: One or both sessions were executed in PLAY mode", report)
 
@@ -2606,6 +2608,323 @@ class TestExperimentalValidationLifecycleAndBugFixes(unittest.TestCase):
         # Verify automatic rollback disabled the tweak in profile
         prof_after = EngineTweakManager.load_profile(self.profile_path)
         self.assertFalse(EngineTweakManager.is_feature_enabled(prof_after.get("synchronization", {}).get("swapchain_debounce")))
+
+    def test_insufficient_data_safeguards(self):
+        """Verifies that incomplete, non-comparable, or corrupt sessions cannot produce successful validation."""
+        # Case A: Target binary mismatch
+        manifest_a = {
+            "session": {"id": "base", "mode": "profile"},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "GameA.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 60.0}},
+        }
+        manifest_b = {
+            "session": {"id": "bench", "mode": "profile"},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "DifferentGameB.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 80.0}},
+        }
+        diff = compute_session_diff(manifest_a, manifest_b)
+        self.assertEqual(diff["verdict"], ExperimentVerdict.INSUFFICIENT_DATA)
+        self.assertIn("Incompatible target binaries", diff["summary"])
+
+        # Case B: Zero rendered frames
+        manifest_zero_frames = {
+            "session": {"id": "bench2", "mode": "profile"},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "GameA.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_count": 0, "frame_metrics": {"fps_avg": 0.0}},
+        }
+        diff2 = compute_session_diff(manifest_a, manifest_zero_frames)
+        self.assertEqual(diff2["verdict"], ExperimentVerdict.INSUFFICIENT_DATA)
+
+        # Case C: Non-comparable capture durations (e.g. 1.0s vs 60.0s)
+        manifest_short = {
+            "session": {"id": "bench3", "mode": "profile", "duration_seconds": 1.0},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "GameA.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "duration_seconds": 1.0, "frame_metrics": {"fps_avg": 90.0}},
+        }
+        manifest_long = {
+            "session": {"id": "base3", "mode": "profile", "duration_seconds": 60.0},
+            "target": {"steam_appid": "12345", "target_executable": {"path": "GameA.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "duration_seconds": 60.0, "frame_metrics": {"fps_avg": 50.0}},
+        }
+        diff3 = compute_session_diff(manifest_long, manifest_short)
+        self.assertEqual(diff3["verdict"], ExperimentVerdict.INSUFFICIENT_DATA)
+        self.assertIn("Non-comparable capture durations", diff3["summary"])
+
+    def test_regression_priority_over_improvement(self):
+        """Verifies that severe frame-pacing / stutter regression strictly overrides modest average FPS gains."""
+        manifest_a = {
+            "session": {"id": "base", "mode": "profile"},
+            "target": {"steam_appid": "100", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 60.0, "fps_1_pct_low": 45.0, "frametime_jitter_ms": 3.0},
+            },
+        }
+        # Average FPS +6.7% (60 -> 64), but 1% lows -28.9% (45 -> 32)
+        manifest_b = {
+            "session": {"id": "bench", "mode": "profile"},
+            "target": {"steam_appid": "100", "target_executable": {"path": "Game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 64.0, "fps_1_pct_low": 32.0, "frametime_jitter_ms": 7.0},
+            },
+        }
+        diff = compute_session_diff(manifest_a, manifest_b)
+        self.assertEqual(diff["verdict"], ExperimentVerdict.REGRESSED)
+        self.assertIn("1% lows", diff["summary"])
+
+    def test_mixed_verdict_prevents_play_mode_promotion(self):
+        """Verifies that mixed performance outcomes are flagged and trigger rejection instead of promotion."""
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="300",
+            app_id="300",
+            target_exe="game.exe",
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="state_dedup",
+            baseline_session_id="base_300",
+        )
+
+        manifest_a = {
+            "session": {"id": "base_300", "mode": "profile"},
+            "target": {"steam_appid": "300", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 50.0, "fps_1_pct_low": 40.0, "frametime_jitter_ms": 2.0},
+            },
+        }
+        # Average FPS +10% (50 -> 55), but 1% low -12.5% (40 -> 35)
+        manifest_b = {
+            "session": {"id": "bench_300", "mode": "profile"},
+            "target": {"steam_appid": "300", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "frame_metrics": {"fps_avg": 55.0, "fps_1_pct_low": 35.0, "frametime_jitter_ms": 2.2},
+            },
+        }
+
+        res = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=manifest_b,
+            baseline_manifest=manifest_a,
+        )
+        self.assertEqual(res["status"], ExperimentStatus.REJECTED)
+        self.assertEqual(res["verdict"], ExperimentVerdict.MIXED)
+
+    def test_transactional_rollback_preserves_custom_settings(self):
+        """Verifies that rollback restores pre-existing custom values (e.g. max_fps = 144) rather than blindly disabling them."""
+        # Initialize profile with a pre-existing custom setting
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="400",
+            app_id="400",
+            target_exe="game.exe",
+            user_tweaks={"graphics": {"max_fps": 144}},
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        prof_initial = EngineTweakManager.load_profile(self.profile_path)
+        self.assertEqual(prof_initial.get("graphics", {}).get("max_fps"), 144)
+
+        # Start cap_framerate experiment (overwrites max_fps with 60)
+        ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="cap_framerate",
+            baseline_session_id="base_400",
+            cap_target=60,
+        )
+        prof_during = EngineTweakManager.load_profile(self.profile_path)
+        self.assertEqual(prof_during.get("graphics", {}).get("max_fps"), 60)
+
+        # Regress & trigger rollback
+        manifest_a = {
+            "session": {"id": "base_400", "mode": "profile"},
+            "target": {"steam_appid": "400", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 140.0, "fps_1_pct_low": 100.0}},
+        }
+        manifest_b = {
+            "session": {"id": "bench_400", "mode": "profile"},
+            "target": {"steam_appid": "400", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 59.0, "fps_1_pct_low": 50.0}},
+        }
+        res = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=manifest_b,
+            baseline_manifest=manifest_a,
+        )
+        self.assertEqual(res["status"], ExperimentStatus.REJECTED)
+
+        # Verify max_fps was restored to exactly 144!
+        prof_rolled_back = EngineTweakManager.load_profile(self.profile_path)
+        self.assertEqual(prof_rolled_back.get("graphics", {}).get("max_fps"), 144)
+
+    def test_composite_fix_registry_gating(self):
+        """Verifies that a composite recommendation (state_dedup_and_debounce) gates all constituent features."""
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="500",
+            app_id="500",
+            target_exe="game.exe",
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        # Start composite experiment
+        ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="state_dedup_and_debounce",
+            baseline_session_id="base_500",
+        )
+
+        prof = EngineTweakManager.load_profile(self.profile_path)
+
+        # In Play Mode: neither constituent feature should be applied
+        env_play = {}
+        EngineTweakManager.apply_tweaks(
+            profile=prof,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env_play,
+        )
+        self.assertNotIn("PROTOGOBLIN_STATE_DEDUP", env_play)
+        self.assertNotIn("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE", env_play)
+
+        # In Profile Mode: BOTH constituent features should be applied for benchmark
+        env_prof = {"PROTOGOBLIN_MODE": "profile"}
+        EngineTweakManager.apply_tweaks(
+            profile=prof,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env_prof,
+        )
+        self.assertEqual(env_prof.get("PROTOGOBLIN_STATE_DEDUP"), "1")
+        self.assertEqual(env_prof.get("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE"), "1")
+
+        # Evaluate experiment with IMPROVED metrics
+        manifest_a = {
+            "session": {"id": "base_500", "mode": "profile"},
+            "target": {"steam_appid": "500", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 50.0, "fps_1_pct_low": 30.0}},
+        }
+        manifest_b = {
+            "session": {"id": "bench_500", "mode": "profile"},
+            "target": {"steam_appid": "500", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 58.0, "fps_1_pct_low": 42.0}},
+        }
+        res = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=manifest_b,
+            baseline_manifest=manifest_a,
+        )
+        self.assertEqual(res["status"], ExperimentStatus.VALIDATED)
+
+        # Now in Play Mode, BOTH are validated and active as permanent defaults!
+        env_play_val = {}
+        prof_val = EngineTweakManager.load_profile(self.profile_path)
+        EngineTweakManager.apply_tweaks(
+            profile=prof_val,
+            engine_info={"engine": "generic"},
+            argv=["game.exe"],
+            env=env_play_val,
+        )
+        self.assertEqual(env_play_val.get("PROTOGOBLIN_STATE_DEDUP"), "1")
+        self.assertEqual(env_play_val.get("PROTOGOBLIN_SWAPCHAIN_DEBOUNCE"), "1")
+
+    def test_multi_run_validation_confidence(self):
+        """Verifies multi-run validation tracking requiring 2 consecutive improvements before promotion."""
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="600",
+            app_id="600",
+            target_exe="game.exe",
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="state_dedup",
+            baseline_session_id="base_600",
+            required_runs=2,
+        )
+
+        manifest_base = {
+            "session": {"id": "base_600", "mode": "profile"},
+            "target": {"steam_appid": "600", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 50.0, "fps_1_pct_low": 30.0}},
+        }
+        manifest_run1 = {
+            "session": {"id": "bench_run1", "mode": "profile"},
+            "target": {"steam_appid": "600", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 55.0, "fps_1_pct_low": 38.0}},
+        }
+
+        # Run 1: IMPROVED, but requires 2 runs, so remains BENCHMARKED
+        res1 = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=manifest_run1,
+            baseline_manifest=manifest_base,
+        )
+        self.assertEqual(res1["status"], ExperimentStatus.BENCHMARKED)
+        self.assertEqual(res1["verdict"], ExperimentVerdict.IMPROVED)
+
+        # Run 2: IMPROVED, reaches required 2 runs -> graduates to VALIDATED
+        manifest_run2 = {
+            "session": {"id": "bench_run2", "mode": "profile"},
+            "target": {"steam_appid": "600", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 56.0, "fps_1_pct_low": 39.0}},
+        }
+        res2 = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=manifest_run2,
+            baseline_manifest=manifest_base,
+        )
+        self.assertEqual(res2["status"], ExperimentStatus.VALIDATED)
+
+    def test_unknown_fix_id_fails_explicitly(self):
+        """Verifies that attempting to start an experiment for an unknown fix raises ValueError."""
+        with self.assertRaises(ValueError):
+            ExperimentalValidationEngine.start_experiment(
+                profile_path=self.profile_path,
+                fix_id="nonexistent_fictional_optimization_fix",
+            )
+
+    def test_target_crash_during_experiment_triggers_regression(self):
+        """Verifies that an unhandled crash during an experiment marks it as REGRESSED and rolls back."""
+        init_toml = EngineTweakManager.generate_profile_toml(
+            game_id="700",
+            app_id="700",
+            target_exe="game.exe",
+        )
+        with open(self.profile_path, "w", encoding="utf-8") as f:
+            f.write(init_toml)
+
+        ExperimentalValidationEngine.start_experiment(
+            profile_path=self.profile_path,
+            fix_id="io_cache",
+            baseline_session_id="base_clean",
+        )
+
+        manifest_clean_base = {
+            "session": {"id": "base_clean", "mode": "profile", "exit_code": 0, "clean_shutdown": True},
+            "target": {"steam_appid": "700", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 60.0, "fps_1_pct_low": 40.0}},
+        }
+        manifest_crashed_target = {
+            "session": {"id": "bench_crash", "mode": "profile", "exit_code": 1, "clean_shutdown": False},
+            "target": {"steam_appid": "700", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {"roi_enabled": True, "frame_metrics": {"fps_avg": 70.0, "fps_1_pct_low": 50.0}},
+        }
+
+        res = ExperimentalValidationEngine.evaluate_experiment(
+            profile_path=self.profile_path,
+            session_manifest=manifest_crashed_target,
+            baseline_manifest=manifest_clean_base,
+        )
+        self.assertEqual(res["status"], ExperimentStatus.REJECTED)
+        self.assertEqual(res["verdict"], ExperimentVerdict.REGRESSED)
 
 
 if __name__ == "__main__":
