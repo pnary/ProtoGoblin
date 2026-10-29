@@ -2179,5 +2179,225 @@ class TestSteamDeckIntegration(unittest.TestCase):
         self.assertTrue(any("Witcher" in t for t in titles))
 
 
+
+
+class TestCommanderGameLauncherAndLiveUpdate(unittest.TestCase):
+    """Tests for game launching (Steam & non-Steam), profiling mode toggling, and live UI updating."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.old_xdg_data = os.environ.get("XDG_DATA_HOME")
+        self.old_xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        self.old_steam_dir = os.environ.get("STEAM_DIR")
+        self.old_steam_lib = os.environ.get("STEAM_LIBRARY")
+
+        os.environ["XDG_DATA_HOME"] = os.path.join(self.td.name, "data")
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(self.td.name, "config")
+        os.makedirs(os.environ["XDG_DATA_HOME"], exist_ok=True)
+        os.makedirs(os.environ["XDG_CONFIG_HOME"], exist_ok=True)
+
+        self.steam_lib_dir = os.path.join(self.td.name, "steamapps")
+        os.makedirs(self.steam_lib_dir, exist_ok=True)
+        os.environ["STEAM_LIBRARY"] = self.steam_lib_dir
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = ProtoGoblinCommandApp(self.root, auto_refresh=False)
+
+        # Mock process launcher
+        self.launched_commands = []
+        def mock_launcher(cmd, **kwargs):
+            self.launched_commands.append((cmd, kwargs))
+            class MockProc:
+                pid = 9999
+            return MockProc()
+        self.app.process_launcher = mock_launcher
+
+    def tearDown(self):
+        self.app.stop_auto_refresh()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self.td.cleanup()
+        if self.old_xdg_data is not None:
+            os.environ["XDG_DATA_HOME"] = self.old_xdg_data
+        else:
+            os.environ.pop("XDG_DATA_HOME", None)
+        if self.old_xdg_config is not None:
+            os.environ["XDG_CONFIG_HOME"] = self.old_xdg_config
+        else:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        if self.old_steam_dir is not None:
+            os.environ["STEAM_DIR"] = self.old_steam_dir
+        else:
+            os.environ.pop("STEAM_DIR", None)
+        if self.old_steam_lib is not None:
+            os.environ["STEAM_LIBRARY"] = self.old_steam_lib
+        else:
+            os.environ.pop("STEAM_LIBRARY", None)
+
+    def test_get_installed_steam_games(self):
+        # Create mock appmanifest files
+        acf_1 = os.path.join(self.steam_lib_dir, "appmanifest_480.acf")
+        with open(acf_1, "w", encoding="utf-8") as f:
+            f.write('"AppState" { "appid" "480" "name" "Spacewar" "installdir" "Spacewar" }')
+
+        acf_2 = os.path.join(self.steam_lib_dir, "appmanifest_2555360.acf")
+        with open(acf_2, "w", encoding="utf-8") as f:
+            f.write('"AppState" { "appid" "2555360" "name" "Immortals of Aveum Demo" "installdir" "Aveum" }')
+
+        self.app._steam_libs_cache = None
+        games = self.app.get_installed_steam_games()
+        app_ids = [g["app_id"] for g in games]
+        names = [g["name"] for g in games]
+
+        self.assertIn("480", app_ids)
+        self.assertIn("2555360", app_ids)
+        self.assertIn("Spacewar", names)
+        self.assertIn("Immortals of Aveum Demo", names)
+
+    def test_get_profiled_non_steam_games(self):
+        # 1. Create a non-steam session manifest
+        sess_dir = os.path.join(os.environ["XDG_DATA_HOME"], "protogoblin", "sessions", "custom_game", "sess_custom")
+        os.makedirs(sess_dir, exist_ok=True)
+        manifest_path = os.path.join(sess_dir, "utilization.json")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "session": {"id": "sess_custom", "mode": "play", "prefix_dir": "/opt/prefix"},
+                "target": {
+                    "steam_appid": "custom_game",
+                    "target_executable": {"path": "/opt/games/indie/IndieGame.exe"},
+                    "working_directory": "/opt/games/indie",
+                },
+            }, f)
+
+        # 2. Create a non-steam profile TOML
+        prof_dir = os.path.join(os.environ["XDG_CONFIG_HOME"], "protogoblin", "games")
+        os.makedirs(prof_dir, exist_ok=True)
+        prof_file = os.path.join(prof_dir, "my_rpg.toml")
+        with open(prof_file, "w", encoding="utf-8") as f:
+            f.write('''[game]
+app_id = "my_rpg"
+target_exe = "/home/user/games/rpg.exe"
+prefix_dir = "/home/user/prefixes/rpg"
+[runtime]
+mode = "profile"
+''')
+
+        self.app.manifest_paths = [manifest_path]
+        non_steam = self.app.get_profiled_non_steam_games()
+        self.assertGreaterEqual(len(non_steam), 2)
+        exes = [g["target_exe"] for g in non_steam]
+        self.assertIn("/opt/games/indie/IndieGame.exe", exes)
+        self.assertIn("/home/user/games/rpg.exe", exes)
+
+    def test_profile_mode_toggling_and_persistence(self):
+        # Initially play
+        mode_initial = self.app.get_game_profile_mode("480")
+        self.assertEqual(mode_initial, "play")
+
+        # Toggle to profile
+        p_path = self.app.set_game_profile_mode("480", "profile")
+        self.assertTrue(os.path.isfile(p_path))
+        self.assertEqual(self.app.get_game_profile_mode("480"), "profile")
+
+        with open(p_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn('mode = "profile"', content)
+
+        # Toggle back to play
+        self.app.set_game_profile_mode("480", "play")
+        self.assertEqual(self.app.get_game_profile_mode("480"), "play")
+
+    def test_launch_installed_steam_game(self):
+        res = self.app.launch_game(480, game_name="Spacewar")
+        self.assertTrue(res["success"])
+        self.assertEqual(len(self.launched_commands), 1)
+        cmd, _ = self.launched_commands[0]
+        cmd_str = " ".join(cmd)
+        self.assertIn("steam://rungameid/480", cmd_str)
+        self.assertIn("Spacewar", self.app.status_bar_lbl.cget("text"))
+
+    def test_launch_profiled_non_steam_game(self):
+        target = "C:\\Games\\MyGame\\Game.exe"
+        res = self.app.launch_game(
+            "custom_app",
+            target_exe=target,
+            argv=[target, "--debug"],
+            prefix_dir="C:\\Prefixes\\MyGame",
+            game_name="My Custom Game",
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(len(self.launched_commands), 1)
+        cmd, kwargs = self.launched_commands[0]
+        cmd_str = " ".join(cmd)
+        self.assertIn("Game.exe", cmd_str)
+        self.assertIn("My Custom Game", self.app.status_bar_lbl.cget("text"))
+
+    def test_live_ui_update_on_new_session_without_restart(self):
+        # 1. Setup initial session
+        sess1_dir = os.path.join(os.environ["XDG_DATA_HOME"], "protogoblin", "sessions", "12345", "sess_01")
+        os.makedirs(sess1_dir, exist_ok=True)
+        sess1_file = os.path.join(sess1_dir, "utilization.json")
+        with open(sess1_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "session": {"id": "sess_01", "mode": "play", "start_time": "2026-10-29T08:00:00Z"},
+                "target": {"steam_appid": 12345, "target_executable": {"path": "C:\\Game\\test.exe"}},
+            }, f)
+        # Touch timestamp
+        os.utime(sess1_file, (1000000, 1000000))
+
+        self.app.refresh_sessions()
+        self.assertIsNotNone(self.app.current_manifest)
+        self.assertEqual(self.app.current_manifest["session"]["id"], "sess_01")
+
+        # 2. Simulate running a profiling session while GUI is open
+        sess2_dir = os.path.join(os.environ["XDG_DATA_HOME"], "protogoblin", "sessions", "12345", "sess_02")
+        os.makedirs(sess2_dir, exist_ok=True)
+        sess2_file = os.path.join(sess2_dir, "utilization.json")
+        with open(sess2_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "session": {"id": "sess_02", "mode": "profile", "start_time": "2026-10-29T08:15:00Z"},
+                "target": {"steam_appid": 12345, "target_executable": {"path": "C:\\Game\\test.exe"}},
+            }, f)
+        os.utime(sess2_file, (2000000, 2000000))
+
+        # 3. Trigger auto-refresh check
+        self.app._auto_refresh_check()
+
+        # 4. Verify GUI updated to sess_02 without closing and reopening!
+        self.assertEqual(self.app.current_manifest["session"]["id"], "sess_02")
+        self.assertEqual(self.app.current_manifest["session"]["mode"], "profile")
+        self.assertIn("sess_02", self.app.diag_header_lbl.cget("text"))
+        self.assertIn("Dashboard auto-updated", self.app.status_bar_lbl.cget("text"))
+
+    def test_game_launcher_dialog(self):
+        from protogoblin_command import GameLauncherDialog
+
+        # Create mock installed Steam game
+        acf = os.path.join(self.steam_lib_dir, "appmanifest_480.acf")
+        with open(acf, "w", encoding="utf-8") as f:
+            f.write('"AppState" { "appid" "480" "name" "Spacewar" "installdir" "Spacewar" }')
+        self.app._steam_libs_cache = None
+
+        dlg = GameLauncherDialog(self.app)
+        self.assertGreaterEqual(len(dlg.visible_games), 1)
+
+        # Toggle profiling mode in dialog
+        dlg.tree.selection_set("0")
+        dlg.on_select_changed()
+        initial_mode = dlg.visible_games[0]["mode"]
+        dlg.on_toggle_mode_clicked()
+        new_mode = dlg.visible_games[0]["mode"]
+        self.assertNotEqual(initial_mode, new_mode)
+
+        # Test launch from dialog
+        dlg.on_launch_clicked()
+        self.assertEqual(len(self.launched_commands), 1)
+        cmd, _ = self.launched_commands[0]
+        self.assertIn("steam://rungameid/480", " ".join(cmd))
+
+
 if __name__ == "__main__":
     unittest.main()

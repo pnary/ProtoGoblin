@@ -7,6 +7,8 @@ import glob
 import json
 import os
 import platform
+import shutil
+import subprocess
 import re
 import sys
 import tkinter as tk
@@ -878,7 +880,7 @@ class ProtoGoblinCommandApp:
     generate_debug_dump = staticmethod(generate_debug_dump)
     format_debug_dump = staticmethod(format_debug_dump)
 
-    def __init__(self, root, initial_session_id=None):
+    def __init__(self, root, initial_session_id=None, auto_refresh=True):
         self.root = root
         self.root.title("ProtoGoblin Command - Optimization & Diagnostics")
         self.root.geometry("1100x720")
@@ -919,16 +921,30 @@ class ProtoGoblinCommandApp:
 
         self.manifest_paths = []
         self.current_manifest = None
+        self.current_manifest_path = None
         self.custom_suggestion_states = {}
         self.initial_session_id = initial_session_id
         self._game_name_cache = {}
         self._steam_libs_cache = None
         self.tree_item_to_path = {}
+        self._last_known_manifest_mtimes = {}
+        self._last_manifest_count = 0
+        self._poll_interval_ms = 2000
+        self._poll_timer_id = None
+        self._last_launched_app_id = None
 
         self._build_ui()
         if self.initial_session_id:
             self.search_var.set(self.initial_session_id)
         self.refresh_sessions()
+
+        if auto_refresh:
+            self._start_auto_refresh()
+
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        except Exception:
+            pass
 
     def _build_ui(self):
         # Top Header Bar
@@ -978,6 +994,31 @@ class ProtoGoblinCommandApp:
             command=self.toggle_selected_game_mode,
         )
         self.btn_toggle_mode.pack(side=tk.RIGHT, padx=5, pady=10)
+
+        self.btn_launch_game = tk.Button(
+            header,
+            text="🚀 Launch Game",
+            bg="#238636",
+            fg="#ffffff",
+            activebackground="#2ea043",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.launch_selected_game,
+        )
+        self.btn_launch_game.pack(side=tk.RIGHT, padx=5, pady=10)
+
+        self.btn_game_library = tk.Button(
+            header,
+            text="🎮 Library...",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            command=self.open_game_launcher_dialog,
+        )
+        self.btn_game_library.pack(side=tk.RIGHT, padx=5, pady=10)
 
         self.dev_mode = False
         self.btn_dev_mode = tk.Button(
@@ -1041,9 +1082,25 @@ class ProtoGoblinCommandApp:
         )
         btn_drop_profile.pack(side=tk.RIGHT, padx=5, pady=10)
 
+        # Status Bar at bottom
+        status_bar = tk.Frame(self.root, bg="#161b22", height=24)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.status_bar_lbl = tk.Label(
+            status_bar,
+            text="Ready",
+            font=("Segoe UI", 9),
+            bg="#161b22",
+            fg="#8b949e",
+            anchor=tk.W,
+            padx=10,
+            pady=3,
+        )
+        self.status_bar_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         # Main Content Panes
         paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=self.bg_color, sashrelief=tk.FLAT)
-        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
 
         # Left Pane: Session / Game List
         left_frame = tk.Frame(paned, bg=self.card_bg, width=320)
@@ -1096,6 +1153,9 @@ class ProtoGoblinCommandApp:
         self.sessions_listbox = self.sessions_tree
 
         self.tree_context_menu = tk.Menu(self.root, tearoff=0, bg="#161b22", fg="#c9d1d9", activebackground="#1f6feb", activeforeground="#ffffff")
+        self.tree_context_menu.add_command(label="🚀 Launch Game (with ProtoGoblin)", command=self.launch_selected_game)
+        self.tree_context_menu.add_command(label="🎯 Toggle Profiling Mode", command=self.toggle_selected_game_mode)
+        self.tree_context_menu.add_separator()
         self.tree_context_menu.add_command(label="🗑️ Drop Profile (Reset for Re-Profiling)", command=self.drop_current_profile)
         self.tree_context_menu.add_command(label="⚙️ Reset Tweaks to Stock", command=self.reset_tweaks_to_stock)
         self.tree_context_menu.add_separator()
@@ -1876,6 +1936,20 @@ class ProtoGoblinCommandApp:
             os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.local/share/Steam"),
             os.path.expanduser("~/.var/app/com.valvesoftware.Steam/.steam/steam"),
         ]
+        if os.environ.get("STEAM_DIR"):
+            roots.append(os.environ["STEAM_DIR"])
+        if os.environ.get("STEAM_LIBRARY"):
+            libs.add(os.environ["STEAM_LIBRARY"])
+        if sys.platform == "win32":
+            for win_root in [
+                os.path.expandvars("%ProgramFiles(x86)%\\Steam"),
+                os.path.expandvars("%ProgramFiles%\\Steam"),
+                "C:\\Program Files (x86)\\Steam",
+                "C:\\Steam",
+                "D:\\Steam",
+            ]:
+                if os.path.isdir(win_root):
+                    roots.append(win_root)
         for root in roots:
             if os.path.isdir(root):
                 sapps = os.path.join(root, "steamapps")
@@ -1895,6 +1969,108 @@ class ProtoGoblinCommandApp:
                         pass
         self._steam_libs_cache = list(libs)
         return self._steam_libs_cache
+
+    def get_installed_steam_games(self):
+        """Scans Steam library folders for all installed games via appmanifest_*.acf."""
+        games = []
+        seen = set()
+        for lib in self._get_steam_libraries():
+            pattern = os.path.join(lib, "appmanifest_*.acf")
+            for acf in glob.glob(pattern):
+                try:
+                    app_id = None
+                    name = None
+                    install_dir = None
+                    with open(acf, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            m_id = re.search(r'\"appid\"\s+\"(\d+)\"', line)
+                            if m_id:
+                                app_id = m_id.group(1).strip()
+                            m_name = re.search(r'\"name\"\s+\"([^\"]+)\"', line)
+                            if m_name:
+                                name = m_name.group(1).strip()
+                            m_dir = re.search(r'\"installdir\"\s+\"([^\"]+)\"', line)
+                            if m_dir:
+                                install_dir = m_dir.group(1).strip()
+
+                    if app_id and app_id not in seen:
+                        if app_id in ("228980",):
+                            continue
+                        seen.add(app_id)
+                        title = name or self.resolve_game_name(app_id)
+                        games.append({
+                            "app_id": app_id,
+                            "name": title,
+                            "install_dir": install_dir or "",
+                            "library_path": lib,
+                            "is_steam": True,
+                        })
+                except Exception:
+                    continue
+        games.sort(key=lambda g: g["name"].lower())
+        return games
+
+    def get_profiled_non_steam_games(self):
+        """Discovers profiled non-Steam games from session manifests and profile configs."""
+        non_steam = []
+        seen = set()
+
+        # 1. From recorded session manifests
+        for path in getattr(self, "manifest_paths", []):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                tgt = data.get("target") or {}
+                sess = data.get("session") or {}
+                app_id = str(tgt.get("steam_appid") or "")
+                t_exe = (tgt.get("target_executable") or {}).get("path")
+                if not t_exe:
+                    continue
+                if not app_id.isdigit() or app_id in ("-", "unknown", "unknown_game", "custom-game"):
+                    key = t_exe
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    name = os.path.splitext(os.path.basename(t_exe))[0]
+                    non_steam.append({
+                        "app_id": app_id or "non_steam",
+                        "name": name,
+                        "target_exe": t_exe,
+                        "prefix_dir": sess.get("prefix_dir"),
+                        "working_dir": tgt.get("working_directory"),
+                        "argv": sess.get("argv", []),
+                        "is_steam": False,
+                    })
+            except Exception:
+                continue
+
+        # 2. From ~/.config/protogoblin/games/*.toml
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        games_dir = os.path.join(xdg_config, "protogoblin", "games")
+        if os.path.isdir(games_dir):
+            for toml_path in glob.glob(os.path.join(games_dir, "*.toml")):
+                try:
+                    prof = protogoblin.EngineTweakManager.load_profile(toml_path)
+                    g_sec = (prof or {}).get("game") or {}
+                    t_exe = g_sec.get("target_exe")
+                    app_id = str(g_sec.get("app_id") or os.path.splitext(os.path.basename(toml_path))[0])
+                    if t_exe and t_exe not in seen and not app_id.isdigit():
+                        seen.add(t_exe)
+                        name = os.path.splitext(os.path.basename(t_exe))[0]
+                        non_steam.append({
+                            "app_id": app_id,
+                            "name": name,
+                            "target_exe": t_exe,
+                            "prefix_dir": g_sec.get("prefix_dir"),
+                            "working_dir": os.path.dirname(t_exe) if os.path.isfile(t_exe) else None,
+                            "argv": [t_exe],
+                            "is_steam": False,
+                        })
+                except Exception:
+                    continue
+
+        non_steam.sort(key=lambda g: g["name"].lower())
+        return non_steam
 
     def resolve_game_name(self, app_id):
         """Resolves human-readable game title from PresetDatabase or Steam appmanifest."""
@@ -1930,7 +2106,7 @@ class ProtoGoblinCommandApp:
         self._game_name_cache[app_id_str] = fallback
         return fallback
 
-    def refresh_sessions(self):
+    def refresh_sessions(self, preserve_selection=True):
         """Scans for all utilization.json files across ProtoGoblin sessions."""
         xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
         base = os.path.join(xdg_data, "protogoblin", "sessions")
@@ -1939,9 +2115,9 @@ class ProtoGoblinCommandApp:
         self.manifest_paths = glob.glob(pattern)
         self.manifest_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
 
-        self._filter_session_list()
+        self._filter_session_list(preserve_selection=preserve_selection)
 
-    def _filter_session_list(self):
+    def _filter_session_list(self, preserve_selection=True):
         for item in self.sessions_tree.get_children():
             self.sessions_tree.delete(item)
 
@@ -2047,15 +2223,25 @@ class ProtoGoblinCommandApp:
         if getattr(self, "dev_mode", False):
             self.refresh_dev_tab()
 
-        # Select first available executable session
-        root_children = self.sessions_tree.get_children()
-        if root_children:
-            first_group = root_children[0]
-            group_children = self.sessions_tree.get_children(first_group)
-            target = group_children[0] if group_children else first_group
-            self.sessions_tree.selection_set(target)
-            self.sessions_tree.focus(target)
-            self.on_session_selected(None)
+        # Select first available executable session, or restore existing selection
+        selected = False
+        if preserve_selection and getattr(self, "current_manifest_path", None):
+            for item_id, path in self.tree_item_to_path.items():
+                if path == self.current_manifest_path:
+                    self.sessions_tree.selection_set(item_id)
+                    self.sessions_tree.focus(item_id)
+                    selected = True
+                    break
+
+        if not selected:
+            root_children = self.sessions_tree.get_children()
+            if root_children:
+                first_group = root_children[0]
+                group_children = self.sessions_tree.get_children(first_group)
+                target = group_children[0] if group_children else first_group
+                self.sessions_tree.selection_set(target)
+                self.sessions_tree.focus(target)
+                self.on_session_selected(None)
 
     def on_session_selected(self, event=None):
         sel = self.sessions_tree.selection()
@@ -2128,6 +2314,9 @@ class ProtoGoblinCommandApp:
             self.tweaks_game_lbl.config(
                 text=f"Active Game: {game_display} | Executable: {t_name} (Engine: {eng_name})"
             )
+        if hasattr(self, "btn_launch_game"):
+            short_name = t_name if len(t_name) <= 15 else t_name[:12] + "..."
+            self.btn_launch_game.config(text=f"🚀 Launch {short_name}")
 
         app_id = tgt.get("steam_appid")
         preset = protogoblin.PresetDatabase.get_preset(app_id) if app_id else None
@@ -2499,6 +2688,245 @@ class ProtoGoblinCommandApp:
     def _on_mode_radio_changed(self):
         m = self.var_profile_mode.get()
         self._update_header_mode_button(m)
+
+    def set_status(self, text, fg="#c9d1d9"):
+        """Updates the bottom status bar message."""
+        if hasattr(self, "status_bar_lbl"):
+            try:
+                self.status_bar_lbl.config(text=text, fg=fg)
+            except Exception:
+                pass
+
+    def get_game_profile_mode(self, app_id):
+        """Reads current mode ('profile' or 'play') for an AppID/game from its profile TOML."""
+        if not app_id:
+            return "play"
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        p_file = os.path.join(xdg_config, "protogoblin", "games", f"{app_id}.toml")
+        if os.path.isfile(p_file):
+            try:
+                prof = protogoblin.EngineTweakManager.load_profile(p_file)
+                mode = (
+                    (prof or {}).get("runtime", {}).get("mode")
+                    or (prof or {}).get("protogoblin", {}).get("mode")
+                )
+                if mode in ("profile", "play"):
+                    return mode
+            except Exception:
+                pass
+        return "play"
+
+    def set_game_profile_mode(self, app_id, mode, target_exe=None):
+        """Sets the mode ('profile' or 'play') in the game's profile TOML."""
+        if not app_id:
+            return None
+        xdg_config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        profile_dir = os.path.join(xdg_config, "protogoblin", "games")
+        os.makedirs(profile_dir, exist_ok=True)
+        p_file = os.path.join(profile_dir, f"{app_id}.toml")
+
+        existing_tweaks = {"mode": mode}
+        exe = target_exe or f"game_{app_id}.exe"
+        if os.path.isfile(p_file):
+            try:
+                prof = protogoblin.EngineTweakManager.load_profile(p_file)
+                if (prof or {}).get("game", {}).get("target_exe"):
+                    exe = prof["game"]["target_exe"]
+            except Exception:
+                pass
+
+        toml_content = protogoblin.EngineTweakManager.generate_profile_toml(
+            game_id=str(app_id),
+            app_id=str(app_id),
+            target_exe=exe,
+            user_tweaks=existing_tweaks,
+        )
+        with open(p_file, "w", encoding="utf-8") as f:
+            f.write(toml_content)
+        return p_file
+
+    def launch_game(self, app_id, target_exe=None, prefix_dir=None, argv=None, game_name=None):
+        """Launches an installed Steam game or profiled non-Steam game with ProtoGoblin."""
+        app_id_str = str(app_id).strip() if app_id else ""
+        is_steam = app_id_str.isdigit()
+        title = game_name or self.resolve_game_name(app_id_str)
+        curr_mode = self.get_game_profile_mode(app_id_str)
+
+        log_fn = getattr(protogoblin, "log", print)
+        log_fn(f"ProtoGoblin Command launching {title} (AppID: {app_id_str}, Mode: {curr_mode.upper()})")
+
+        launcher = getattr(self, "process_launcher", subprocess.Popen)
+        launched_proc = None
+        cmd = []
+
+        try:
+            if is_steam:
+                steam_url = f"steam://rungameid/{app_id_str}"
+                if sys.platform == "win32":
+                    cmd = ["cmd", "/c", "start", steam_url]
+                    launched_proc = launcher(cmd, shell=True)
+                else:
+                    if shutil.which("steam"):
+                        cmd = ["steam", steam_url]
+                    elif shutil.which("xdg-open"):
+                        cmd = ["xdg-open", steam_url]
+                    elif shutil.which("flatpak"):
+                        cmd = ["flatpak", "run", "com.valvesoftware.Steam", steam_url]
+                    else:
+                        cmd = ["steam", steam_url]
+                    launched_proc = launcher(cmd)
+            else:
+                if not target_exe:
+                    raise ValueError(f"No executable path specified for non-Steam game {title}")
+
+                proton_path = os.path.join(SCRIPT_DIR, "proton")
+                env = os.environ.copy()
+                if prefix_dir:
+                    env["STEAM_COMPAT_DATA_PATH"] = prefix_dir
+                env["SteamAppId"] = app_id_str or "non_steam"
+                env["PROTOGOBLIN_MODE"] = curr_mode
+
+                working_dir = os.path.dirname(target_exe) if (target_exe and os.path.isfile(target_exe)) else None
+
+                if os.path.isfile(proton_path) and sys.platform != "win32":
+                    extra_args = argv[1:] if (argv and len(argv) > 1) else []
+                    cmd = [sys.executable, proton_path, "run", target_exe] + extra_args
+                    launched_proc = launcher(cmd, env=env, cwd=working_dir)
+                else:
+                    extra_args = argv[1:] if (argv and len(argv) > 1) else []
+                    cmd = [target_exe] + extra_args
+                    launched_proc = launcher(cmd, env=env, cwd=working_dir)
+
+            mode_badge = "🎯 PROFILE MODE" if curr_mode == "profile" else "⚪ PLAY MODE"
+            msg = f"🚀 Launched {title} in {mode_badge}. Waiting for session results..."
+            self.set_status(msg, fg="#39FF14" if curr_mode == "profile" else "#58a6ff")
+
+            self._last_launched_app_id = app_id_str
+
+            return {
+                "success": True,
+                "process": launched_proc,
+                "cmd": cmd,
+                "app_id": app_id_str,
+                "mode": curr_mode,
+            }
+        except Exception as e:
+            err_msg = f"Failed to launch {title}: {e}"
+            log_fn(err_msg)
+            self.set_status(f"⚠️ {err_msg}", fg="#e74c3c")
+            try:
+                messagebox.showerror("Launch Error", err_msg)
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "error": str(e),
+                "cmd": cmd,
+                "app_id": app_id_str,
+            }
+
+    def launch_selected_game(self):
+        """Launches the currently selected game from the dashboard, or opens the library dialog."""
+        if not self.current_manifest:
+            self.open_game_launcher_dialog()
+            return
+
+        tgt = self.current_manifest.get("target") or {}
+        sess = self.current_manifest.get("session") or {}
+        app_id = tgt.get("steam_appid")
+        t_exe = (tgt.get("target_executable") or {}).get("path")
+        prefix_dir = sess.get("prefix_dir")
+        argv = sess.get("argv", [])
+        game_name = self.resolve_game_name(app_id)
+
+        self.launch_game(
+            app_id=app_id,
+            target_exe=t_exe,
+            prefix_dir=prefix_dir,
+            argv=argv,
+            game_name=game_name,
+        )
+
+    def open_game_launcher_dialog(self):
+        """Opens the Game Library launcher dialog."""
+        return GameLauncherDialog(self)
+
+    def _start_auto_refresh(self):
+        """Starts background periodic polling for newly recorded or updated session manifests."""
+        self._auto_refresh_check()
+
+    def _auto_refresh_check(self):
+        try:
+            if not getattr(self, "root", None) or not self.root.winfo_exists():
+                return
+
+            xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+            base = os.path.join(xdg_data, "protogoblin", "sessions")
+            pattern = os.path.join(base, "*", "*", "utilization.json")
+            current_manifests = glob.glob(pattern)
+
+            updated = False
+            if len(current_manifests) != getattr(self, "_last_manifest_count", -1):
+                updated = True
+            else:
+                for p in current_manifests:
+                    try:
+                        mtime = os.path.getmtime(p)
+                        if p not in self._last_known_manifest_mtimes or mtime > self._last_known_manifest_mtimes[p]:
+                            updated = True
+                            break
+                    except OSError:
+                        pass
+
+            if updated:
+                for p in current_manifests:
+                    try:
+                        self._last_known_manifest_mtimes[p] = os.path.getmtime(p)
+                    except OSError:
+                        pass
+                self._last_manifest_count = len(current_manifests)
+
+                self.refresh_sessions(preserve_selection=False)
+
+                if current_manifests:
+                    latest = max(current_manifests, key=lambda p: os.path.getmtime(p))
+                    try:
+                        with open(latest, "r", encoding="utf-8") as f:
+                            m_data = json.load(f)
+                        app_id = (m_data.get("target") or {}).get("steam_appid")
+                        m_mode = (m_data.get("session") or {}).get("mode", "play").upper()
+                        g_title = self.resolve_game_name(app_id)
+                        self.set_status(
+                            f"✨ New session [{m_mode}] detected for {g_title}! Dashboard auto-updated.",
+                            fg="#39FF14",
+                        )
+                    except Exception:
+                        self.set_status("✨ New session detected! Dashboard auto-updated.", fg="#39FF14")
+        except Exception:
+            pass
+        finally:
+            try:
+                if getattr(self, "root", None) and self.root.winfo_exists():
+                    self._poll_timer_id = self.root.after(self._poll_interval_ms, self._auto_refresh_check)
+            except Exception:
+                pass
+
+    def stop_auto_refresh(self):
+        """Cancels background polling."""
+        if getattr(self, "_poll_timer_id", None) and getattr(self, "root", None):
+            try:
+                self.root.after_cancel(self._poll_timer_id)
+            except Exception:
+                pass
+            self._poll_timer_id = None
+
+    def on_close(self):
+        """Handles clean application exit."""
+        self.stop_auto_refresh()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def toggle_selected_game_mode(self):
         if not self.current_manifest:
@@ -3334,6 +3762,237 @@ class ProtoGoblinCommandApp:
                 + "\n".join([f"• {a}" for a in applied])
                 + f"\n\nSaved to profile:\n{path}",
             )
+
+
+
+
+class GameLauncherDialog(tk.Toplevel):
+    """Dialog to browse installed Steam games and profiled non-Steam games, toggle profiling, and launch."""
+
+    def __init__(self, parent_app):
+        super().__init__(parent_app.root)
+        self.app = parent_app
+        self.title("ProtoGoblin Game Launcher & Profiler")
+        self.geometry("780x520")
+        self.minsize(620, 400)
+        self.configure(bg="#1e1e24")
+        self.transient(parent_app.root)
+
+        self.visible_games = []
+        self._build_ui()
+        self.populate_games()
+
+    def _build_ui(self):
+        # Header
+        hdr = tk.Frame(self, bg="#18181e", height=50)
+        hdr.pack(fill=tk.X, side=tk.TOP)
+        lbl_title = tk.Label(
+            hdr,
+            text="🎮 Game Library & Launchpad",
+            font=("Segoe UI", 12, "bold"),
+            bg="#18181e",
+            fg="#58a6ff",
+        )
+        lbl_title.pack(side=tk.LEFT, padx=15, pady=10)
+
+        lbl_desc = tk.Label(
+            hdr,
+            text="Launch installed Steam games or profiled non-Steam games with ProtoGoblin",
+            font=("Segoe UI", 9),
+            bg="#18181e",
+            fg="#8b949e",
+        )
+        lbl_desc.pack(side=tk.LEFT, padx=5, pady=12)
+
+        # Search filter
+        search_bar = tk.Frame(self, bg="#1e1e24")
+        search_bar.pack(fill=tk.X, padx=15, pady=(10, 5))
+        lbl_search = tk.Label(search_bar, text="🔍 Search:", bg="#1e1e24", fg="#c9d1d9", font=("Segoe UI", 9))
+        lbl_search.pack(side=tk.LEFT, padx=(0, 5))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self.filter_games())
+        entry = tk.Entry(search_bar, textvariable=self.search_var, bg="#161b22", fg="#ffffff", insertbackground="#ffffff", relief=tk.FLAT)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+
+        # Games Treeview
+        tree_container = tk.Frame(self, bg="#1e1e24")
+        tree_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        sb = tk.Scrollbar(tree_container)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree = ttk.Treeview(
+            tree_container,
+            columns=("type", "title", "id_exe", "mode"),
+            show="headings",
+            selectmode="browse",
+            yscrollcommand=sb.set,
+        )
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.tree.yview)
+
+        self.tree.heading("type", text="Type", anchor=tk.W)
+        self.tree.heading("title", text="Game Title", anchor=tk.W)
+        self.tree.heading("id_exe", text="AppID / Target Binary", anchor=tk.W)
+        self.tree.heading("mode", text="Profiling Mode", anchor=tk.W)
+
+        self.tree.column("type", width=100, minwidth=80)
+        self.tree.column("title", width=280, minwidth=180)
+        self.tree.column("id_exe", width=200, minwidth=140)
+        self.tree.column("mode", width=140, minwidth=110)
+
+        self.tree.bind("<Double-1>", lambda e: self.on_launch_clicked())
+        self.tree.bind("<<TreeviewSelect>>", self.on_select_changed)
+
+        # Action Buttons footer
+        btn_bar = tk.Frame(self, bg="#18181e", height=50)
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.btn_toggle_dialog_mode = tk.Button(
+            btn_bar,
+            text="🎯 Toggle Profiling Mode",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            command=self.on_toggle_mode_clicked,
+        )
+        self.btn_toggle_dialog_mode.pack(side=tk.LEFT, padx=15, pady=10)
+
+        btn_cancel = tk.Button(
+            btn_bar,
+            text="Close",
+            bg="#21262d",
+            fg="#c9d1d9",
+            activebackground="#30363d",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            command=self.destroy,
+        )
+        btn_cancel.pack(side=tk.RIGHT, padx=15, pady=10)
+
+        self.btn_dialog_launch = tk.Button(
+            btn_bar,
+            text="🚀 Launch Game",
+            bg="#238636",
+            fg="#ffffff",
+            activebackground="#2ea043",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            relief=tk.FLAT,
+            command=self.on_launch_clicked,
+        )
+        self.btn_dialog_launch.pack(side=tk.RIGHT, padx=5, pady=10)
+
+    def populate_games(self):
+        self.all_games = []
+        steam_games = self.app.get_installed_steam_games()
+        for g in steam_games:
+            app_id = g["app_id"]
+            curr_mode = self.app.get_game_profile_mode(app_id)
+            self.all_games.append({
+                "type": "🎮 Steam",
+                "title": g["name"],
+                "id_exe": f"AppID {app_id}",
+                "app_id": app_id,
+                "target_exe": None,
+                "prefix_dir": None,
+                "argv": [],
+                "mode": curr_mode,
+                "is_steam": True,
+            })
+
+        non_steam = self.app.get_profiled_non_steam_games()
+        for g in non_steam:
+            app_id = g["app_id"]
+            curr_mode = self.app.get_game_profile_mode(app_id)
+            t_name = os.path.basename(g["target_exe"]) if g.get("target_exe") else app_id
+            self.all_games.append({
+                "type": "📦 Non-Steam",
+                "title": g["name"],
+                "id_exe": t_name,
+                "app_id": app_id,
+                "target_exe": g.get("target_exe"),
+                "prefix_dir": g.get("prefix_dir"),
+                "argv": g.get("argv", []),
+                "mode": curr_mode,
+                "is_steam": False,
+            })
+
+        self.filter_games()
+
+    def filter_games(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        q = self.search_var.get().lower().strip()
+        self.visible_games = []
+
+        for idx, g in enumerate(self.all_games):
+            if q:
+                if q not in g["title"].lower() and q not in str(g["app_id"]).lower() and q not in g["id_exe"].lower():
+                    continue
+            self.visible_games.append(g)
+            v_idx = len(self.visible_games) - 1
+            mode_badge = "🎯 PROFILE" if g["mode"] == "profile" else "⚪ PLAY"
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(v_idx),
+                values=(g["type"], g["title"], g["id_exe"], mode_badge),
+            )
+
+        if self.visible_games:
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+            self.on_select_changed()
+
+    def on_select_changed(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        game = self.visible_games[idx]
+        mode_text = "Switch to PLAY (Optimizations Only)" if game["mode"] == "profile" else "Switch to PROFILE (Telemetry & HUD)"
+        self.btn_toggle_dialog_mode.config(text=f"🎯 {mode_text}")
+        self.btn_dialog_launch.config(text=f"🚀 Launch {game['title'][:18]}")
+
+    def on_toggle_mode_clicked(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        game = self.visible_games[idx]
+        new_mode = "play" if game["mode"] == "profile" else "profile"
+        self.app.set_game_profile_mode(game["app_id"], new_mode, target_exe=game.get("target_exe"))
+        game["mode"] = new_mode
+
+        mode_badge = "🎯 PROFILE" if new_mode == "profile" else "⚪ PLAY"
+        self.tree.item(str(idx), values=(game["type"], game["title"], game["id_exe"], mode_badge))
+        self.on_select_changed()
+        self.app.set_status(f"Updated {game['title']} profiling mode to: {mode_badge}", fg="#39FF14" if new_mode == "profile" else "#58a6ff")
+
+        if self.app.current_manifest:
+            curr_app_id = str((self.app.current_manifest.get("target") or {}).get("steam_appid") or "")
+            if curr_app_id == str(game["app_id"]):
+                self.app.var_profile_mode.set(new_mode)
+                self.app._update_header_mode_button(new_mode)
+
+    def on_launch_clicked(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        game = self.visible_games[idx]
+        self.destroy()
+        self.app.launch_game(
+            app_id=game["app_id"],
+            target_exe=game.get("target_exe"),
+            prefix_dir=game.get("prefix_dir"),
+            argv=game.get("argv"),
+            game_name=game["title"],
+        )
 
 
 def main():
