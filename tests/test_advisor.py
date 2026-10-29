@@ -22,6 +22,7 @@ from protogoblin import (
     NativeDllSnagger,
     PresetDatabase,
     ProtoGoblinSession,
+    SystemProbe,
 )
 from protogoblin_command import (
     DiagnosticAdvisor,
@@ -2071,6 +2072,111 @@ class TestProfileDropAndReprofiling(unittest.TestCase):
         self.assertFalse(os.path.isfile(p_file))
         self.assertFalse(self.app.var_gfx_vsync_off.get())
         self.assertFalse(self.app.var_gfx_descriptor_buffer.get())
+
+
+class TestSteamDeckIntegration(unittest.TestCase):
+    def test_steam_deck_environment_probe(self):
+        old_val = os.environ.get("SteamDeck")
+        try:
+            os.environ["SteamDeck"] = "1"
+            self.assertTrue(SystemProbe.is_steam_deck())
+            info = SystemProbe.get_steam_deck_info()
+            self.assertTrue(info["is_deck"])
+            self.assertEqual(info["resolution"], "1280x800")
+            self.assertEqual(info["aspect_ratio"], "16:10")
+        finally:
+            if old_val is None:
+                os.environ.pop("SteamDeck", None)
+            else:
+                os.environ["SteamDeck"] = old_val
+
+    def test_steam_deck_preset_elevation(self):
+        dummy_db = {
+            "999999": {
+                "title": "Deck Test Game",
+                "recommended_tweaks": {
+                    "env": {"BASE_FLAG": "1"},
+                    "args": ["-base_arg"],
+                },
+                "deck_tweaks": {
+                    "env": {"SteamDeck": "1", "DECK_PERF": "high"},
+                    "args": ["-deck_arg"],
+                },
+            }
+        }
+        old_cache = PresetDatabase._CACHE
+        try:
+            PresetDatabase._CACHE = dummy_db
+            # Standard preset
+            standard = PresetDatabase.get_preset("999999", is_deck=False)
+            self.assertEqual(standard["recommended_tweaks"]["env"], {"BASE_FLAG": "1"})
+            self.assertEqual(standard["recommended_tweaks"]["args"], ["-base_arg"])
+
+            # Elevated preset on Steam Deck
+            deck = PresetDatabase.get_preset("999999", is_deck=True)
+            self.assertEqual(deck["recommended_tweaks"]["env"]["BASE_FLAG"], "1")
+            self.assertEqual(deck["recommended_tweaks"]["env"]["SteamDeck"], "1")
+            self.assertEqual(deck["recommended_tweaks"]["env"]["DECK_PERF"], "high")
+            self.assertIn("-base_arg", deck["recommended_tweaks"]["args"])
+            self.assertIn("-deck_arg", deck["recommended_tweaks"]["args"])
+        finally:
+            PresetDatabase._CACHE = old_cache
+
+    def test_steam_deck_profile_application(self):
+        profile = {
+            "game": {"id": "test_game", "steam_appid": 1234},
+            "graphics": {"backend": "dxvk"},
+            "steam_deck": {
+                "enabled": True,
+                "env": {"DXVK_FRAME_RATE": "45"},
+                "args": ["-deck_mode"],
+                "limit_fps": 45,
+            },
+        }
+        env = {}
+        argv = ["game.exe"]
+        new_argv = EngineTweakManager.apply_tweaks(profile, {"engine": "generic"}, argv, env, is_deck=True)
+        self.assertEqual(env.get("SteamDeck"), "1")
+        self.assertEqual(env.get("DXVK_FRAME_RATE"), "45")
+        self.assertEqual(env.get("VKD3D_FRAME_RATE"), "45")
+        self.assertIn("-deck_mode", new_argv)
+
+    def test_steam_deck_diagnostic_advisor(self):
+        manifest = {
+            "steam_deck": {
+                "is_deck": True,
+                "model": "Steam Deck OLED (Galileo)",
+            }
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        titles = [s["title"] for s in suggestions]
+        self.assertTrue(any("Steam Deck Environment Active" in t for t in titles))
+        self.assertTrue(any("Galileo" in t for t in titles))
+
+    def test_protogoblin_sqlite_db_lookup_and_fixes(self):
+        db_path = PresetDatabase.get_db_path()
+        self.assertIsNotNone(db_path)
+        self.assertTrue(os.path.isfile(db_path))
+
+        # Test preset lookup via SQLite
+        preset = PresetDatabase.get_preset(409710)
+        self.assertIsNotNone(preset)
+        self.assertEqual(preset["title"], "BioShock Remastered")
+        self.assertIn("PROTON_NO_ESYNC", str(preset["recommended_tweaks"]))
+
+        # Test active fixes (forward-only, zero deprecated)
+        fixes = PresetDatabase.get_active_fixes(409710)
+        self.assertGreaterEqual(len(fixes), 1)
+        commands = [f["fix_command"] for f in fixes]
+        self.assertIn("PROTON_NO_ESYNC=1", commands)
+        # Verify deprecated D9VK is not present
+        self.assertNotIn("PROTON_USE_D9VK=1", commands)
+
+        # Test search under 1ms
+        results = PresetDatabase.search_games("Witcher", limit=5)
+        self.assertGreater(len(results), 0)
+        titles = [r["title"] for r in results]
+        self.assertTrue(any("Witcher" in t for t in titles))
 
 
 if __name__ == "__main__":

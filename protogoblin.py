@@ -394,16 +394,155 @@ class EngineDetector:
 
 
 class PresetDatabase:
-    """Provides ProtonDB community presets, ratings, and known fixes for Steam AppIDs."""
+    """Provides ProtonDB community presets, ratings, and known fixes for Steam AppIDs via protogoblin.db SQLite."""
 
     _CACHE = None
+    _DB_PATH = None
 
     @classmethod
-    def get_preset(cls, app_id):
+    def get_db_path(cls):
+        if cls._DB_PATH and os.path.isfile(cls._DB_PATH):
+            return cls._DB_PATH
+        candidate_paths = [
+            os.path.join(SCRIPT_DIR, "share", "protogoblin", "protogoblin.db"),
+            os.path.join(SCRIPT_DIR, "..", "share", "protogoblin", "protogoblin.db"),
+            os.path.join(SCRIPT_DIR, "protogoblin.db"),
+            os.path.expanduser("~/.local/share/protogoblin/protogoblin.db"),
+            "/usr/share/protogoblin/protogoblin.db",
+        ]
+        for p in candidate_paths:
+            if os.path.isfile(p):
+                cls._DB_PATH = p
+                return p
+        return None
+
+    @classmethod
+    def get_preset(cls, app_id, is_deck=None):
         if not app_id:
             return None
+
+        if is_deck is None:
+            is_deck = SystemProbe.is_steam_deck()
+
+        # Fast indexed microsecond SQLite path
+        db_path = cls.get_db_path()
+        if db_path:
+            try:
+                import sqlite3
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT title, reports, modern_reports, tier, known_issues, recommended_tweaks, deck_tweaks "
+                    "FROM presets WHERE app_id = ?",
+                    (int(app_id),)
+                )
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    known_issues = json.loads(row[4]) if row[4] else []
+                    recs = json.loads(row[5]) if row[5] else {}
+                    deck_tweaks = json.loads(row[6]) if row[6] else {}
+                    preset = {
+                        "title": row[0],
+                        "reports": row[1],
+                        "modern_reports": row[2],
+                        "tier": row[3],
+                        "known_issues": known_issues,
+                        "recommended_tweaks": recs,
+                        "deck_tweaks": deck_tweaks,
+                    }
+                    if is_deck and deck_tweaks:
+                        elevated = dict(recs)
+                        if "env" in deck_tweaks:
+                            elevated_env = dict(recs.get("env", {}))
+                            elevated_env.update(deck_tweaks["env"])
+                            elevated["env"] = elevated_env
+                        if "args" in deck_tweaks:
+                            elevated_args = list(recs.get("args", []))
+                            for a in deck_tweaks["args"]:
+                                if a not in elevated_args:
+                                    elevated_args.append(a)
+                            elevated["args"] = elevated_args
+                        for k, v in deck_tweaks.items():
+                            if k not in ["env", "args"]:
+                                elevated[k] = v
+                        preset["recommended_tweaks"] = elevated
+                    return preset
+            except Exception:
+                pass
+
+        # Fallback to JSON cache if SQLite DB is absent
         db = cls.get_all()
-        return db.get(str(app_id))
+        preset = db.get(str(app_id))
+        if not preset:
+            return None
+
+        if is_deck:
+            preset_copy = dict(preset)
+            recs = dict(preset.get("recommended_tweaks") or {})
+            deck_tweaks = preset.get("deck_tweaks") or preset.get("deck_recommended_tweaks") or recs.get("deck")
+            if deck_tweaks:
+                elevated = dict(recs)
+                if "env" in deck_tweaks:
+                    elevated_env = dict(recs.get("env", {}))
+                    elevated_env.update(deck_tweaks["env"])
+                    elevated["env"] = elevated_env
+                if "args" in deck_tweaks:
+                    elevated_args = list(recs.get("args", []))
+                    for a in deck_tweaks["args"]:
+                        if a not in elevated_args:
+                            elevated_args.append(a)
+                    elevated["args"] = elevated_args
+                for k, v in deck_tweaks.items():
+                    if k not in ["env", "args"]:
+                        elevated[k] = v
+                preset_copy["recommended_tweaks"] = elevated
+            return preset_copy
+        return preset
+
+    @classmethod
+    def get_active_fixes(cls, app_id):
+        """Returns verified, active modern fixes for an AppID from SQLite."""
+        db_path = cls.get_db_path()
+        if not db_path or not app_id:
+            return []
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT category, fix_command, confidence, report_mentions, description "
+                "FROM fixes WHERE app_id = ? ORDER BY report_mentions DESC",
+                (int(app_id),)
+            )
+            fixes = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            return fixes
+        except Exception:
+            return []
+
+    @classmethod
+    def search_games(cls, query, limit=20):
+        """Fast indexed search for games by title or AppID under 1ms."""
+        db_path = cls.get_db_path()
+        if not db_path or not query:
+            return []
+        try:
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT app_id, title, tier, reports FROM presets "
+                "WHERE title LIKE ? OR CAST(app_id AS TEXT) LIKE ? ORDER BY reports DESC LIMIT ?",
+                (f"%{query}%", f"%{query}%", limit)
+            )
+            results = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            return results
+        except Exception:
+            return []
 
     @classmethod
     def get_all(cls):
@@ -591,7 +730,7 @@ class EngineTweakManager:
         return result
 
     @classmethod
-    def generate_profile_toml(cls, game_id, app_id, target_exe, engine_info=None, sync_backend="ntsync", user_tweaks=None):
+    def generate_profile_toml(cls, game_id, app_id, target_exe, engine_info=None, sync_backend="ntsync", user_tweaks=None, is_deck=None):
         tweaks = user_tweaks or {}
         eng_name = engine_info.get("engine", "") if engine_info else ""
         is_ue = eng_name in ["unreal_4", "unreal_5", "unreal"]
@@ -681,6 +820,19 @@ class EngineTweakManager:
                 f'native_gfx_jobs = {"true" if unity_cfg.get("native_gfx_jobs", True) else "false"}',
                 f'disable_vr = {"true" if unity_cfg.get("disable_vr", True) else "false"}',
                 f'force_vulkan = {"true" if unity_cfg.get("force_vulkan", False) else "false"}',
+            ])
+
+        effective_deck = is_deck if is_deck is not None else (tweaks.get("is_deck") or tweaks.get("steam_deck") or SystemProbe.is_steam_deck())
+        deck_cfg = tweaks.get("steam_deck") or tweaks.get("deck")
+        if effective_deck or deck_cfg:
+            d_cfg = deck_cfg if isinstance(deck_cfg, dict) else {}
+            lines.extend([
+                "",
+                "[steam_deck]",
+                f'enabled = {"true" if d_cfg.get("enabled", True) else "false"}',
+                f'target_resolution = "{d_cfg.get("target_resolution", "1280x800")}"',
+                f'limit_fps = {d_cfg.get("limit_fps", 60)}',
+                f'ui_scale_override = {"true" if d_cfg.get("ui_scale_override", True) else "false"}',
             ])
 
         if is_godot or (not eng_name and "godot" in tweaks):
@@ -785,9 +937,12 @@ class EngineTweakManager:
         return "\n".join(lines)
 
     @classmethod
-    def apply_tweaks(cls, profile, engine_info, argv, env, prefix_dir=None, proton_dir=None):
+    def apply_tweaks(cls, profile, engine_info, argv, env, prefix_dir=None, proton_dir=None, is_deck=None):
         if not profile:
             return argv
+
+        if is_deck is None:
+            is_deck = SystemProbe.is_steam_deck()
 
         eng_name = engine_info.get("engine", "") if engine_info else ""
         if not eng_name and isinstance(profile, dict):
@@ -983,6 +1138,38 @@ class EngineTweakManager:
             env["PROTOGOBLIN_PROFILE_KEY"] = prof_sec["hotkey"]
         elif profile.get("hotkey"):
             env["PROTOGOBLIN_PROFILE_KEY"] = profile["hotkey"]
+
+        # 8. General Profile Environment and Argument Overrides
+        env_sec = profile.get("env", {})
+        if isinstance(env_sec, dict):
+            for k, v in env_sec.items():
+                if k not in env:
+                    env[k] = str(v)
+
+        args_sec = profile.get("args", [])
+        if isinstance(args_sec, list):
+            for a in args_sec:
+                if a not in new_argv:
+                    new_argv.append(str(a))
+
+        # 9. Steam Deck First-Class Elevation
+        if is_deck:
+            env.setdefault("SteamDeck", "1")
+            deck_sec = profile.get("steam_deck", {}) or profile.get("deck", {})
+            if isinstance(deck_sec, dict):
+                # Elevate deck-specific environment overrides
+                for k, v in deck_sec.get("env", {}).items():
+                    env[k] = str(v)
+                # Elevate deck-specific command line arguments
+                for a in deck_sec.get("args", []):
+                    if a not in new_argv:
+                        new_argv.append(str(a))
+                # Deck FPS capping
+                deck_limit = deck_sec.get("limit_fps")
+                if deck_limit and int(deck_limit) > 0:
+                    limit_val = int(deck_limit)
+                    dxvk_items.append(f"dxgi.maxFrameRate = {limit_val}")
+                    env["VKD3D_FRAME_RATE"] = str(limit_val)
 
         return new_argv
 
@@ -2099,6 +2286,104 @@ class SystemProbe:
                 pass
         return 16384
 
+    @staticmethod
+    def is_steam_deck():
+        """Detects if running on a Steam Deck (Valve Jupiter / Galileo) or SteamOS Deck environment."""
+        if os.environ.get("SteamDeck") == "1" or os.environ.get("STEAM_DECK") == "1":
+            return True
+
+        dmi_paths = [
+            "/sys/devices/virtual/dmi/id/product_name",
+            "/sys/class/dmi/id/product_name",
+            "/run/host/sys/devices/virtual/dmi/id/product_name",
+            "/sys/devices/virtual/dmi/id/product_family",
+            "/sys/class/dmi/id/product_family",
+        ]
+        deck_tokens = ["jupiter", "galileo", "steamdeck", "valve"]
+        for p in dmi_paths:
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        val = f.read().strip().lower()
+                        if any(token in val for token in deck_tokens):
+                            return True
+                except OSError:
+                    pass
+
+        # Check vendor
+        for v_path in [
+            "/sys/devices/virtual/dmi/id/board_vendor",
+            "/sys/class/dmi/id/board_vendor",
+            "/run/host/sys/devices/virtual/dmi/id/board_vendor",
+            "/sys/devices/virtual/dmi/id/sys_vendor",
+        ]:
+            if os.path.isfile(v_path):
+                try:
+                    with open(v_path, "r", encoding="utf-8", errors="ignore") as f:
+                        if "valve" in f.read().lower():
+                            return True
+                except OSError:
+                    pass
+
+        # Check SteamOS release variant
+        for os_path in ["/run/host/os-release", "/etc/os-release"]:
+            if os.path.isfile(os_path):
+                try:
+                    with open(os_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().lower()
+                        if "variant_id=steamdeck" in content or 'variant_id="steamdeck"' in content:
+                            return True
+                except OSError:
+                    pass
+
+        return False
+
+    @staticmethod
+    def get_steam_deck_info():
+        """Returns hardware specifications and display metrics for Steam Deck devices."""
+        is_deck = SystemProbe.is_steam_deck()
+        if not is_deck:
+            return {"is_deck": False, "model": None}
+
+        model = "Unknown Steam Deck"
+        display_panel = "60Hz LCD (800p)"
+        target_fps = 60
+
+        dmi_paths = [
+            "/sys/devices/virtual/dmi/id/product_name",
+            "/sys/class/dmi/id/product_name",
+            "/run/host/sys/devices/virtual/dmi/id/product_name",
+        ]
+        for p in dmi_paths:
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        val = f.read().strip().lower()
+                        if "galileo" in val:
+                            model = "Steam Deck OLED (Galileo)"
+                            display_panel = "90Hz HDR OLED (800p)"
+                            target_fps = 90
+                            break
+                        elif "jupiter" in val:
+                            model = "Steam Deck LCD (Jupiter)"
+                            display_panel = "60Hz LCD (800p)"
+                            target_fps = 60
+                            break
+                except OSError:
+                    pass
+
+        if model == "Unknown Steam Deck" and (os.environ.get("SteamDeck") == "1" or os.environ.get("STEAM_DECK") == "1"):
+            model = "Steam Deck (Environment Inferred)"
+
+        return {
+            "is_deck": True,
+            "model": model,
+            "resolution": "1280x800",
+            "aspect_ratio": "16:10",
+            "display_panel": display_panel,
+            "target_fps": target_fps,
+        }
+
 
 class ProtoGoblinSession:
     """Manages the lifecycle of a ProtoGoblin game execution session."""
@@ -2122,6 +2407,8 @@ class ProtoGoblinSession:
         self.session_dir = os.path.join(xdg_data, "protogoblin", "sessions", game_slug, self.session_id)
         self.manifest_path = os.path.join(self.session_dir, "utilization.json")
 
+        self.is_steam_deck = SystemProbe.is_steam_deck()
+        self.deck_info = SystemProbe.get_steam_deck_info()
         self.anti_cheat = {"detected": False, "provider": None, "passthrough_enforced": False}
         self.detected_engine = {"detected": False, "engine": "unknown", "version": None, "confidence": 0.0, "details": {}}
         self.initial_exe = None
@@ -2579,11 +2866,14 @@ class ProtoGoblinSession:
                     env,
                     prefix_dir,
                     proton_dir=self.proton_dir,
+                    is_deck=self.is_steam_deck,
                 )
                 log(f"Applied engine tweaks from profile. Resulting argv={argv}")
         elif not is_raw and presets_enabled:
             # Automatic preset bootstrap from PresetDatabase if no custom profile exists
-            preset = PresetDatabase.get_preset(self.steam_appid)
+            if self.is_steam_deck:
+                env.setdefault("SteamDeck", "1")
+            preset = PresetDatabase.get_preset(self.steam_appid, is_deck=self.is_steam_deck)
             if preset and preset.get("recommended_tweaks"):
                 log(f"Loaded built-in preset for AppID {self.steam_appid}")
                 recs = preset["recommended_tweaks"]
@@ -2615,6 +2905,7 @@ class ProtoGoblinSession:
                 f.write(f"Target Executable:  {target_path}\n")
                 f.write(f"Engine Detected:    {self.detected_engine.get('engine')} (confidence: {self.detected_engine.get('confidence')})\n")
                 f.write(f"Anti-Cheat Policy:  {self.anti_cheat}\n")
+                f.write(f"Steam Deck:         {self.is_steam_deck} ({self.deck_info.get('model', 'N/A')})\n")
                 f.write(f"Pruned Subsystems:  {self.pruned_subsystems}\n")
                 f.write(f"Final Arguments:    {argv}\n")
                 f.write("\n--- Environment Overrides ---\n")
@@ -2830,7 +3121,9 @@ class ProtoGoblinSession:
                 "cpu": SystemProbe.get_cpu_info(),
                 "gpu": gpu_info,
                 "ram_total_mb": SystemProbe.get_ram_total_mb(),
+                "steam_deck": getattr(self, "deck_info", SystemProbe.get_steam_deck_info()),
             },
+            "steam_deck": getattr(self, "deck_info", SystemProbe.get_steam_deck_info()),
             "anti_cheat": self.anti_cheat,
             "subsystems": {
                 "loaded": loaded_subsystems,

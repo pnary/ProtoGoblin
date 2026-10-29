@@ -501,6 +501,22 @@ class DiagnosticAdvisor:
                 }
             )
 
+        # 10. Steam Deck Hardware & Optimization Elevation
+        deck = manifest.get("steam_deck") or (manifest.get("environment") or {}).get("steam_deck") or {}
+        if deck.get("is_deck"):
+            model = deck.get("model") or "Steam Deck"
+            suggestions.append(
+                {
+                    "level": "info",
+                    "title": f"🎮 Steam Deck Environment Active ({model})",
+                    "description": (
+                        f"ProtoGoblin elevated Steam Deck-specific optimizations for {model} "
+                        f"(native 1280x800 presentation, SteamDeck=1 environment flag, and elevated APU power pacing)."
+                    ),
+                    "action": "Steam Deck presets and controller glyph overrides automatically elevated.",
+                }
+            )
+
         return suggestions
 
 

@@ -1845,7 +1845,12 @@ $(PROTOGOBLIN_PRESETS_TARGET): $(SRCDIR)/share/protogoblin/protogoblin_presets.j
 	mkdir -p $(DST_DIR)/share/protogoblin
 	cp -a $< $@
 
-all-dist: $(PROTOGOBLIN_PRESETS_TARGET)
+PROTOGOBLIN_DB_TARGET := $(DST_DIR)/share/protogoblin/protogoblin.db
+$(PROTOGOBLIN_DB_TARGET): $(SRCDIR)/share/protogoblin/protogoblin.db | $(DST_DIR)
+	mkdir -p $(DST_DIR)/share/protogoblin
+	cp -a $< $@
+
+all-dist: $(PROTOGOBLIN_PRESETS_TARGET) $(PROTOGOBLIN_DB_TARGET)
 
 ifeq ($(ENABLE_WOW64),1)
 USER_SETTINGS_WOW64_PY_TARGET := $(addprefix $(DST_BASE)/,user_settings.py)
