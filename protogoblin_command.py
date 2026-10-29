@@ -63,6 +63,7 @@ class DiagnosticAdvisor:
                     "action": "Game runs in clean Play Mode. In-process shims and profiling hooks are intentionally disabled.",
                 }
             )
+            return suggestions
 
         # 2. Synchronization Backend
         sync_backend = sync.get("sync_backend", "")
@@ -183,44 +184,29 @@ class DiagnosticAdvisor:
                         "action": "If higher framerates are desired, consider FSR upscaling (WINE_FULLSCREEN_FSR=1) or reducing in-game render resolution.",
                     }
                 )
-            elif b_class == "sync_bound":
-                gpu_load = pacing.get("gpu_busy_pct", 0)
-                cpu_load = pacing.get("cpu_busy_pct", 0)
-                if gpu_load < 50 and cpu_load < 55:
-                    suggestions.append(
-                        {
-                            "level": "error",
-                            "title": "Intra-Frame CPU-GPU Staging Synchronization Stall",
-                            "description": f"Severe GPU under-utilization ({gpu_load}%) and low CPU utilization ({cpu_load}%) observed during active rendering. This signature indicates recurring intra-frame staging buffer readbacks (Map/CopyResource cycles) where the render thread repeatedly flushes and stalls on GPU fences multiple times per frame. (Common engine flaw in Gust/Koei Tecmo titles and naive D3D9->D3D11 ports).",
-                            "action": "Deploy shadow staging buffer wrapper (Atelier Sync Fix) and force dxgi.syncInterval = 0 in profile.toml.",
-                            "fix_id": "atelier_sync_fix",
-                            "fix_button_text": "⚡ Apply Staging Buffer Sync Fix & VSync Off",
-                        }
-                    )
-                else:
-                    suggestions.append(
-                        {
-                            "level": "warning",
-                            "title": "Thread Starvation / Synchronization Waits",
-                            "description": "Both CPU and GPU reported low utilization despite active gameplay. Threads are likely blocked on internal locks or waiting on timer intervals.",
-                            "action": "Test adaptive wait policies or check if frame rate limiter is set below monitor refresh rate.",
-                        }
-                    )
-
-                if sync_backend != "ntsync" and not os.path.exists("/dev/ntsync"):
-                    suggestions.append(
-                        {
-                            "level": "info",
-                            "title": "Kernel NT Synchronization (ntsync) Driver Inactive",
-                            "description": "Session relied on slower wineserver RPC/eventfd waits. Upgrading to a kernel with the /dev/ntsync driver (Linux 6.13+) provides native Windows NT synchronization primitives to eliminate thread wait overhead.",
-                            "action": "Ensure ntsync kernel module is active or upgrade to Linux 6.13+.",
-                        }
-                    )
+            elif b_class in ("underutilized", "sync_bound"):
+                suggestions.append({
+                    "level": "warning",
+                    "title": "Low CPU and GPU Utilization",
+                    "description": (
+                        f"CPU load was {pacing.get('cpu_busy_pct')}% and GPU load was {pacing.get('gpu_busy_pct')}%. "
+                        "Aggregate utilization cannot distinguish a frame cap, menu, CPU thread bottleneck, "
+                        "timer wait, or GPU readback stall."
+                    ),
+                    "action": "Capture active gameplay and inspect D3D11 Map and Present timings before choosing a fix.",
+                })
+            elif b_class == "unknown" or roi.get("capture_status") == "missing":
+                suggestions.append({
+                    "level": "warning",
+                    "title": "Insufficient Performance Capture",
+                    "description": "Frame or utilization measurements are missing. No performance bottleneck has been established.",
+                    "action": "Check session and layer logs, then capture a successful gameplay interval.",
+                })
 
             # Frame Pacing & 1% Lows
-            fps_avg = fm.get("fps_avg", 0)
-            fps_1 = fm.get("fps_1_pct_low", 0)
-            jitter = fm.get("frametime_jitter_ms", 0)
+            fps_avg = fm.get("fps_avg") or 0
+            fps_1 = fm.get("fps_1_pct_low") or 0
+            jitter = fm.get("frametime_jitter_ms") or 0
             if fps_avg > 0 and fps_1 > 0 and (fps_1 / fps_avg) < 0.65:
                 cap_target = max(30, int(fps_avg))
                 suggestions.append(
@@ -253,6 +239,19 @@ class DiagnosticAdvisor:
                             "cap_target": max(30, int(fps_avg or 60)),
                         }
                     )
+
+        readbacks = (gfx.get("d3d11_wrapper_stats") or {}).get("readbacks") or {}
+        if readbacks.get("map_calls", 0) > 0 and readbacks.get("map_time_ms", 0) >= 100:
+            suggestions.append({
+                "level": "warning",
+                "title": "Measured D3D11 Readback Waits",
+                "description": (
+                    f"{readbacks['map_calls']:,} read mappings took {readbacks['map_time_ms']:.1f}ms in total; "
+                    f"{readbacks.get('slow_map_calls', 0):,} exceeded 1ms. These are measured API waits, "
+                    "not proof that every wait is unnecessary."
+                ),
+                "action": "Correlate slow mappings with copies and frame timings; compare one workaround at a time.",
+            })
 
         # 4b. D3D11 / DXGI Wrapper Introspective Live Telemetry
         w_stats = gfx.get("d3d11_wrapper_stats")
@@ -430,7 +429,7 @@ class DiagnosticAdvisor:
         if eng_name == "unreal_5":
             roi_fm = (roi.get("frame_metrics") or {}) if isinstance(roi, dict) else {}
             roi_bot = roi.get("bottleneck_classification", "") if isinstance(roi, dict) else ""
-            is_heavy = roi_bot in ["gpu_bound", "sync_bound"] or (bool(roi) and roi_fm.get("fps_1_pct_low", 0) < 45)
+            is_heavy = roi_bot in ["gpu_bound", "sync_bound"] or (bool(roi) and roi_fm.get("fps_1_pct_low") is not None and roi_fm["fps_1_pct_low"] < 45)
             suggestions.append(
                 {
                     "level": "warning" if is_heavy else "info",
@@ -496,16 +495,12 @@ class DiagnosticAdvisor:
             tier = preset.get("tier", "unknown")
             recs = preset.get("recommended_tweaks", {})
             if "gust_d3d11_staging_sync_stall" in known_issues:
-                suggestions.append(
-                    {
-                        "level": "error",
-                        "title": "Documented Gust Engine D3D11 Sync Stall (ProtonDB)",
-                        "description": "ProtonDB reports confirm this title has the severe Gust D3D11 staging buffer sync defect. Without a shadow staging wrapper, the GPU sits mostly idle and FPS drops heavily.",
-                        "action": "Apply Atelier Sync Fix (doitsujin/TellowKrinkle) and set dxgi.syncInterval = 0 in profile.toml.",
-                        "fix_id": "atelier_sync_fix",
-                        "fix_button_text": "⚡ Apply Staging Buffer Sync Fix & VSync Off",
-                    }
-                )
+                suggestions.append({
+                    "level": "info",
+                    "title": "Community Report: D3D11 Synchronization Issue",
+                    "description": "The bundled preset lists a synchronization issue. This is community metadata, not a diagnosis of this session.",
+                    "action": "Measure D3D11 readback and presentation waits before testing a workaround.",
+                })
             if "ue5_fsr_frame_gen_crash" in known_issues:
                 suggestions.append(
                     {
@@ -1282,7 +1277,7 @@ class ProtoGoblinCommandApp:
         self.var_gfx_descriptor_buffer = tk.BooleanVar(value=True)
         self.var_gfx_reflex = tk.BooleanVar(value=True)
         self.var_sync_ntsync = tk.BooleanVar(value=True)
-        self.var_atelier_sync_fix = tk.BooleanVar(value=False)
+        self.var_d3d11_trace = tk.BooleanVar(value=False)
         self.var_sync_state_dedup = tk.BooleanVar(value=True)
         self.var_sync_swapchain_debounce = tk.BooleanVar(value=True)
         self.var_sync_precision_timers = tk.BooleanVar(value=True)
@@ -1297,7 +1292,7 @@ class ProtoGoblinCommandApp:
             ("Vulkan Descriptor Buffers (dxvk.enableDescriptorBuffer = true for DXVK 2.7+)", self.var_gfx_descriptor_buffer),
             ("Nvidia Reflex Low-Latency Queueing (dxvk.nvLowLatency2 = true)", self.var_gfx_reflex),
             ("Kernel Fast-Path NT Synchronization (ntsync)", self.var_sync_ntsync),
-            ("Gust / Atelier D3D11 Staging Buffer Sync Fix (Shadow staging wrapper override)", self.var_atelier_sync_fix),
+            ("D3D11 Readback Timing Capture (forwards real GPU operations)", self.var_d3d11_trace),
             ("Constant Buffer & State Rebind Deduplication (D3D11 wrapper state filter)", self.var_sync_state_dedup),
             ("Debounce Rapid SwapChain Resize Choke (DXGI/D3D11 scale-factor filter)", self.var_sync_swapchain_debounce),
             ("High-Precision Sleep & Frame Pacing Timers (QPC hybrid spin-sleep pacing)", self.var_sync_precision_timers),
@@ -2213,12 +2208,6 @@ class ProtoGoblinCommandApp:
             self.btn_launch_game.config(text=f"🚀 Launch {short_name}")
 
         app_id = tgt.get("steam_appid")
-        preset = protogoblin.PresetDatabase.get_preset(app_id) if app_id else None
-        if preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
-            self.var_atelier_sync_fix.set(True)
-        else:
-            self.var_atelier_sync_fix.set(False)
-
         # Sync profile mode from existing .toml profile if present
         prof_mode = None
         if app_id:
@@ -2427,26 +2416,25 @@ class ProtoGoblinCommandApp:
         if roi and roi.get("roi_enabled"):
             fm = roi.get("frame_metrics") or {}
             pacing = roi.get("pacing") or {}
-            p_lines.extend(
-                [
-                    "REGION-OF-INTEREST (ROI) FRAMETIME TELEMETRY",
-                    "-" * 60,
-                    f"Bottleneck Status:    {(roi.get('bottleneck_classification') or 'balanced').upper()}",
-                    f"Average Framerate:    {(fm.get('fps_avg') or 0):.1f} FPS",
-                    f"1% Low Framerate:     {(fm.get('fps_1_pct_low') or 0):.1f} FPS",
-                    f"0.1% Low Framerate:   {(fm.get('fps_0_1_pct_low') or 0):.1f} FPS",
-                    f"Average Frametime:    {(fm.get('frametime_avg_ms') or 0):.2f} ms",
-                    f"Frametime Percentiles:p95 = {fm.get('frametime_p95_ms') or 0} ms | p99 = {fm.get('frametime_p99_ms') or 0} ms",
-                    f"Frametime Jitter:     {(fm.get('frametime_jitter_ms') or 0):.2f} ms (StdDev)",
-                    f"Total Frames Scanned: {(fm.get('total_frames') or 0):,}",
-                    "",
-                    "HARDWARE RESOURCE ALLOCATION",
-                    "-" * 60,
-                    f"CPU Busy Utilization: {pacing.get('cpu_busy_pct') or 0}%",
-                    f"CPU Wait/Blocked:     {pacing.get('cpu_wait_pct') or 0}%",
-                    f"GPU Busy Utilization: {pacing.get('gpu_busy_pct') or 0}%",
-                ]
-            )
+            def measured(value, unit="", places=2):
+                return f"{value:.{places}f}{unit}" if isinstance(value, (int, float)) else "unknown"
+            p_lines.extend([
+                "FRAME TELEMETRY",
+                "-" * 60,
+                f"Capture Status:      {roi.get('capture_status', 'unknown')}",
+                f"Bottleneck Estimate: {(roi.get('bottleneck_classification') or 'unknown').upper()}",
+                f"Average Framerate:   {measured(fm.get('fps_avg'), ' FPS')}",
+                f"1% Low Framerate:    {measured(fm.get('fps_1_pct_low'), ' FPS')}",
+                f"0.1% Low Framerate:  {measured(fm.get('fps_0_1_pct_low'), ' FPS')}",
+                f"Average Frametime:   {measured(fm.get('frametime_avg_ms'), ' ms')}",
+                f"Sample p95 / p99:    {measured(fm.get('frametime_p95_ms'), ' ms')} / {measured(fm.get('frametime_p99_ms'), ' ms')}",
+                f"Frametime Jitter:    {measured(fm.get('frametime_jitter_ms'), ' ms')}",
+                f"Interval Samples:    {fm.get('sample_count', 'unknown')}",
+                "",
+                f"CPU Load:            {measured(pacing.get('cpu_busy_pct'), '%')}",
+                f"CPU Wait:            {measured(pacing.get('cpu_wait_pct'), '%')}",
+                f"GPU Load:            {measured(pacing.get('gpu_busy_pct'), '%')}",
+            ])
         else:
             ac = data.get("anti_cheat", {})
             if ac.get("detected"):
@@ -2467,6 +2455,8 @@ class ProtoGoblinCommandApp:
                         "ROI Telemetry: Not recorded (Session was launched in PLAY mode).",
                         "To collect frame percentiles and latency breakdown, launch with:",
                         "  PROTOGOBLIN_MODE=profile %command%",
+                        "(MangoHud HUD and whole-session capture are enabled by default in",
+                        " profile sessions; set PROTOGOBLIN_OVERLAY=0 to opt out)",
                     ]
                 )
 
@@ -2502,7 +2492,7 @@ class ProtoGoblinCommandApp:
                 ]
             )
 
-        timing_stats = sess.get("graphics", {}).get("d3d11_wrapper_stats", {}).get("timing")
+        timing_stats = ((data.get("graphics") or {}).get("d3d11_wrapper_stats") or {}).get("timing")
         if timing_stats:
             p_lines.extend(
                 [
@@ -3000,8 +2990,6 @@ class ProtoGoblinCommandApp:
 
         mode = "profile" if enable_prof else "play"
         user_tweaks = {"mode": mode}
-        if preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
-            user_tweaks["atelier_sync_fix"] = True
 
         toml_content = protogoblin.EngineTweakManager.generate_profile_toml(
             game_id=app_id,
@@ -3053,7 +3041,7 @@ class ProtoGoblinCommandApp:
         self.var_gfx_descriptor_buffer.set(False)
         self.var_gfx_reflex.set(False)
         self.var_sync_ntsync.set(False)
-        self.var_atelier_sync_fix.set(False)
+        self.var_d3d11_trace.set(False)
         self.var_sync_state_dedup.set(False)
         self.var_sync_swapchain_debounce.set(False)
         self.var_sync_precision_timers.set(False)
@@ -3182,9 +3170,9 @@ class ProtoGoblinCommandApp:
             self.var_gfx_async_shader.set(bool(gfx["async_shader_compile"]))
         if "max_fps" in gfx:
             self.var_gfx_max_fps.set(str(gfx["max_fps"]))
-        if "atelier_sync_fix" in sync:
-            v = sync["atelier_sync_fix"]
-            self.var_atelier_sync_fix.set(bool(v.get("enabled") if isinstance(v, dict) else v))
+        if "d3d11" in prof_data.get("telemetry", {}):
+            v = prof_data["telemetry"]["d3d11"]
+            self.var_d3d11_trace.set(bool(v.get("enabled") if isinstance(v, dict) else v))
         if "state_dedup" in sync:
             v = sync["state_dedup"]
             self.var_sync_state_dedup.set(bool(v.get("enabled") if isinstance(v, dict) else v))
@@ -3223,8 +3211,8 @@ class ProtoGoblinCommandApp:
 
         if fid == "enable_descriptor_buffer":
             return bool(self.var_gfx_descriptor_buffer.get())
-        elif fid == "atelier_sync_fix":
-            return bool(self.var_atelier_sync_fix.get())
+        elif fid == "d3d11_trace":
+            return bool(self.var_d3d11_trace.get())
         elif fid == "async_shader_compile":
             return bool(self.var_gfx_async_shader.get())
         elif fid == "cap_framerate":
@@ -3272,8 +3260,8 @@ class ProtoGoblinCommandApp:
 
         if fid == "enable_descriptor_buffer":
             self.var_gfx_descriptor_buffer.set(enabled)
-        elif fid == "atelier_sync_fix":
-            self.var_atelier_sync_fix.set(enabled)
+        elif fid == "d3d11_trace":
+            self.var_d3d11_trace.set(enabled)
             if enabled:
                 self.var_gfx_vsync_off.set(True)
         elif fid == "async_shader_compile":
@@ -3519,15 +3507,12 @@ class ProtoGoblinCommandApp:
                 "• Cuts driver descriptor allocation overhead in CPU-bound draw-call heavy workloads.\n\n"
                 f"Saved to profile:\n{path}",
             )
-        elif fix_id == "atelier_sync_fix":
-            self.var_atelier_sync_fix.set(True)
-            self.var_gfx_vsync_off.set(True)
+        elif fix_id == "d3d11_trace":
+            self.var_d3d11_trace.set(True)
             path = self.generate_profile_toml(silent=True)
             messagebox.showinfo(
-                "Fix Applied",
-                "Gust / Atelier D3D11 Staging Buffer Sync Fix applied!\n\n"
-                "• Shadow staging buffer wrapper override enabled ([synchronization.atelier_sync_fix])\n"
-                "• Presentation sync forced off (dxgi.syncInterval = 0)\n\n"
+                "Capture Enabled",
+                "D3D11 readback timing capture enabled. GPU copies and mappings are forwarded unchanged.\n\n"
                 f"Saved to profile:\n{path}",
             )
         elif fix_id == "async_shader_compile":
@@ -3665,7 +3650,7 @@ class ProtoGoblinCommandApp:
 
         user_tweaks = {
             "mode": self.var_profile_mode.get(),
-            "atelier_sync_fix": self.var_atelier_sync_fix.get(),
+            "d3d11_trace": self.var_d3d11_trace.get(),
             "graphics": {
                 "backend": self.current_manifest.get("graphics", {}).get("active_backend", "dxvk"),
                 "force_vsync": "off" if self.var_gfx_vsync_off.get() else "auto",

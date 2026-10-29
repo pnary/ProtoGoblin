@@ -9,6 +9,8 @@ import csv
 import glob
 import hashlib
 import json
+import math
+import statistics
 import os
 import platform
 import re
@@ -62,6 +64,41 @@ def log(msg: str):
                 f.write(formatted + "\n")
         except Exception:
             pass
+
+
+def notify_desktop(summary, body=""):
+    """Best-effort desktop notification via notify-send. Never blocks or fails the launch."""
+    if os.environ.get("PROTOGOBLIN_NOTIFY", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    notify_bin = shutil.which("notify-send")
+    if not notify_bin:
+        return
+    args = [notify_bin, "-a", "ProtoGoblin", "-t", "10000", summary]
+    if body:
+        args.append(body)
+
+    def _run():
+        try:
+            subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _is_real_game_target(target_path):
+    """True when the session target is an actual game executable, not a Steam helper."""
+    if not target_path:
+        return False
+    normalized = target_path.replace("\\", "/")
+    return "/steamapps/common/" in normalized
+
+
+def feature_enabled(value):
+    """Read a boolean feature or its TOML table without treating the table as true."""
+    if isinstance(value, dict):
+        value = value.get("enabled", False)
+    return value is True
 
 
 class PEInfo:
@@ -651,12 +688,22 @@ class FixRegistry:
         "atelier_sync_fix": FixDefinition(
             fix_id="atelier_sync_fix",
             title="Atelier / Gust D3D11 Staging Buffer Sync Fix",
-            constituent_features=["atelier_sync_fix"],
+            constituent_features=["atelier_sync_fix", "d3d11_trace"],
             profile_targets=[
-                (("synchronization", "atelier_sync_fix"), True),
+                (("telemetry", "d3d11"), True),
                 (("graphics", "force_vsync"), "off"),
             ],
-            description="Applies D3D11 staging buffer shadow copies and unlocks VSync to resolve GPU starvation.",
+            description="Observes D3D11 readback timings without replacing GPU data and unlocks VSync.",
+        ),
+        "d3d11_trace": FixDefinition(
+            fix_id="d3d11_trace",
+            title="D3D11 Readback Telemetry Capture",
+            constituent_features=["d3d11_trace"],
+            profile_targets=[
+                (("telemetry", "d3d11"), True),
+                (("graphics", "force_vsync"), "off"),
+            ],
+            description="Observes D3D11 readback timings without replacing GPU data and unlocks VSync.",
         ),
         "precision_timers": FixDefinition(
             fix_id="precision_timers",
@@ -1671,21 +1718,15 @@ class EngineTweakManager:
                 f'max_fps = {godot_cfg.get("max_fps", 0)}',
             ])
 
-        preset = PresetDatabase.get_preset(app_id) if app_id else None
-        atelier_sync = None
-        if "atelier_sync_fix" in tweaks:
-            atelier_sync = tweaks["atelier_sync_fix"]
-        elif "synchronization" in tweaks and "atelier_sync_fix" in tweaks["synchronization"]:
-            atelier_sync = tweaks["synchronization"]["atelier_sync_fix"]
-        elif preset and "gust_d3d11_staging_sync_stall" in preset.get("known_issues", []):
-            atelier_sync = True
-
-        if cls.is_feature_enabled(atelier_sync):
+        d3d11_trace = tweaks.get("d3d11_trace", tweaks.get("telemetry", {}).get("d3d11"))
+        if d3d11_trace is None:
+            d3d11_trace = tweaks.get("atelier_sync_fix", tweaks.get("synchronization", {}).get("atelier_sync_fix"))
+        if cls.is_feature_enabled(d3d11_trace):
             lines.extend([
                 "",
-                "[synchronization.atelier_sync_fix]",
+                "[telemetry.d3d11]",
                 "enabled = true",
-                "# Shadow staging buffer wrapper to eliminate intra-frame CPU-GPU sync stalls",
+                "# Observe D3D11 readback timings without replacing GPU data",
             ])
 
         state_dedup = None
@@ -1842,6 +1883,7 @@ class EngineTweakManager:
         sync_sec = profile.get("synchronization", {})
 
         new_argv = list(argv)
+        unity_cfg = {}
 
         # 1. Unreal Engine command-line cvars
         ue_cfg = engine_sec.get("unreal", {})
@@ -1874,10 +1916,12 @@ class EngineTweakManager:
         dxvk_items = []
 
         # Safely evaluate features via is_feature_enabled to guard against nonempty dicts with enabled=false
-        sync_fix_val = sync_sec.get("atelier_sync_fix")
-        if sync_fix_val is None:
-            sync_fix_val = engine_sec.get("gust", {}).get("atelier_sync_fix")
-        sync_fix_enabled = cls.is_feature_enabled(sync_fix_val)
+        d3d11_trace_val = profile.get("telemetry", {}).get("d3d11")
+        if d3d11_trace_val is None:
+            d3d11_trace_val = sync_sec.get("atelier_sync_fix")
+        if d3d11_trace_val is None:
+            d3d11_trace_val = engine_sec.get("gust", {}).get("atelier_sync_fix")
+        d3d11_trace_enabled = cls.is_feature_enabled(d3d11_trace_val)
 
         state_dedup_enabled = cls.is_feature_enabled(sync_sec.get("state_dedup"))
         swapchain_debounce_enabled = cls.is_feature_enabled(sync_sec.get("swapchain_debounce"))
@@ -1912,19 +1956,18 @@ class EngineTweakManager:
             # In Profile Mode (benchmarking), applied/benchmarked/validated are permitted
             return any(g.get("status") in (ExperimentStatus.APPLIED, ExperimentStatus.BENCHMARKED, ExperimentStatus.VALIDATED) for g in governing)
 
-        sync_fix_enabled = _filter_by_experiment("atelier_sync_fix", sync_fix_enabled)
+        d3d11_trace_enabled = _filter_by_experiment("d3d11_trace", d3d11_trace_enabled) or _filter_by_experiment("atelier_sync_fix", d3d11_trace_enabled)
         state_dedup_enabled = _filter_by_experiment("state_dedup", state_dedup_enabled)
         swapchain_debounce_enabled = _filter_by_experiment("swapchain_debounce", swapchain_debounce_enabled)
         precision_timers_enabled = _filter_by_experiment("precision_timers", precision_timers_enabled)
 
-        wrapper_required = sync_fix_enabled or state_dedup_enabled or swapchain_debounce_enabled or precision_timers_enabled
+        wrapper_required = d3d11_trace_enabled or state_dedup_enabled or swapchain_debounce_enabled or precision_timers_enabled
         if wrapper_required:
             dll_ov = env.get("WINEDLLOVERRIDES", "")
             if "d3d11=" not in dll_ov:
                 env["WINEDLLOVERRIDES"] = f"d3d11=n,b;{dll_ov}" if dll_ov else "d3d11=n,b"
-            if sync_fix_enabled:
-                dxvk_items.extend(["dxgi.syncInterval = 0", "d3d11.syncInterval = 0"])
-                env["PROTOGOBLIN_STAGING_SYNC_FIX"] = "1"
+            if d3d11_trace_enabled:
+                env["PROTOGOBLIN_D3D11_TRACE"] = "1"
             if state_dedup_enabled:
                 env["PROTOGOBLIN_STATE_DEDUP"] = "1"
             if swapchain_debounce_enabled:
@@ -2229,6 +2272,10 @@ class ProcessTreeTracker:
         "rpcss.exe",
         "rundll32.exe",
         "start.exe",
+        "svchost.exe",
+        "tabtip.exe",
+        "xalia.exe",
+        "iscriptevaluator.exe",
         "cmd.exe",
         "umu.exe",
         "wineboot.exe",
@@ -2245,8 +2292,14 @@ class ProcessTreeTracker:
         r"crashreport",
     ]
 
-    def __init__(self, root_pid, prefix_dir=None):
+    def __init__(self, root_pid, prefix_dir=None, session_dir=None):
         self.root_pid = root_pid
+        # This process (the proton launcher) is the reliable tree anchor:
+        # under SteamLinuxRuntime / pressure-vessel, wineserver, wine's
+        # steam.exe and the game itself are parented here (or re-parented to
+        # the container init), never to the spawned wrapper child that
+        # root_pid refers to.
+        self.anchor_pid = os.getpid()
         self.prefix_dir = prefix_dir
         self.stop_event = threading.Event()
         self.thread = None
@@ -2259,6 +2312,44 @@ class ProcessTreeTracker:
         self.logged_pids = set()
         # map: resolved_path -> {'peak_threads': int, 'first_seen': float, 'last_seen': float}
         self.discovered_executables = {}
+        self.loaded_modules = set()
+        self._start_monotonic = time.monotonic()
+        self._injection_audited = False
+        self._extra_root = None
+        self.session_dir = session_dir or os.environ.get("PROTOGOBLIN_SESSION_DIR")
+
+    def _container_extra_root(self):
+        """Pressure-vessel adopts daemonized processes (wineserver, and through
+        it the game exe) to the container init, which is an ancestor sibling of
+        the launcher chain rather than a descendant of either root_pid or the
+        anchor.  Walk up from the anchor to the container boundary and return
+        that init as an additional tree root."""
+        container_names = {"pv-adverb", "srt-bwrap", "bwrap"}
+        cur = self.anchor_pid
+        extra = None
+        hops = 0
+        while cur and hops < 8:
+            hops += 1
+            try:
+                with open(f"/proc/{cur}/stat", "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                idx = content.rfind(")")
+                ppid = int(content[idx + 2:].split()[1])
+            except (OSError, IndexError, ValueError):
+                break
+            if not ppid:
+                break
+            try:
+                with open(f"/proc/{ppid}/comm", "r", encoding="utf-8", errors="ignore") as f:
+                    comm = f.read().strip()
+            except OSError:
+                break
+            if comm in container_names:
+                extra = ppid
+                cur = ppid
+                continue
+            cur = ppid
+        return extra
 
     def start(self):
         if not self.root_pid:
@@ -2284,14 +2375,19 @@ class ProcessTreeTracker:
         if len(norm) >= 2 and norm[1] == ":":
             drive = norm[0].lower()
             subpath = norm[2:].lstrip("/")
+            if prefix_dir:
+                drive_link = os.path.join(prefix_dir, "dosdevices", f"{drive}:")
+                candidate = os.path.join(drive_link, subpath)
+                if os.path.isfile(candidate):
+                    return os.path.realpath(candidate)
             if drive == "c" and prefix_dir:
                 candidate = os.path.join(prefix_dir, "drive_c", subpath)
                 if os.path.isfile(candidate):
-                    return os.path.abspath(candidate)
+                    return os.path.realpath(candidate)
             elif drive == "z":
                 candidate = "/" + subpath
                 if os.path.isfile(candidate):
-                    return os.path.abspath(candidate)
+                    return os.path.realpath(candidate)
         return clean
 
     def _monitor_loop(self):
@@ -2300,11 +2396,14 @@ class ProcessTreeTracker:
                 self._poll()
             except Exception:
                 pass
-            time.sleep(0.3)
+            self.stop_event.wait(0.3)
 
     def _poll(self):
         if not os.path.isdir("/proc"):
             return
+
+        if not self._extra_root:
+            self._extra_root = self._container_extra_root()
 
         try:
             pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
@@ -2325,7 +2424,12 @@ class ProcessTreeTracker:
                 continue
 
         tree_pids = set()
-        queue = [self.root_pid]
+        # Walk from both the spawned child and this launcher process.  Under
+        # SteamLinuxRuntime / pressure-vessel the wine processes are parented
+        # to this process or re-parented to the container init, not to the
+        # spawned wrapper, so anchoring only on root_pid observes an empty
+        # tree (peak_processes=1).
+        queue = [pid for pid in {self.root_pid, self.anchor_pid, self._extra_root} if pid]
         while queue:
             curr = queue.pop(0)
             tree_pids.add(curr)
@@ -2342,6 +2446,7 @@ class ProcessTreeTracker:
             now = time.monotonic()
 
             for pid in tree_pids:
+                pid_threads = 0
                 if pid not in self.logged_pids:
                     self.logged_pids.add(pid)
                     comm = ""
@@ -2362,7 +2467,8 @@ class ProcessTreeTracker:
                     with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="ignore") as f:
                         for line in f:
                             if line.startswith("Threads:"):
-                                total_threads += int(line.split()[1])
+                                pid_threads = int(line.split()[1])
+                                total_threads += pid_threads
                                 break
                 except (OSError, IndexError, ValueError):
                     pass
@@ -2371,13 +2477,30 @@ class ProcessTreeTracker:
                     with open(f"/proc/{pid}/cmdline", "rb") as f:
                         raw = f.read()
                     parts = raw.split(b"\0")
+                    with open(f"/proc/{pid}/comm", encoding="utf-8", errors="ignore") as stream:
+                        process_name = stream.read().strip().lower()
+                    executable_name = os.path.basename(os.readlink(f"/proc/{pid}/exe")).lower()
+                    # Python and runtime wrappers mention the game in argv but
+                    # are not the game. Only Wine/PE processes supply candidates.
+                    if not (process_name.endswith(".exe") or executable_name in (
+                        "wine", "wine64", "wine-preloader", "wine64-preloader",
+                    )):
+                        continue
+                    try:
+                        with open(f"/proc/{pid}/maps", encoding="utf-8", errors="ignore") as stream:
+                            for line in stream:
+                                path = line.split()[-1] if line.split() else ""
+                                if path.startswith("/") and path.lower().endswith(".dll"):
+                                    self.loaded_modules.add(os.path.splitext(os.path.basename(path))[0].lower())
+                    except OSError:
+                        pass
                     for part in parts:
                         try:
                             token = part.decode("utf-8", errors="ignore").strip()
                         except Exception:
                             continue
                         if token.lower().endswith(".exe"):
-                            base = os.path.basename(token).lower()
+                            base = os.path.basename(token.replace("\\", "/")).lower()
                             if base not in self.SYSTEM_HELPER_EXES:
                                 resolved = self.resolve_wine_path(token, self.prefix_dir)
                                 if resolved not in self.discovered_executables:
@@ -2385,18 +2508,45 @@ class ProcessTreeTracker:
                                     self.discovered_executables[resolved] = {
                                         "first_seen": now,
                                         "last_seen": now,
-                                        "peak_threads": 1,
+                                        "peak_threads": pid_threads,
                                     }
                                 else:
                                     entry = self.discovered_executables[resolved]
                                     entry["last_seen"] = now
-                                    if total_threads > entry["peak_threads"]:
-                                        entry["peak_threads"] = total_threads
+                                    if pid_threads > entry["peak_threads"]:
+                                        entry["peak_threads"] = pid_threads
                 except OSError:
                     continue
 
             if total_threads > self.peak_thread_count:
                 self.peak_thread_count = total_threads
+
+            # One-shot runtime injection audit: once the tree has had time to
+            # spawn the target, record which MangoHud libraries were actually
+            # mapped.  This is ground truth; the pre-flight audit is only a
+            # prediction.
+            if (not self._injection_audited
+                    and self.session_dir
+                    and time.monotonic() - self._start_monotonic > 8.0):
+                self._injection_audited = True
+                mapped = []
+                for pid in tree_pids:
+                    try:
+                        with open(f"/proc/{pid}/maps", "r", encoding="utf-8", errors="ignore") as f:
+                            libs = sorted({line.split()[-1] for line in f
+                                           if "libMangoHud" in line
+                                           and line.split() and line.split()[-1].startswith("/")})
+                    except (OSError, IndexError):
+                        continue
+                    if libs:
+                        mapped.append({"pid": pid, "libraries": libs})
+                        log(f"InjectionAudit: PID={pid} has MangoHud mapped: {libs}")
+                if mapped:
+                    try:
+                        with open(os.path.join(self.session_dir, "injection_audit.json"), "w", encoding="utf-8") as f:
+                            json.dump({"mapped": mapped}, f, indent=2)
+                    except OSError:
+                        pass
 
     def evaluate_executables(self, initial_exe_path):
         """Analyzes all discovered executables and classifies (launcher_path, target_path)."""
@@ -2498,7 +2648,7 @@ class GraphicsLogParser:
             "vulkan_version": None,
             "present_mode": None,
             "resolution": None,
-            "presentation_model": "flip",
+            "presentation_model": None,
             "shader_compiles": {
                 "count": 0,
                 "total_time_ms": 0.0,
@@ -2589,122 +2739,117 @@ class GraphicsLogParser:
 
 
 class MangoHudLogParser:
-    """Parses MangoHud summary and frametime CSV logs into standardized ProtoGoblin ROI metrics."""
+    """Parse every capture; keep missing measurements distinct from zero.
+
+    MangoHud's interval logs contain samples, not every rendered frame. Their
+    percentiles describe sampled frametimes and cannot establish GPU readbacks
+    or render-thread wait time on their own.
+    """
+
+    @staticmethod
+    def _number(value):
+        try:
+            result = float(value)
+            return result if math.isfinite(result) and result >= 0 else None
+        except (TypeError, ValueError):
+            return None
 
     @classmethod
     def parse_session(cls, session_dir, duration_sec=0.0):
         if not session_dir or not os.path.isdir(session_dir):
             return None
-
-        summary_files = [
-            os.path.join(session_dir, f)
-            for f in os.listdir(session_dir)
-            if f.endswith("_summary.csv")
-        ]
-
-        detail_files = [
-            os.path.join(session_dir, f)
-            for f in os.listdir(session_dir)
-            if f.endswith(".csv") and not f.endswith("_summary.csv")
-        ]
-
-        if not summary_files and not detail_files:
+        paths = sorted(Path(session_dir).glob("*.csv"))
+        if not paths:
             return None
 
-        fps_avg = 0.0
-        fps_1 = 0.0
-        fps_0_1 = 0.0
-        frametime_avg = 0.0
-        cpu_busy = 0.0
-        gpu_busy = 0.0
-        total_frames = 0
-        ft_p95 = 0.0
-        ft_p99 = 0.0
-        jitter = 0.0
-
-        if summary_files:
+        samples = {key: [] for key in ("frametime", "fps", "cpu_load", "gpu_load")}
+        summaries = []
+        sources = []
+        for path in paths:
             try:
-                with open(summary_files[0], "r", encoding="utf-8", errors="ignore") as f:
-                    reader = csv.DictReader(f)
-                    row = next(reader)
-                    fps_0_1 = float(row.get("0.1% Min FPS", 0))
-                    fps_1 = float(row.get("1% Min FPS", 0))
-                    fps_avg = float(row.get("Average FPS", 0))
-                    frametime_avg = float(row.get("Average Frame Time", 0))
-                    cpu_busy = float(row.get("CPU Load", 0))
-                    gpu_busy = float(row.get("GPU Load", 0))
-            except Exception:
-                pass
+                with path.open(encoding="utf-8-sig", errors="replace", newline="") as stream:
+                    rows = list(csv.reader(stream))
+            except OSError:
+                continue
+            is_summary = path.name.endswith("_summary.csv")
+            for index, row in enumerate(rows):
+                header = [column.strip().lower() for column in row]
+                if is_summary:
+                    if "average fps" not in header:
+                        continue
+                elif "frametime" not in header or "fps" not in header:
+                    continue
+                for values in rows[index + 1:]:
+                    record = {key: cls._number(value.strip()) for key, value in zip(header, values)}
+                    if is_summary:
+                        if record.get("average fps") is not None:
+                            summaries.append(record)
+                    else:
+                        for key in samples:
+                            value = record.get(key)
+                            if value is not None and (key not in ("fps", "frametime") or value > 0):
+                                samples[key].append(value)
+                sources.append(path.name)
+                break
 
-        if detail_files:
-            try:
-                frametimes = []
-                with open(detail_files[0], "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
-                    header_idx = -1
-                    for idx, line in enumerate(lines):
-                        if "frametime" in line and "fps" in line:
-                            header_idx = idx
-                            break
-                    if header_idx != -1:
-                        reader = csv.DictReader(lines[header_idx:])
-                        for r in reader:
-                            val = r.get("frametime")
-                            if val:
-                                try:
-                                    frametimes.append(float(val))
-                                except ValueError:
-                                    pass
+        if not sources:
+            return None
+        # Detail samples can be aggregated across captures. Summary-only
+        # averages are only usable for a single capture without sample weights.
+        detail_captures = sum(not name.endswith("_summary.csv") for name in sources)
+        summary = summaries[0] if len(summaries) == 1 and detail_captures <= 1 else {}
+        frametimes = sorted(samples["frametime"])
+        def average(key, summary_key=None):
+            values = samples[key]
+            return statistics.fmean(values) if values else summary.get(summary_key)
+        def rounded(value, places=2):
+            return round(value, places) if value is not None else None
+        def percentile(q):
+            if not frametimes:
+                return None
+            return frametimes[max(0, math.ceil(q * len(frametimes)) - 1)]
 
-                if frametimes:
-                    total_frames = len(frametimes)
-                    frametimes.sort()
-                    p95_idx = int(0.95 * len(frametimes))
-                    p99_idx = int(0.99 * len(frametimes))
-                    ft_p95 = round(frametimes[p95_idx], 2)
-                    ft_p99 = round(frametimes[p99_idx], 2)
-                    if not frametime_avg:
-                        frametime_avg = round(sum(frametimes) / len(frametimes), 2)
-                    if not fps_avg and frametime_avg > 0:
-                        fps_avg = round(1000.0 / frametime_avg, 1)
-
-                    variance = sum((x - frametime_avg) ** 2 for x in frametimes) / len(frametimes)
-                    jitter = round(variance**0.5, 2)
-            except Exception:
-                pass
-
-        if not total_frames and fps_avg > 0 and duration_sec > 0:
-            total_frames = int(fps_avg * duration_sec)
-
-        if cpu_busy >= 80 and gpu_busy < 75:
-            classification = "cpu_bound"
-        elif gpu_busy >= 85:
+        ft_avg = average("frametime", "average frame time")
+        fps_avg = average("fps", "average fps")
+        cpu = average("cpu_load", "cpu load")
+        gpu = average("gpu_load", "gpu load")
+        # Utilization is a heuristic, not evidence of a particular API stall.
+        if gpu is not None and gpu >= 85:
             classification = "gpu_bound"
-        elif cpu_busy < 50 and gpu_busy < 50:
-            classification = "sync_bound"
+        elif cpu is None or gpu is None:
+            classification = "unknown"
+        elif cpu >= 80 and gpu < 75:
+            classification = "cpu_bound"
+        elif cpu < 50 and gpu < 50:
+            classification = "underutilized"
         else:
             classification = "balanced"
-
         return {
             "roi_enabled": True,
-            "roi_capture_duration_sec": round(duration_sec, 2),
+            "capture_status": "measured" if frametimes or summaries else "incomplete",
+            "capture_files": sources,
+            "roi_capture_duration_sec": None,
+            "session_duration_sec": round(duration_sec, 2),
             "bottleneck_classification": classification,
+            "classification_basis": "aggregate_utilization_heuristic",
             "compatibility_layer_overhead_ratio": None,
             "frame_metrics": {
-                "total_frames": total_frames,
-                "fps_avg": round(fps_avg, 1),
-                "fps_p50": round(fps_avg, 1),
-                "fps_1_pct_low": round(fps_1, 1),
-                "fps_0_1_pct_low": round(fps_0_1, 1),
-                "frametime_avg_ms": round(frametime_avg, 2),
-                "frametime_p95_ms": ft_p95 or round(frametime_avg * 1.15, 2),
-                "frametime_p99_ms": ft_p99 or round(frametime_avg * 1.35, 2),
-                "frametime_jitter_ms": jitter or 0.5,
+                "total_frames": None,
+                "sample_count": len(frametimes),
+                "percentile_basis": "interval_samples" if frametimes else None,
+                "fps_avg": rounded(fps_avg, 1),
+                "fps_p50": rounded(statistics.median(samples["fps"]), 1) if samples["fps"] else None,
+                "fps_1_pct_low": summary.get("1% min fps"),
+                "fps_0_1_pct_low": summary.get("0.1% min fps"),
+                "frametime_avg_ms": rounded(ft_avg),
+                "frametime_p95_ms": rounded(percentile(0.95)),
+                "frametime_p99_ms": rounded(percentile(0.99)),
+                "frametime_jitter_ms": rounded(statistics.pstdev(frametimes)) if frametimes else None,
             },
             "pacing": {
-                "cpu_busy_pct": round(cpu_busy, 1),
-                "cpu_wait_pct": round(max(0.0, 100.0 - cpu_busy), 1),
-                "gpu_busy_pct": round(gpu_busy, 1),
+                "cpu_busy_pct": rounded(cpu, 1),
+                "cpu_wait_pct": None,
+                "gpu_busy_pct": rounded(gpu, 1),
                 "in_present_api_pct": None,
             },
         }
@@ -3555,22 +3700,9 @@ class ProtoGoblinSession:
         if not profile_prune_enabled:
             return []
 
-        unutilized = set()
-        if prune_cfg:
-            for sub, active in prune_cfg.items():
-                if active:
-                    unutilized.add(sub.lower())
-
-        prev_manifest_path = self.find_latest_session_manifest()
-        if prev_manifest_path and os.path.isfile(prev_manifest_path):
-            try:
-                with open(prev_manifest_path, "r", encoding="utf-8") as f:
-                    prev_data = json.load(f)
-                prev_subs = (prev_data.get("subsystems") or {}).get("unutilized", [])
-                for s in prev_subs:
-                    unutilized.add(str(s).lower())
-            except Exception:
-                pass
+        # A capture only covers exercised code paths. Never disable a subsystem
+        # just because a previous run did not observe it.
+        unutilized = {sub.lower() for sub, value in prune_cfg.items() if feature_enabled(value)}
 
         pruned = []
 
@@ -3580,7 +3712,7 @@ class ProtoGoblinSession:
                 env["WINEDLLOVERRIDES"] = f"{dll_name}=d;{cur}" if cur else f"{dll_name}=d"
 
         # 1. VR / OpenXR Pruning
-        if "openvr" in unutilized or "wineopenxr" in unutilized or "vr" in unutilized or prune_cfg.get("vr"):
+        if "openvr" in unutilized or "wineopenxr" in unutilized or "vr" in unutilized or "vr" in unutilized:
             for vr_dll in ["openvr_api", "wineopenxr", "vrclient", "vrclient_x64"]:
                 _disable_dll(vr_dll)
             env["PROTON_NO_VR"] = "1"
@@ -3588,13 +3720,13 @@ class ProtoGoblinSession:
             pruned.append("vr")
 
         # 2. Media Foundation Pruning
-        if ("mfplat" in unutilized and prune_cfg.get("mfplat")) or prune_cfg.get("mfplat"):
+        if "mfplat" in unutilized:
             for mf_dll in ["mfplat", "mfreadwrite"]:
                 _disable_dll(mf_dll)
             pruned.append("mfplat")
 
         # 3. D3D12 Pruning (for games that never load d3d12)
-        if ("d3d12" in unutilized and prune_cfg.get("d3d12")) or prune_cfg.get("d3d12"):
+        if "d3d12" in unutilized:
             _disable_dll("d3d12")
             pruned.append("d3d12")
 
@@ -3682,14 +3814,44 @@ class ProtoGoblinSession:
                 f"Active {self.anti_cheat.get('provider', 'Anti-Cheat')} detected. Profiling hooks and HUD overlay "
                 "were disabled to enforce strict zero-injection passthrough and minimize ban risk or client disconnections."
             )
+            # Suppress inherited ProtoGoblin hooks as well as hooks configured
+            # below. Leave unrelated Steam/user preloads and upstream DXVK intact.
+            env["MANGOHUD"] = "0"
+            env.pop("MANGOHUD_CONFIG", None)
+            for key in ("PROTOGOBLIN_STAGING_SYNC_FIX", "PROTOGOBLIN_STATE_DEDUP",
+                        "PROTOGOBLIN_SWAPCHAIN_DEBOUNCE", "PROTOGOBLIN_HIGH_PRECISION_TIMERS",
+                        "PROTOGOBLIN_IO_CACHE", "PROTOGOBLIN_D3D11_TRACE"):
+                env.pop(key, None)
+            for key in ("LD_PRELOAD", "WINEDLLPATH"):
+                paths = [part for part in re.split(r"[:\s]+", env.get(key, "")) if part]
+                paths = [part for part in paths if not any(name in part.lower() for name in (
+                    "libmangohud", "libprotogoblin", "/protogoblin/lib", "/staging-sync-fix",
+                ))]
+                if paths:
+                    env[key] = ":".join(paths)
+                else:
+                    env.pop(key, None)
 
         # Upstream ntsync auto-detection: if /dev/ntsync is exposed by host kernel (Linux 6.13+)
         if os.path.exists("/dev/ntsync") and os.environ.get("PROTON_NO_NTSYNC") != "1":
             env.setdefault("PROTON_USE_NTSYNC", "1")
             env.setdefault("WINE_USE_NTSYNC", "1")
 
-        # In profile mode, configure bundled MangoHud for automatic ROI telemetry capture and HUD status
+        # In profile mode, MangoHud provides ROI frame telemetry and the HUD
+        # overlay.  It is ON by default: telemetry is the point of this
+        # project.  The MangoHud v0.8.x loader deadlock that forced the old
+        # opt-in gate is fixed at the source in patches/mangohud/ - blacklisted
+        # helper processes now refuse the layer interface outright in
+        # vkNegotiateLoaderLayerInterfaceVersion instead of wedging the
+        # loader's procaddr walk.  PROTOGOBLIN_OVERLAY=0 opts out of the
+        # on-screen display only: the layer stays loaded and capture still
+        # autostarts and profiles the entire session.  All other profiling
+        # telemetry (process tree, I/O, manifests) is unaffected.
+        pe_data = PEInfo.inspect(target_path) if target_path else None
+        overlay_disabled = os.environ.get("PROTOGOBLIN_OVERLAY", "1").strip().lower() in ("0", "false", "no", "off")
         if self.mode == "profile":
+            env.setdefault("DXVK_LOG_LEVEL", "info")
+            env.setdefault("DXVK_LOG_PATH", self.session_dir)
             env["MANGOHUD"] = "1"
             assigned_key = self.get_assigned_profile_key()
             mangohud_key = self._format_mangohud_hotkey(assigned_key)
@@ -3700,10 +3862,11 @@ class ProtoGoblinSession:
                 os.path.join(proto_root, "files", "share", "mangohud", "implicit_layer.d"),
                 os.path.join(proto_root, "share", "protogoblin", "mangohud", "implicit_layer.d"),
                 os.path.join(proto_root, "share", "mangohud", "implicit_layer.d"),
-                os.path.expanduser("~/.local/share/vulkan/implicit_layer.d"),
-                "/usr/share/vulkan/implicit_layer.d",
             ]
-            valid_layer_dirs = [d for d in layer_dirs if os.path.isdir(d)]
+            # Select one bundled manifest directory. Combining it with global
+            # MangoHud copies can load both architecture-named layers against
+            # one soname, recursively wiring the layer's dispatch table to itself.
+            valid_layer_dirs = [d for d in layer_dirs if os.path.isdir(d)][:1]
             if valid_layer_dirs:
                 for l_var in ["VK_ADD_LAYER_PATH", "VK_IMPLICIT_LAYER_PATH"]:
                     existing = env.get(l_var, "")
@@ -3730,50 +3893,84 @@ class ProtoGoblinSession:
                 existing_ld = env.get("LD_LIBRARY_PATH", "")
                 ld_parts = [p for p in existing_ld.split(":") if p] if existing_ld else []
                 for d in valid_lib_dirs:
+                    # Append in listed order: bundled (patched) dirs come first
+                    # in lib_dirs and must keep priority.  insert(0) here used
+                    # to reverse the order and let user/system MangoHud
+                    # installs shadow the bundled one.
                     if d not in ld_parts:
-                        ld_parts.insert(0, d)
+                        ld_parts.append(d)
                 env["LD_LIBRARY_PATH"] = ":".join(ld_parts)
 
-            hud_script_path = os.path.join(self.session_dir, "hud_status.sh")
-            try:
-                with open(hud_script_path, "w", encoding="utf-8") as f:
-                    f.write(
-                        "#!/bin/sh\n"
-                        f"SESSION_DIR=\"{self.session_dir}\"\n"
-                        f"KEY=\"{assigned_key}\"\n"
-                        "NOW=$(date +%s)\n"
-                        "ACTIVE=0\n"
-                        "for f in \"$SESSION_DIR\"/*.csv; do\n"
-                        "  [ -f \"$f\" ] || continue\n"
-                        "  case \"$f\" in\n"
-                        "    *_summary.csv) continue ;;\n"
-                        "  esac\n"
-                        "  MTIME=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null)\n"
-                        "  if [ -n \"$MTIME\" ]; then\n"
-                        "    DIFF=$((NOW - MTIME))\n"
-                        "    if [ \"$DIFF\" -ge 0 ] && [ \"$DIFF\" -le 3 ]; then\n"
-                        "      ACTIVE=1\n"
-                        "      break\n"
-                        "    fi\n"
-                        "  fi\n"
-                        "done\n"
-                        "if [ \"$ACTIVE\" -eq 1 ]; then\n"
-                        "  echo \"Profiling\"\n"
-                        "else\n"
-                        "  echo \"Press $KEY to start Profiling\"\n"
-                        "fi\n"
-                    )
-                os.chmod(hud_script_path, 0o755)
-            except OSError:
-                pass
-
-            log(f"Configuring MangoHud for profiling: hotkey={assigned_key}")
             config_parts = [
                 f"output_folder={self.session_dir}",
                 "log_interval=100",
                 "fps_metrics=avg+0.01+0.001",
+                # Profile the whole session: start capture at launch instead of
+                # waiting for the HUD hotkey confirmation.
+                "autostart_log=1",
                 f"toggle_logging={mangohud_key}",
             ]
+            if not overlay_disabled:
+                log(f"Configuring MangoHud for profiling: hotkey={assigned_key}")
+                config_parts.extend([
+                    "legacy_layout=0",
+                    "position=top-right",
+                    # Static banner: capture autostarts and covers the whole
+                    # session, so there is no dynamic state to display.  No
+                    # exec=: MangoHud would popen() /bin/sh from inside the
+                    # game process, and that fork is the prime suspect for
+                    # early-init wedges (white screen before any frames).
+                    "custom_text=ProtoGoblin\\: profiling (full session)",
+                    "text_color=39FF14",
+                    "font_size=26",
+                    "background_alpha=0.0",
+                    "text_outline=1",
+                    "text_outline_color=000000",
+                ])
+                # Opt-in legacy dynamic banner: MangoHud's exec= params spawn
+                # /bin/sh from inside the game process (a fork in a 50+ thread
+                # wine process).  Off by default; set
+                # PROTOGOBLIN_OVERLAY_EXEC=1 to restore it.
+                if os.environ.get("PROTOGOBLIN_OVERLAY_EXEC", "0").strip().lower() in ("1", "true", "yes", "on"):
+                    hud_script_path = os.path.join(self.session_dir, "hud_status.sh")
+                    try:
+                        with open(hud_script_path, "w", encoding="utf-8") as f:
+                            f.write(
+                                "#!/bin/sh\n"
+                                f"SESSION_DIR=\"{self.session_dir}\"\n"
+                                f"KEY=\"{assigned_key}\"\n"
+                                "NOW=$(date +%s)\n"
+                                "ACTIVE=0\n"
+                                "for f in \"$SESSION_DIR\"/*.csv; do\n"
+                                "  [ -f \"$f\" ] || continue\n"
+                                "  case \"$f\" in\n"
+                                "    *_summary.csv) continue ;;\n"
+                                "  esac\n"
+                                "  MTIME=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null)\n"
+                                "  if [ -n \"$MTIME\" ]; then\n"
+                                "    DIFF=$((NOW - MTIME))\n"
+                                "    if [ \"$DIFF\" -ge 0 ] && [ \"$DIFF\" -le 3 ]; then\n"
+                                "      ACTIVE=1\n"
+                                "      break\n"
+                                "    fi\n"
+                                "  fi\n"
+                                "done\n"
+                                "if [ \"$ACTIVE\" -eq 1 ]; then\n"
+                                "  echo \"Profiling\"\n"
+                                "else\n"
+                                "  echo \"Press $KEY to start Profiling\"\n"
+                                "fi\n"
+                            )
+                        os.chmod(hud_script_path, 0o755)
+                    except OSError:
+                        pass
+                    config_parts.append(f"exec={hud_script_path}")
+                    log("PROTOGOBLIN_OVERLAY_EXEC=1: dynamic HUD status (exec=) enabled; MangoHud will spawn a shell from the game process.")
+            else:
+                # Capture-only: keep the layer loaded and logging without
+                # drawing anything on screen.
+                config_parts.append("no_display=1")
+                log("MangoHud display disabled via PROTOGOBLIN_OVERLAY=0; whole-session capture remains active.")
             blacklist_helpers = [
                 "steam.exe",
                 "Steam.exe",
@@ -3791,28 +3988,73 @@ class ProtoGoblinSession:
             ]
             for helper in blacklist_helpers:
                 config_parts.append(f"blacklist={helper}")
-            if os.environ.get("PROTOGOBLIN_OVERLAY") == "0":
-                config_parts.append("no_display=1")
-            else:
-                config_parts.extend([
-                    "legacy_layout=0",
-                    "position=top-right",
-                    "custom_text=ProtoGoblin\\:",
-                    f"exec={hud_script_path}",
-                    "text_color=39FF14",
-                    "font_size=26",
-                    "background_alpha=0.0",
-                    "text_outline=1",
-                    "text_outline_color=000000",
-                ])
             env["MANGOHUD_CONFIG"] = ",".join(config_parts)
             log(f"MANGOHUD_CONFIG={env['MANGOHUD_CONFIG']}")
             log(f"LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH')}")
             log(f"VK_ADD_LAYER_PATH={env.get('VK_ADD_LAYER_PATH')}")
 
+            # Deep opt-in tracing for wedge hunts: PROTOGOBLIN_DEBUG_LAYERS=1
+            # records the loader's full layer selection on stderr and lets
+            # DXVK log its init progress into the session dir.
+            if os.environ.get("PROTOGOBLIN_DEBUG_LAYERS", "0").strip().lower() in ("1", "true", "yes", "on"):
+                env["VK_LOADER_DEBUG"] = "loader"
+                env["DXVK_LOG_LEVEL"] = "info"
+                env.setdefault("DXVK_LOG_PATH", self.session_dir)
+                existing_wd = env.get("WINEDEBUG", "")
+                env["WINEDEBUG"] = f"{existing_wd},+loaddll" if existing_wd else "+loaddll"
+                log("PROTOGOBLIN_DEBUG_LAYERS active: VK_LOADER_DEBUG=loader, DXVK_LOG_LEVEL=info (DXVK_LOG_PATH=session dir), WINEDEBUG+=+loaddll")
+
+            # Injection audit: record exactly which MangoHud layer manifest and
+            # library the loader will resolve, so every session can prove what
+            # was injected instead of inferring it after a wedge.
+            expected_arch = "32" if pe_data and pe_data.get("arch") == "x86_32" else "64"
+            # pressure-vessel can import older global manifests into its own
+            # override directory. Architecture filtering must also apply there,
+            # otherwise its x86 entry can resolve the same 64-bit soname again.
+            incompatible_layer = "VK_LAYER_MANGOHUD_overlay_x86" if expected_arch == "64" else "VK_LAYER_MANGOHUD_overlay_x86_64"
+            disabled_layers = [name for name in env.get("VK_LOADER_LAYERS_DISABLE", "").split(",") if name]
+            if incompatible_layer not in disabled_layers:
+                disabled_layers.append(incompatible_layer)
+            env["VK_LOADER_LAYERS_DISABLE"] = ",".join(disabled_layers)
+            audit = {"kind": "prediction", "library_arch": expected_arch, "layer": None, "library": None, "bundled_match": None}
+            for d in env.get("VK_ADD_LAYER_PATH", "").split(":"):
+                if not d:
+                    continue
+                pattern = "MangoHud.x86_64.json" if expected_arch == "64" else "MangoHud.x86.json"
+                hits = sorted(glob.glob(os.path.join(d, pattern)))
+                if hits:
+                    try:
+                        with open(hits[0], "r", encoding="utf-8") as f:
+                            layer_json = json.load(f).get("layer", {})
+                        audit["layer"] = {
+                            "manifest": hits[0],
+                            "name": layer_json.get("name"),
+                            "library_path": layer_json.get("library_path"),
+                        }
+                    except (OSError, ValueError):
+                        audit["layer"] = {"manifest": hits[0]}
+                    break
+            bundled_ref = os.path.join(proto_root, "share", "protogoblin", "mangohud", "lib64", "libMangoHud.so")
+            for d in env.get("LD_LIBRARY_PATH", "").split(":"):
+                candidate = os.path.join(d, "libMangoHud.so")
+                if os.path.isfile(candidate):
+                    with open(candidate, "rb") as f:
+                        digest = hashlib.sha256(f.read()).hexdigest()
+                    audit["library"] = {"path": candidate, "sha256": digest}
+                    if os.path.isfile(bundled_ref):
+                        with open(bundled_ref, "rb") as f:
+                            audit["bundled_match"] = digest == hashlib.sha256(f.read()).hexdigest()
+                    break
+            log(f"MangoHud injection audit: layer={audit['layer']}")
+            log(f"MangoHud injection audit: library={audit['library']} bundled_match={audit['bundled_match']}")
+            try:
+                with open(os.path.join(self.session_dir, "layer_audit.json"), "w", encoding="utf-8") as f:
+                    json.dump(audit, f, indent=2)
+            except OSError:
+                pass
+
         # Initial target info and engine detection
         if target_path:
-            pe_data = PEInfo.inspect(target_path)
             self.target_exe = pe_data or {
                 "path": target_path,
                 "sha256": "unknown",
@@ -3842,7 +4084,8 @@ class ProtoGoblinSession:
 
         profile = None
         profile_path = self.find_game_profile()
-        if profile_path and not is_raw:
+        modifications_allowed = not is_raw and not self.anti_cheat["detected"]
+        if profile_path and modifications_allowed:
             profile = EngineTweakManager.load_profile(profile_path)
             if profile:
                 log(f"Loaded game profile: {profile_path}")
@@ -3856,7 +4099,7 @@ class ProtoGoblinSession:
                     is_deck=self.is_steam_deck,
                 )
                 log(f"Applied engine tweaks from profile. Resulting argv={argv}")
-        elif not is_raw and presets_enabled:
+        elif modifications_allowed and presets_enabled:
             # Automatic preset bootstrap from PresetDatabase if no custom profile exists
             if self.is_steam_deck:
                 env.setdefault("SteamDeck", "1")
@@ -3876,7 +4119,7 @@ class ProtoGoblinSession:
             self.dev_mode = True
 
         # Active Subsystem Pruning in Play Mode based on prior profiling telemetry
-        if not is_raw:
+        if modifications_allowed:
             self.prune_subsystems(env, profile=profile)
             if self.pruned_subsystems:
                 log(f"Pruned unutilized subsystems: {self.pruned_subsystems}")
@@ -3907,12 +4150,23 @@ class ProtoGoblinSession:
             pass
 
         log(f"pre_flight complete. Final argv={argv}")
+
+        # Lifecycle signal: confirm profiling start for real game sessions.
+        if self.mode == "profile" and _is_real_game_target(target_path):
+            if env.get("MANGOHUD") == "1":
+                hud_state = "Frame HUD on — logging the full session (hotkey toggles capture)"
+            else:
+                hud_state = "Frame HUD off (PROTOGOBLIN_OVERLAY=1 enables it)"
+            notify_desktop(
+                "ProtoGoblin: profiling started",
+                f"{os.path.basename(target_path)} — session {self.session_id}\n{hud_state}",
+            )
         return argv
 
-    def start_process_tree_monitor(self, root_pid, prefix_dir=None):
-        """Starts monitoring child processes spawned by root_pid."""
+    def start_process_tree_monitor(self, root_pid, prefix_dir=None, session_dir=None):
+        """Starts monitoring the session tree from root_pid and the launcher process itself."""
         log(f"start_process_tree_monitor: root_pid={root_pid}, prefix_dir={prefix_dir}")
-        self.tracker = ProcessTreeTracker(root_pid, prefix_dir)
+        self.tracker = ProcessTreeTracker(root_pid, prefix_dir, session_dir=session_dir)
         self.tracker.start()
 
     def stop_process_tree_monitor(self):
@@ -3950,7 +4204,7 @@ class ProtoGoblinSession:
 
         sync_backend = "wineserver_rpc"
         fast_path = False
-        if os.path.exists("/dev/ntsync") or env.get("WINE_USE_NTSYNC") == "1" or env.get("PROTON_USE_NTSYNC") == "1":
+        if env.get("PROTON_NO_NTSYNC") != "1" and (env.get("WINE_USE_NTSYNC") == "1" or env.get("PROTON_USE_NTSYNC") == "1"):
             sync_backend = "ntsync"
             fast_path = True
         elif env.get("WINEFSYNC") == "1":
@@ -3967,8 +4221,8 @@ class ProtoGoblinSession:
         else:
             active_backend = "dxvk"
 
-        d3d_api_versions = ["d3d11", "dxgi"]
-        present_mode = "VK_PRESENT_MODE_FIFO_KHR"
+        d3d_api_versions = []
+        present_mode = None
         resolution = "unknown"
         shader_compiles = {
             "count": 0,
@@ -4008,16 +4262,16 @@ class ProtoGoblinSession:
             shader_compiles = parsed_gfx["shader_compiles"]
             vram_used_mb = parsed_gfx["vram_used_mb"]
 
-        loaded_subsystems = ["kernel32", "ntdll", "user32", "gdi32", "ws2_32"]
-        unutilized_subsystems = ["dinput8", "openvr", "wineopenxr", "mfplat"]
+        loaded_subsystems = sorted(self.tracker.loaded_modules) if self.tracker else []
+        unutilized_subsystems = []
+        for api in ("d3d9", "d3d10core", "d3d11", "dxgi", "d3d12"):
+            if api in loaded_subsystems and api not in d3d_api_versions:
+                d3d_api_versions.append(api)
+
 
         for api in d3d_api_versions:
             if api not in loaded_subsystems:
                 loaded_subsystems.append(api)
-
-        for candidate in ["d3d12", "d3d9"]:
-            if candidate not in d3d_api_versions and candidate not in unutilized_subsystems:
-                unutilized_subsystems.append(candidate)
 
         dll_overrides_raw = env.get("WINEDLLOVERRIDES", "")
         active_overrides = {}
@@ -4035,8 +4289,10 @@ class ProtoGoblinSession:
             if not roi_telemetry:
                 roi_telemetry = {
                     "roi_enabled": True,
-                    "roi_capture_duration_sec": duration_seconds,
-                    "bottleneck_classification": "balanced",
+                    "roi_capture_duration_sec": None,
+                    "session_duration_sec": duration_seconds,
+                    "bottleneck_classification": "unknown",
+                    "capture_status": "missing",
                     "compatibility_layer_overhead_ratio": None,
                     "frame_metrics": None,
                     "pacing": None,
@@ -4142,7 +4398,7 @@ class ProtoGoblinSession:
             },
             "media_and_audio": {
                 "audio_backend": "pipewire" if os.environ.get("PIPEWIRE_REMOTE") else "pulse",
-                "media_foundation_active": False,
+                "media_foundation_active": None,
             },
             "roi_telemetry": roi_telemetry,
             "compatibility": compat_info,
@@ -4170,6 +4426,15 @@ class ProtoGoblinSession:
 
         log(f"=== Session Post-Flight: {self.session_id} ===")
         log(f"Exit Code: {exit_code}, Duration: {duration_seconds:.2f}s, Processes: {self.process_tree_count}, Peak Threads: {self.peak_thread_count}")
+
+        # Lifecycle signal: confirm profiling completion for real game sessions.
+        if self.mode == "profile" and _is_real_game_target(self.target_exe.get("path") if self.target_exe else None):
+            state = "completed cleanly" if exit_code == 0 else f"ended (exit code {exit_code})"
+            notify_desktop(
+                "ProtoGoblin: profiling finished",
+                f"{os.path.basename(self.target_exe.get('path'))} {state} in {duration_seconds:.1f}s\n"
+                f"Session saved: {self.session_id}",
+            )
 
         try:
             with open(os.path.join(self.session_dir, "protogoblin_debug.log"), "a", encoding="utf-8") as f:

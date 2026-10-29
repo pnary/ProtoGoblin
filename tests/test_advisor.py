@@ -97,6 +97,7 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         self.assertTrue(any("Anti-Cheat Active (Easy Anti-Cheat)" in t for t in titles))
         self.assertTrue(any("Profiling Suppressed" in t for t in titles))
         self.assertTrue(any("zero-injection passthrough" in s["description"].lower() for s in suggestions))
+        self.assertFalse(any(s.get("fix_id") for s in suggestions))
         self.assertTrue(any(s["level"] == "warning" for s in suggestions))
 
     def test_shader_compilation_stalls(self):
@@ -368,8 +369,8 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         }
         suggestions = DiagnosticAdvisor.analyze(manifest)
         titles = [s["title"] for s in suggestions]
-        self.assertTrue(any("Intra-Frame CPU-GPU Staging Synchronization Stall" in t for t in titles))
-        self.assertTrue(any(s["level"] == "error" for s in suggestions))
+        self.assertIn("Low CPU and GPU Utilization", titles)
+        self.assertFalse(any(s.get("fix_id") == "atelier_sync_fix" for s in suggestions))
 
     def test_preset_database_and_gust_flaw_flag(self):
         # Check PresetDatabase loads Atelier Ryza (1121560)
@@ -381,7 +382,7 @@ class TestDiagnosticAdvisor(unittest.TestCase):
         manifest = {"target": {"steam_appid": 1121560}}
         suggestions = DiagnosticAdvisor.analyze(manifest)
         titles = [s["title"] for s in suggestions]
-        self.assertTrue(any("Documented Gust Engine D3D11 Sync Stall" in t for t in titles))
+        self.assertTrue(any("Community Report: D3D11 Synchronization Issue" in t for t in titles))
 
     def test_immortals_of_aveum_demo_preset_and_advisor(self):
         # Immortals of Aveum Demo AppID 2555360
@@ -494,7 +495,9 @@ class TestProfileBannerHUD(unittest.TestCase):
             config = env.get("MANGOHUD_CONFIG", "")
             self.assertIn("custom_text=ProtoGoblin\\:", config)
             self.assertIn("toggle_logging=Alt_L+F11", config)
-            self.assertIn("exec=", config)
+            # exec= spawns a shell from inside the game process and is
+            # suspected of early-init wedges: off by default.
+            self.assertNotIn("exec=", config)
             self.assertIn("position=top-right", config)
             self.assertIn("text_color=39FF14", config)
             self.assertIn("blacklist=steam.exe", config)
@@ -523,6 +526,29 @@ class TestProfileBannerHUD(unittest.TestCase):
                 os.environ.pop("PROTOGOBLIN_MODE", None)
             if old_overlay is not None:
                 os.environ["PROTOGOBLIN_OVERLAY"] = old_overlay
+
+    def test_profile_mode_exec_opt_in(self):
+        old_mode = os.environ.get("PROTOGOBLIN_MODE")
+        old_exec = os.environ.get("PROTOGOBLIN_OVERLAY_EXEC")
+        try:
+            os.environ["PROTOGOBLIN_MODE"] = "profile"
+            os.environ["PROTOGOBLIN_OVERLAY_EXEC"] = "1"
+            session = ProtoGoblinSession()
+            env = {}
+            session.pre_flight(["dummy.exe"], env)
+
+            config = env.get("MANGOHUD_CONFIG", "")
+            self.assertIn("exec=", config)
+            self.assertIn("custom_text=ProtoGoblin\\:", config)
+        finally:
+            if old_mode is not None:
+                os.environ["PROTOGOBLIN_MODE"] = old_mode
+            else:
+                os.environ.pop("PROTOGOBLIN_MODE", None)
+            if old_exec is not None:
+                os.environ["PROTOGOBLIN_OVERLAY_EXEC"] = old_exec
+            else:
+                os.environ.pop("PROTOGOBLIN_OVERLAY_EXEC", None)
 
     def test_profile_mode_custom_assigned_key(self):
         old_mode = os.environ.get("PROTOGOBLIN_MODE")
@@ -697,7 +723,7 @@ class TestSessionInitialModeSelection(unittest.TestCase):
                 sess.pre_flight([exe_path], env)
                 self.assertEqual(sess.mode, "play")
                 self.assertTrue(sess.anti_cheat.get("profiling_suppressed"))
-                self.assertIsNone(env.get("MANGOHUD"))
+                self.assertEqual(env.get("MANGOHUD"), "0")
 
                 manifest = sess.post_flight(0, env=env)
                 self.assertTrue(manifest["session"]["profiling_suppressed"])
@@ -941,7 +967,7 @@ class TestEngineTweakManager(unittest.TestCase):
             self.assertEqual(loaded["graphics"]["force_vsync"], "off")
 
     def test_atelier_sync_fix_pipeline(self):
-        # 1. Profile Telemetry detection produces fix_id "atelier_sync_fix"
+        # 1. Profile Telemetry detection produces fix_id "d3d11_trace"
         manifest = {
             "roi_telemetry": {
                 "roi_enabled": True,
@@ -951,42 +977,42 @@ class TestEngineTweakManager(unittest.TestCase):
             }
         }
         suggestions = DiagnosticAdvisor.analyze(manifest)
-        sync_suggestions = [s for s in suggestions if s.get("fix_id") == "atelier_sync_fix"]
-        self.assertTrue(len(sync_suggestions) > 0)
-        self.assertIn("Apply Staging Buffer Sync Fix", sync_suggestions[0]["fix_button_text"])
+        sync_suggestions = [s for s in suggestions if s.get("fix_id") == "d3d11_trace"]
+        self.assertEqual(sync_suggestions, [])
+        self.assertTrue(any(s["title"] == "Low CPU and GPU Utilization" for s in suggestions))
 
         # 2. TOML profile generation with atelier_sync_fix
         toml_text = EngineTweakManager.generate_profile_toml(
             game_id="1121560",
             app_id=1121560,
             target_exe="Atelier_Ryza.exe",
-            user_tweaks={"atelier_sync_fix": True, "graphics": {"force_vsync": "off"}},
+            user_tweaks={"d3d11_trace": True, "graphics": {"force_vsync": "off"}},
         )
-        self.assertIn("[synchronization.atelier_sync_fix]", toml_text)
+        self.assertIn("[telemetry.d3d11]", toml_text)
         self.assertIn("enabled = true", toml_text)
 
         # 3. Applying tweaks injects WINEDLLOVERRIDES="d3d11=n,b" and syncInterval=0
         profile = {
-            "synchronization": {"atelier_sync_fix": {"enabled": True}},
+            "telemetry": {"d3d11": {"enabled": True}},
             "graphics": {"force_vsync": "off"},
         }
         env = {}
         EngineTweakManager.apply_tweaks(profile, {}, ["Atelier_Ryza.exe"], env)
         self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
         self.assertIn("dxgi.syncInterval = 0", env.get("DXVK_CONFIG", ""))
-        self.assertEqual(env.get("PROTOGOBLIN_STAGING_SYNC_FIX"), "1")
+        self.assertEqual(env.get("PROTOGOBLIN_D3D11_TRACE"), "1")
 
     def test_vendored_staging_sync_fix_resolution(self):
         with tempfile.TemporaryDirectory() as td:
             lib64 = os.path.join(td, "share", "protogoblin", "lib64")
             os.makedirs(lib64, exist_ok=True)
             profile = {
-                "synchronization": {"atelier_sync_fix": {"enabled": True}},
+                "telemetry": {"d3d11": {"enabled": True}},
             }
             env = {}
             EngineTweakManager.apply_tweaks(profile, {}, ["Atelier_Ryza.exe"], env, proton_dir=td)
             self.assertIn("d3d11=n,b", env.get("WINEDLLOVERRIDES", ""))
-            self.assertEqual(env.get("PROTOGOBLIN_STAGING_SYNC_FIX"), "1")
+            self.assertEqual(env.get("PROTOGOBLIN_D3D11_TRACE"), "1")
             self.assertIn(lib64, env.get("WINEDLLPATH", ""))
 
     def test_state_dedup_and_swapchain_debounce_pipeline(self):
@@ -1342,12 +1368,9 @@ class TestSubsystemPruning(unittest.TestCase):
                 env = {}
                 sess.pre_flight(["Game.exe"], env)
 
-                self.assertIn("vr", sess.pruned_subsystems)
-                self.assertIn("openvr_api=d", env.get("WINEDLLOVERRIDES", ""))
-                self.assertIn("wineopenxr=d", env.get("WINEDLLOVERRIDES", ""))
-                self.assertEqual(env.get("PROTON_NO_VR"), "1")
-                self.assertEqual(env.get("PROTON_DISABLE_OPENXR"), "1")
-                self.assertIn("vr", env.get("PROTOGOBLIN_PRUNED_SUBSYSTEMS", ""))
+                self.assertEqual(sess.pruned_subsystems, [])
+                self.assertNotIn("openvr_api=d", env.get("WINEDLLOVERRIDES", ""))
+                self.assertNotIn("PROTON_NO_VR", env)
             finally:
                 if old_xdg:
                     os.environ["XDG_DATA_HOME"] = old_xdg
@@ -1667,7 +1690,10 @@ class TestCommanderRecommendationInteraction(unittest.TestCase):
         os.environ["XDG_DATA_HOME"] = self.td.name
         os.environ["XDG_CONFIG_HOME"] = self.td.name
 
-        self.root = tk.Tk()
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
         self.root.withdraw()
         self.app = ProtoGoblinCommandApp(self.root)
         self.app.current_manifest = {
@@ -1715,11 +1741,11 @@ class TestCommanderRecommendationInteraction(unittest.TestCase):
         self.assertEqual(self.app.var_gfx_max_fps.get(), "0")
 
         # 3. Atelier sync fix (also sets vsync off)
-        s_atelier = {"fix_id": "atelier_sync_fix", "title": "Atelier Sync Fix"}
+        s_atelier = {"fix_id": "d3d11_trace", "title": "D3D11 Readback Capture"}
         self.assertFalse(self.app.is_suggestion_enabled(s_atelier))
         self.app.set_suggestion_enabled(s_atelier, True)
         self.assertTrue(self.app.is_suggestion_enabled(s_atelier))
-        self.assertTrue(self.app.var_atelier_sync_fix.get())
+        self.assertTrue(self.app.var_d3d11_trace.get())
         self.assertTrue(self.app.var_gfx_vsync_off.get())
         self.app.set_suggestion_enabled(s_atelier, False)
         self.assertFalse(self.app.is_suggestion_enabled(s_atelier))
@@ -1829,7 +1855,10 @@ class TestCommanderSteamGroupExplorer(unittest.TestCase):
         os.environ["XDG_DATA_HOME"] = self.td.name
         os.environ["XDG_CONFIG_HOME"] = self.td.name
 
-        self.root = tk.Tk()
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
         self.root.withdraw()
         self.app = ProtoGoblinCommandApp(self.root)
 
@@ -1990,7 +2019,10 @@ class TestProfileDropAndReprofiling(unittest.TestCase):
         os.environ["XDG_CONFIG_HOME"] = os.path.join(self.td.name, "config")
         os.environ["PROTOGOBLIN_SESSIONS_DIR"] = os.path.join(self.td.name, "data", "protogoblin", "sessions")
 
-        self.root = tk.Tk()
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
         self.root.withdraw()
         self.app = ProtoGoblinCommandApp(self.root)
 
@@ -2392,11 +2424,12 @@ mode = "profile"
         self.assertGreaterEqual(len(dlg.visible_games), 1)
 
         # Toggle profiling mode in dialog
-        dlg.tree.selection_set("0")
+        idx = next(i for i, g in enumerate(dlg.visible_games) if g["app_id"] == "480")
+        dlg.tree.selection_set(str(idx))
         dlg.on_select_changed()
-        initial_mode = dlg.visible_games[0]["mode"]
+        initial_mode = dlg.visible_games[idx]["mode"]
         dlg.on_toggle_mode_clicked()
-        new_mode = dlg.visible_games[0]["mode"]
+        new_mode = dlg.visible_games[idx]["mode"]
         self.assertNotEqual(initial_mode, new_mode)
 
         # Test launch from dialog

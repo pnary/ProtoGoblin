@@ -1,26 +1,9 @@
 #include "sync_fix.h"
 
-// Shadow buffer tracking structures
-struct StagingResourceTracker {
-    bool isStaging = false;
-    bool dirty = false;
-    std::vector<uint8_t> shadowBuffer;
-    ID3D11Resource* gpuSource = nullptr;
-    UINT subresource = 0;
-};
-
-struct ConstantBufferTracker {
-    UINT byteWidth = 0;
-    bool isConstantBuffer = false;
-    bool hasData = false;
-    std::vector<uint8_t> data;
-};
-
-static std::mutex g_resourceLock;
-static std::unordered_map<ID3D11Resource*, StagingResourceTracker> g_stagingResources;
-
+// Store comparison payloads on the buffer itself so destruction releases the
+// metadata and pointer reuse cannot associate a new resource with old data.
+static const GUID kPayloadGuid = {0x47a43f80, 0x2f6b, 0x4983, {0xb4, 0x23, 0xc3, 0x5f, 0x46, 0x97, 0x70, 0xa1}};
 static std::mutex g_cbLock;
-static std::unordered_map<ID3D11Resource*, ConstantBufferTracker> g_constantBuffers;
 
 // Diagnostic & Introspective Live Telemetry Counters
 static std::atomic<uint64_t> g_cbUpdatesTotal{0};
@@ -30,6 +13,13 @@ static std::atomic<uint64_t> g_stateBindsRedundant{0};
 static std::atomic<uint64_t> g_swapchainResizesTotal{0};
 static std::atomic<uint64_t> g_swapchainResizesIdentical{0};
 static std::atomic<uint64_t> g_swapchainResizesRapid{0};
+
+// Readback timings are observations. Never replace GPU readback with stale
+// CPU memory or write a read mapping back into its GPU source.
+static std::atomic<uint64_t> g_copyCalls{0};
+static std::atomic<uint64_t> g_readMapCalls{0};
+static std::atomic<uint64_t> g_readMapTicks{0};
+static std::atomic<uint64_t> g_slowReadMapCalls{0};
 
 // Precision Timer & Pacing Telemetry
 typedef void (WINAPI *pfn_Sleep)(DWORD);
@@ -139,7 +129,7 @@ static void HookModuleIAT(HMODULE hMod) {
     auto pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hMod + importDir.VirtualAddress);
     while (pImportDesc->Name != 0) {
         const char* modName = (const char*)((BYTE*)hMod + pImportDesc->Name);
-        if (_stricmp(modName, "kernel32.dll") == 0 || _stricmp(modName, "kernelbase.dll") == 0) {
+        if (lstrcmpiA(modName, "kernel32.dll") == 0 || lstrcmpiA(modName, "kernelbase.dll") == 0) {
             auto pThunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + pImportDesc->FirstThunk);
             auto pOrigThunk = pImportDesc->OriginalFirstThunk ?
                               (PIMAGE_THUNK_DATA)((BYTE*)hMod + pImportDesc->OriginalFirstThunk) : pThunk;
@@ -234,11 +224,21 @@ static void FlushStatsInternal() {
     uint64_t scRapid = g_swapchainResizesRapid.load(std::memory_order_relaxed);
 
     bool stateDedup = IsStateDedupEnabled();
-    bool scDebounce = IsSwapchainDebounceEnabled();
+    bool scDebounce = false;
 
     fprintf(fp, "{\n");
     fprintf(fp, "  \"state_dedup_active\": %s,\n", stateDedup ? "true" : "false");
     fprintf(fp, "  \"swapchain_debounce_active\": %s,\n", scDebounce ? "true" : "false");
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    double readMapMs = frequency.QuadPart > 0 ?
+        1000.0 * (double)g_readMapTicks.load() / (double)frequency.QuadPart : 0.0;
+    fprintf(fp, "  \"readbacks\": {\n");
+    fprintf(fp, "    \"copy_calls\": %llu,\n", (unsigned long long)g_copyCalls.load());
+    fprintf(fp, "    \"map_calls\": %llu,\n", (unsigned long long)g_readMapCalls.load());
+    fprintf(fp, "    \"map_time_ms\": %.3f,\n", readMapMs);
+    fprintf(fp, "    \"slow_map_calls\": %llu\n", (unsigned long long)g_slowReadMapCalls.load());
+    fprintf(fp, "  },\n");
     fprintf(fp, "  \"constant_buffers\": {\n");
     fprintf(fp, "    \"updates_total\": %llu,\n", (unsigned long long)cbTotal);
     fprintf(fp, "    \"updates_redundant\": %llu,\n", (unsigned long long)cbRedundant);
@@ -278,7 +278,7 @@ void FlushStats() {
 
 class WrappedContext : public ID3D11DeviceContext {
 private:
-    ULONG m_refCount;
+    LONG m_refCount;
     ID3D11DeviceContext* m_real;
 
     // Pipeline State Cache for Deduplication
@@ -334,93 +334,34 @@ public:
         return m_real->SetPrivateDataInterface(guid, pData);
     }
 
-    // Intercept CopyResource to decouple redundant intra-frame CPU-GPU sync flushes
-    void STDMETHODCALLTYPE CopyResource(ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource) override {
-        bool intercept = false;
-        {
-            std::lock_guard<std::mutex> lock(g_resourceLock);
-            auto it = g_stagingResources.find(pDstResource);
-            if (it != g_stagingResources.end() && it->second.isStaging) {
-                // Gust/Atelier engine pattern: CopyResource(staging, gpu) immediately followed by Map(staging).
-                // Recording GPU source and deferring prevents synchronous fence stall on active command queue.
-                it->second.gpuSource = pSrcResource;
-                it->second.dirty = true;
-                intercept = true;
-            }
-        }
-
-        if (!intercept) {
-            m_real->CopyResource(pDstResource, pSrcResource);
-        }
+    void STDMETHODCALLTYPE CopyResource(ID3D11Resource* dst, ID3D11Resource* src) override {
+        g_copyCalls.fetch_add(1, std::memory_order_relaxed);
+        m_real->CopyResource(dst, src);
     }
 
-    // Intercept Map to provide non-blocking shadow mapping
-    HRESULT STDMETHODCALLTYPE Map(
-        ID3D11Resource* pResource,
-        UINT Subresource,
-        D3D11_MAP MapType,
-        UINT MapFlags,
-        D3D11_MAPPED_SUBRESOURCE* pMappedResource
-    ) override {
-        {
-            std::lock_guard<std::mutex> lock(g_resourceLock);
-            auto it = g_stagingResources.find(pResource);
-            if (it != g_stagingResources.end() && it->second.isStaging) {
-                // If mapping for read-write or write on an intra-frame staging buffer,
-                // fulfill via shadow buffer memory without stalling on a GPU fence flush.
-                if (!it->second.shadowBuffer.empty() && pMappedResource) {
-                    pMappedResource->pData = it->second.shadowBuffer.data();
-                    pMappedResource->RowPitch = (UINT)it->second.shadowBuffer.size();
-                    pMappedResource->DepthPitch = (UINT)it->second.shadowBuffer.size();
-                    return S_OK;
-                }
-            }
+    HRESULT STDMETHODCALLTYPE Map(ID3D11Resource* resource, UINT subresource,
+        D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* mapped) override {
+        bool read = type == D3D11_MAP_READ || type == D3D11_MAP_READ_WRITE;
+        LARGE_INTEGER begin{}, end{}, frequency{};
+        if (read) QueryPerformanceCounter(&begin);
+        HRESULT result = m_real->Map(resource, subresource, type, flags, mapped);
+        if (read) {
+            QueryPerformanceCounter(&end);
+            QueryPerformanceFrequency(&frequency);
+            uint64_t ticks = end.QuadPart - begin.QuadPart;
+            g_readMapCalls.fetch_add(1, std::memory_order_relaxed);
+            g_readMapTicks.fetch_add(ticks, std::memory_order_relaxed);
+            if (frequency.QuadPart > 0 && ticks >= (uint64_t)frequency.QuadPart / 1000)
+                g_slowReadMapCalls.fetch_add(1, std::memory_order_relaxed);
         }
-
-        return m_real->Map(pResource, Subresource, MapType, MapFlags, pMappedResource);
+        return result;
     }
 
-    void STDMETHODCALLTYPE Unmap(ID3D11Resource* pResource, UINT Subresource) override {
-        ID3D11Resource* gpuSrc = nullptr;
-        bool hasShadow = false;
-        void* shadowData = nullptr;
-        size_t shadowSize = 0;
-
-        {
-            std::lock_guard<std::mutex> lock(g_resourceLock);
-            auto it = g_stagingResources.find(pResource);
-            if (it != g_stagingResources.end() && it->second.isStaging && it->second.dirty) {
-                gpuSrc = it->second.gpuSource;
-                hasShadow = !it->second.shadowBuffer.empty();
-                if (hasShadow) {
-                    shadowData = it->second.shadowBuffer.data();
-                    shadowSize = it->second.shadowBuffer.size();
-                }
-                it->second.dirty = false;
-            }
-        }
-
-        if (hasShadow && gpuSrc && shadowData) {
-            // Asynchronously push modified shadow buffer back to GPU target
-            m_real->UpdateSubresource(gpuSrc, Subresource, nullptr, shadowData, (UINT)shadowSize, (UINT)shadowSize);
-        } else {
-            m_real->Unmap(pResource, Subresource);
-        }
+    void STDMETHODCALLTYPE Unmap(ID3D11Resource* resource, UINT subresource) override {
+        m_real->Unmap(resource, subresource);
     }
 
     // Delegate remaining standard pipeline methods
-    void STDMETHODCALLTYPE SetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers) override {
-        m_real->VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
-    }
-    void STDMETHODCALLTYPE SetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView* const* ppShaderResourceViews) override {
-        m_real->PSSetShaderResources(StartSlot, NumViews, ppShaderResourceViews);
-    }
-    void STDMETHODCALLTYPE SetSamplers(UINT StartSlot, UINT NumSamplers, ID3D11SamplerState* const* ppSamplers) override {
-        m_real->PSSetSamplers(StartSlot, NumSamplers, ppSamplers);
-    }
-    void STDMETHODCALLTYPE SetShader(ID3D11VertexShader* pVertexShader, ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances) override {
-        m_real->VSSetShader(pVertexShader, ppClassInstances, NumClassInstances);
-    }
     void STDMETHODCALLTYPE DrawIndexed(UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation) override {
         m_real->DrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation);
     }
@@ -439,6 +380,18 @@ public:
 
     #define DELEGATE_CONTEXT(func, ...) void STDMETHODCALLTYPE func(__VA_ARGS__) override { m_real->func(__VA_ARGS__); }
     #define DELEGATE_CONTEXT_RET(ret, func, ...) ret STDMETHODCALLTYPE func(__VA_ARGS__) override { return m_real->func(__VA_ARGS__); }
+
+    void STDMETHODCALLTYPE VSSetShaderResources(UINT start, UINT count, ID3D11ShaderResourceView* const* views) override { m_real->VSSetShaderResources(start, count, views); }
+    void STDMETHODCALLTYPE VSSetSamplers(UINT start, UINT count, ID3D11SamplerState* const* samplers) override { m_real->VSSetSamplers(start, count, samplers); }
+    void STDMETHODCALLTYPE SOSetTargets(UINT count, ID3D11Buffer* const* buffers, const UINT* offsets) override { m_real->SOSetTargets(count, buffers, offsets); }
+    void STDMETHODCALLTYPE DrawAuto() override { m_real->DrawAuto(); }
+    void STDMETHODCALLTYPE DrawIndexedInstancedIndirect(ID3D11Buffer* buffer, UINT offset) override { m_real->DrawIndexedInstancedIndirect(buffer, offset); }
+    void STDMETHODCALLTYPE DrawInstancedIndirect(ID3D11Buffer* buffer, UINT offset) override { m_real->DrawInstancedIndirect(buffer, offset); }
+    void STDMETHODCALLTYPE PSGetConstantBuffers(UINT start, UINT count, ID3D11Buffer** buffers) override { m_real->PSGetConstantBuffers(start, count, buffers); }
+    void STDMETHODCALLTYPE VSGetShaderResources(UINT start, UINT count, ID3D11ShaderResourceView** views) override { m_real->VSGetShaderResources(start, count, views); }
+    void STDMETHODCALLTYPE VSGetSamplers(UINT start, UINT count, ID3D11SamplerState** samplers) override { m_real->VSGetSamplers(start, count, samplers); }
+    void STDMETHODCALLTYPE GetPredication(ID3D11Predicate** predicate, BOOL* value) override { m_real->GetPredication(predicate, value); }
+    void STDMETHODCALLTYPE SOGetTargets(UINT count, ID3D11Buffer** buffers) override { m_real->SOGetTargets(count, buffers); }
 
     // D3D11 Context pass-through wrappers
     void STDMETHODCALLTYPE VSSetConstantBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers) override {
@@ -561,21 +514,29 @@ public:
     }
     void STDMETHODCALLTYPE UpdateSubresource(ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) override {
         if (pDstResource && pSrcData && !pDstBox) {
-            std::lock_guard<std::mutex> lock(g_cbLock);
-            auto it = g_constantBuffers.find(pDstResource);
-            if (it != g_constantBuffers.end() && it->second.isConstantBuffer) {
-                g_cbUpdatesTotal.fetch_add(1, std::memory_order_relaxed);
-                if (it->second.hasData && it->second.data.size() == it->second.byteWidth) {
-                    if (memcmp(it->second.data.data(), pSrcData, it->second.byteWidth) == 0) {
-                        // Redundant constant buffer update: track metric and drop if dedup enabled
-                        g_cbUpdatesRedundant.fetch_add(1, std::memory_order_relaxed);
-                        if (IsStateDedupEnabled()) return;
+            D3D11_RESOURCE_DIMENSION dimension;
+            pDstResource->GetType(&dimension);
+            if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                ID3D11Buffer* buffer = nullptr;
+                if (SUCCEEDED(pDstResource->QueryInterface(__uuidof(ID3D11Buffer), (void**)&buffer))) {
+                    D3D11_BUFFER_DESC desc{};
+                    buffer->GetDesc(&desc);
+                    if (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+                        std::lock_guard<std::mutex> lock(g_cbLock);
+                        g_cbUpdatesTotal.fetch_add(1, std::memory_order_relaxed);
+                        std::vector<uint8_t> previous(desc.ByteWidth);
+                        UINT size = desc.ByteWidth;
+                        if (SUCCEEDED(buffer->GetPrivateData(kPayloadGuid, &size, previous.data())) &&
+                            size == desc.ByteWidth && memcmp(previous.data(), pSrcData, size) == 0)
+                            g_cbUpdatesRedundant.fetch_add(1, std::memory_order_relaxed);
+                        buffer->SetPrivateData(kPayloadGuid, desc.ByteWidth, pSrcData);
                     }
+                    buffer->Release();
                 }
-                it->second.data.assign((const uint8_t*)pSrcData, (const uint8_t*)pSrcData + it->second.byteWidth);
-                it->second.hasData = true;
             }
         }
+        // Matching CPU payloads do not prove the GPU contents are unchanged:
+        // Map, copies, and command lists can also modify the resource.
         m_real->UpdateSubresource(pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
     }
     HRESULT STDMETHODCALLTYPE FinishCommandList(BOOL RestoreDeferredContextState, ID3D11CommandList** ppCommandList) override { return m_real->FinishCommandList(RestoreDeferredContextState, ppCommandList); }
@@ -616,7 +577,7 @@ public:
 
 class WrappedDevice : public ID3D11Device {
 private:
-    ULONG m_refCount;
+    LONG m_refCount;
     ID3D11Device* m_real;
 
 public:
@@ -655,27 +616,6 @@ public:
         ID3D11Buffer** ppBuffer
     ) override {
         HRESULT hr = m_real->CreateBuffer(pDesc, pInitialData, ppBuffer);
-        if (SUCCEEDED(hr) && ppBuffer && *ppBuffer && pDesc) {
-            if (pDesc->Usage == D3D11_USAGE_STAGING && (pDesc->CPUAccessFlags & D3D11_CPU_ACCESS_READ)) {
-                std::lock_guard<std::mutex> lock(g_resourceLock);
-                auto& tracker = g_stagingResources[*ppBuffer];
-                tracker.isStaging = true;
-                tracker.shadowBuffer.resize(pDesc->ByteWidth, 0);
-                if (pInitialData && pInitialData->pSysMem) {
-                    memcpy(tracker.shadowBuffer.data(), pInitialData->pSysMem, pDesc->ByteWidth);
-                }
-            }
-            if (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
-                std::lock_guard<std::mutex> lock(g_cbLock);
-                auto& cb = g_constantBuffers[*ppBuffer];
-                cb.byteWidth = pDesc->ByteWidth;
-                cb.isConstantBuffer = true;
-                if (pInitialData && pInitialData->pSysMem && pDesc->ByteWidth > 0) {
-                    cb.data.assign((const uint8_t*)pInitialData->pSysMem, (const uint8_t*)pInitialData->pSysMem + pDesc->ByteWidth);
-                    cb.hasData = true;
-                }
-            }
-        }
         return hr;
     }
 
@@ -747,7 +687,7 @@ void WrapDeviceAndContext(ID3D11Device** ppDevice, ID3D11DeviceContext** ppConte
 
 class WrappedSwapChain : public IDXGISwapChain {
 private:
-    ULONG m_refCount;
+    LONG m_refCount;
     IDXGISwapChain* m_real;
     UINT m_curWidth = 0;
     UINT m_curHeight = 0;
@@ -833,14 +773,14 @@ public:
                 (NewFormat == DXGI_FORMAT_UNKNOWN || NewFormat == m_curFormat) &&
                 (BufferCount == 0 || BufferCount == m_curBufferCount)) {
                 g_swapchainResizesIdentical.fetch_add(1, std::memory_order_relaxed);
-                if (IsSwapchainDebounceEnabled()) return S_OK;
+
             }
         }
 
         // 2. High-frequency resize debounce (rapid window DPI / borderless focus jitter < 50ms)
         if (now - m_lastResizeTick < 50 && m_curWidth != 0 && m_curHeight != 0) {
             g_swapchainResizesRapid.fetch_add(1, std::memory_order_relaxed);
-            if (IsSwapchainDebounceEnabled()) return S_OK;
+
         }
 
         HRESULT hr = m_real->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);

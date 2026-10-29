@@ -297,14 +297,21 @@ get_outdated_components() {
     fi
 
     if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud" ]]; then
-        local mh_json="${TOOL_DIR}/files/share/mangohud/implicit_layer.d/MangoHud.x86_64.json"
-        if [[ ! -f "$mh_json" ]]; then
-            outdated+=("files/share/mangohud/implicit_layer.d/MangoHud.x86_64.json")
-        fi
-        local mh_lib64="${TOOL_DIR}/files/lib/x86_64-linux-gnu/libMangoHud.so"
-        if [[ ! -f "$mh_lib64" ]]; then
-            outdated+=("files/lib/x86_64-linux-gnu/libMangoHud.so")
-        fi
+        local source deployed rel arch
+        for arch in lib64 lib32 implicit_layer.d; do
+            for source in "${SCRIPT_DIR}/share/protogoblin/mangohud/${arch}/"*; do
+                [[ -f "$source" ]] || continue
+                case "$arch" in
+                    lib64) rel="files/lib/x86_64-linux-gnu/$(basename "$source")" ;;
+                    lib32) rel="files/lib/i386-linux-gnu/$(basename "$source")" ;;
+                    implicit_layer.d) rel="files/share/mangohud/implicit_layer.d/$(basename "$source")" ;;
+                esac
+                deployed="${TOOL_DIR}/${rel}"
+                if [[ ! -f "$deployed" ]] || ! cmp -s "$source" "$deployed"; then
+                    outdated+=("$rel")
+                fi
+            done
+        done
     fi
 
     local vdf="${TOOL_DIR}/compatibilitytool.vdf"
@@ -416,35 +423,30 @@ install_protogoblin_components() {
         # Install into files/ for Proton runtime
         mkdir -p "${TOOL_DIR}/files/share/mangohud/implicit_layer.d"
         mkdir -p "${TOOL_DIR}/share/vulkan/implicit_layer.d"
-        mkdir -p "${HOME}/.local/share/vulkan/implicit_layer.d"
         if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d" ]]; then
             cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${TOOL_DIR}/files/share/mangohud/implicit_layer.d/" 2>/dev/null || true
             cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${TOOL_DIR}/share/vulkan/implicit_layer.d/" 2>/dev/null || true
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/implicit_layer.d/"* "${HOME}/.local/share/vulkan/implicit_layer.d/" 2>/dev/null || true
         fi
 
         # Install 64-bit MangoHud library and dependencies
         if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64" ]]; then
-            mkdir -p "${TOOL_DIR}/files/lib/x86_64-linux-gnu" "${TOOL_DIR}/files/lib64" "${HOME}/.local/lib/mangohud"
+            mkdir -p "${TOOL_DIR}/files/lib/x86_64-linux-gnu" "${TOOL_DIR}/files/lib64"
             cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/"* "${TOOL_DIR}/files/lib/x86_64-linux-gnu/" 2>/dev/null || true
             cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/"* "${TOOL_DIR}/files/lib64/" 2>/dev/null || true
-            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib64/"* "${HOME}/.local/lib/mangohud/" 2>/dev/null || true
         fi
 
         # Install 32-bit MangoHud library and dependencies (e.g. 32-bit libxkbcommon)
         if [[ -d "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32" ]]; then
-            mkdir -p "${TOOL_DIR}/files/lib/i386-linux-gnu" "${TOOL_DIR}/files/lib" "${HOME}/.local/lib32/mangohud"
+            mkdir -p "${TOOL_DIR}/files/lib/i386-linux-gnu" "${TOOL_DIR}/files/lib"
             cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/"* "${TOOL_DIR}/files/lib/i386-linux-gnu/" 2>/dev/null || true
             cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/"* "${TOOL_DIR}/files/lib/" 2>/dev/null || true
-            cp -af "${SCRIPT_DIR}/share/protogoblin/mangohud/lib32/"* "${HOME}/.local/lib32/mangohud/" 2>/dev/null || true
         fi
 
         # Install mangohud CLI wrapper if present
         if [[ -f "${SCRIPT_DIR}/share/protogoblin/mangohud/bin/mangohud" ]]; then
-            mkdir -p "${TOOL_DIR}/tools" "${HOME}/.local/bin"
+            mkdir -p "${TOOL_DIR}/tools"
             cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/bin/mangohud" "${TOOL_DIR}/tools/"
-            cp -f "${SCRIPT_DIR}/share/protogoblin/mangohud/bin/mangohud" "${HOME}/.local/bin/"
-            chmod +x "${TOOL_DIR}/tools/mangohud" "${HOME}/.local/bin/mangohud" 2>/dev/null || true
+            chmod +x "${TOOL_DIR}/tools/mangohud" 2>/dev/null || true
         fi
     fi
 

@@ -3,6 +3,7 @@ Unit tests for install_to_steam.sh deployment check and update functionality.
 """
 
 import os
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +17,8 @@ class TestInstallToSteam(unittest.TestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.dest_dir = self.tmp_dir.name
         self.tool_dir = os.path.join(self.dest_dir, "ProtoGoblin-local")
+        self.home = os.path.join(self.dest_dir, "home")
+        os.makedirs(self.home)
 
     def tearDown(self):
         self.tmp_dir.cleanup()
@@ -26,7 +29,7 @@ class TestInstallToSteam(unittest.TestCase):
             "--dest", self.dest_dir,
             *args
         ]
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={**os.environ, "HOME": self.home})
 
     def test_check_when_not_deployed(self):
         res = self.run_installer("--check")
@@ -76,6 +79,20 @@ class TestInstallToSteam(unittest.TestCase):
         res_check4 = self.run_installer("--check")
         self.assertEqual(res_check4.returncode, 0)
         self.assertIn("ProtoGoblin deployment is fully up to date", res_check4.stdout)
+
+    def test_mangohud_content_changes_are_detected(self):
+        os.makedirs(self.tool_dir)
+        (Path(self.tool_dir) / "proton").write_text("old")
+        self.assertEqual(self.run_installer("--update").returncode, 0)
+        library = Path(self.tool_dir) / "files/lib/x86_64-linux-gnu/libMangoHud.so"
+        library.write_bytes(b"stale binary")
+        checked = self.run_installer("--check")
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn("libMangoHud.so", checked.stdout)
+        self.assertEqual(self.run_installer("--update").returncode, 0)
+        bundled = Path(SCRIPT_DIR) / "share/protogoblin/mangohud/lib64/libMangoHud.so"
+        self.assertEqual(library.read_bytes(), bundled.read_bytes())
+        self.assertFalse((Path(self.home) / ".local").exists())
 
 
 if __name__ == "__main__":

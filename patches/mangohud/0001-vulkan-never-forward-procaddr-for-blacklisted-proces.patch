@@ -1,0 +1,101 @@
+diff --git a/src/blacklist.cpp b/src/blacklist.cpp
+index d137cf1..ecd4c30 100644
+--- a/src/blacklist.cpp
++++ b/src/blacklist.cpp
+@@ -106,4 +106,29 @@ void add_blacklist(const std::string& new_item) {
+     is_blacklisted(true);
+ }
+ 
++/* ProtoGoblin: check the MANGOHUD_CONFIG blacklist entries against the current
++ * process name without a full overlay_params parse.  Needed because the config
++ * is normally parsed inside CreateInstance, far too late for helper processes
++ * (e.g. Proton's steam.exe shim) that must never instantiate the layer. */
++bool is_config_blacklisted() {
++    const char *conf = getenv("MANGOHUD_CONFIG");
++    if (!conf || !*conf)
++        return false;
++
++    const std::string proc_name = get_proc_name();
++    const std::string key = "blacklist=";
++    std::string s(conf);
++    size_t pos = 0;
++    while (true) {
++        size_t comma = s.find(',', pos);
++        std::string token = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
++        if (token.rfind(key, 0) == 0 && token.substr(key.size()) == proc_name)
++            return true;
++        if (comma == std::string::npos)
++            break;
++        pos = comma + 1;
++    }
++    return false;
++}
++
+ 
+diff --git a/src/blacklist.h b/src/blacklist.h
+index 087c716..8320044 100644
+--- a/src/blacklist.h
++++ b/src/blacklist.h
+@@ -4,6 +4,7 @@
+ #include<string>
+ bool is_blacklisted(bool force_recheck = false);
+ void add_blacklist(const std::string& proc);
++bool is_config_blacklisted();
+ extern std::string global_proc_name;
+ extern std::string global_engine_name;
+ 
+diff --git a/src/vulkan.cpp b/src/vulkan.cpp
+index 7030d29..6c3b544 100644
+--- a/src/vulkan.cpp
++++ b/src/vulkan.cpp
+@@ -2173,6 +2173,16 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct
+     if (!pVersionStruct)
+         return VK_ERROR_INITIALIZATION_FAILED;
+ 
++    /* ProtoGoblin: refuse the layer interface entirely for blacklisted
++     * processes (Proton's steam.exe shim, explorer.exe, launchers).  The
++     * loader is required to skip a layer whose negotiate fails, which keeps
++     * those processes fully transparent: no instance data gets created and no
++     * procaddr gets wired into the loader trampoline chain.  Letting the
++     * layer instantiate there deadlocks the loader's procaddr walk and spins
++     * the process forever before the game is ever spawned. */
++    if (is_blacklisted() || is_config_blacklisted())
++        return VK_ERROR_INITIALIZATION_FAILED;
++
+     if (pVersionStruct->loaderLayerInterfaceVersion < 2)
+         return VK_ERROR_INITIALIZATION_FAILED;
+ 
+@@ -2242,9 +2252,16 @@ extern "C" PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL overlay_GetDeviceProc
+    void *ptr = find_ptr(funcName);
+    if (ptr) return reinterpret_cast<PFN_vkVoidFunction>(ptr);
+ 
++   /* Blacklisted processes must see the layer as fully transparent: our
++    * dispatch tables are wired to the loader trampoline, and forwarding
++    * through them re-enters this function and spins forever. */
++   if (is_blacklisted())
++      return NULL;
++
+    if (dev == NULL) return NULL;
+ 
+    struct device_data *device_data = FIND(struct device_data, dev);
++   if (device_data == NULL) return NULL;
+    if (device_data->vtable.GetDeviceProcAddr == NULL) return NULL;
+    return device_data->vtable.GetDeviceProcAddr(dev, funcName);
+ }
+@@ -2256,9 +2273,16 @@ extern "C" PUBLIC VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL overlay_GetInstancePr
+    void *ptr = find_ptr(funcName);
+    if (ptr) return reinterpret_cast<PFN_vkVoidFunction>(ptr);
+ 
++   /* Blacklisted processes must see the layer as fully transparent: our
++    * dispatch tables are wired to the loader trampoline, and forwarding
++    * through them re-enters this function and spins forever. */
++   if (is_blacklisted())
++      return NULL;
++
+    if (instance == NULL) return NULL;
+ 
+    struct instance_data *instance_data = FIND(struct instance_data, instance);
++   if (instance_data == NULL) return NULL;
+    if (instance_data->vtable.GetInstanceProcAddr == NULL) return NULL;
+    return instance_data->vtable.GetInstanceProcAddr(instance, funcName);
+ }

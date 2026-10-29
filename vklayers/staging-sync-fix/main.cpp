@@ -5,19 +5,26 @@ static PFN_D3D11_CREATE_DEVICE g_pfnCreateDevice = nullptr;
 static PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN g_pfnCreateDeviceAndSwapChain = nullptr;
 
 static bool InitRealD3D11() {
-    if (g_realD3D11) return true;
-
-    WCHAR sysPath[MAX_PATH];
-    if (!GetSystemDirectoryW(sysPath, MAX_PATH)) return false;
-    lstrcatW(sysPath, L"\\d3d11.dll");
-
-    g_realD3D11 = LoadLibraryW(sysPath);
-    if (!g_realD3D11) return false;
-
-    g_pfnCreateDevice = (PFN_D3D11_CREATE_DEVICE)GetProcAddress(g_realD3D11, "D3D11CreateDevice");
-    g_pfnCreateDeviceAndSwapChain = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(g_realD3D11, "D3D11CreateDeviceAndSwapChain");
-
-    return (g_pfnCreateDevice != nullptr);
+    static std::once_flag once;
+    std::call_once(once, [] {
+        WCHAR sysPath[MAX_PATH];
+        UINT length = GetSystemDirectoryW(sysPath, MAX_PATH);
+        if (!length || length + 11 >= MAX_PATH) return;
+        lstrcatW(sysPath, L"\\d3d11.dll");
+        HMODULE real = LoadLibraryW(sysPath);
+        if (!real) return;
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&InitRealD3D11), &self);
+        if (real == self) {
+            FreeLibrary(real);
+            return;
+        }
+        g_realD3D11 = real;
+        g_pfnCreateDevice = (PFN_D3D11_CREATE_DEVICE)GetProcAddress(real, "D3D11CreateDevice");
+        g_pfnCreateDeviceAndSwapChain = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(real, "D3D11CreateDeviceAndSwapChain");
+    });
+    return g_pfnCreateDevice && g_pfnCreateDeviceAndSwapChain;
 }
 
 extern "C" HRESULT WINAPI D3D11CreateDevice(

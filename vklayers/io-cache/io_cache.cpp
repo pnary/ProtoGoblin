@@ -13,6 +13,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <memory>
+#include <limits>
 
 #include "io_cache.h"
 
@@ -47,28 +49,25 @@ struct FileCacheSlot {
     size_t window_size = 0;
     std::vector<uint8_t> buffer;
     std::mutex slot_lock;
+    struct stat fingerprint{};
+    bool fingerprint_valid = false;
 };
 
 static std::mutex g_trackedLock;
-static std::unordered_map<int, FileCacheSlot*> g_trackedFiles;
+static std::unordered_map<int, std::shared_ptr<FileCacheSlot>> g_trackedFiles;
 
 static bool IsIoCacheEnabled() {
-    static int s_val = -1;
-    if (s_val == -1) {
+    static const bool enabled = [] {
         const char* env = getenv("PROTOGOBLIN_IO_CACHE");
-        if (env && (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' || env[0] == 'Y')) {
-            s_val = 1;
-        } else {
-            s_val = 0;
-        }
-    }
-    return s_val == 1;
+        return env && (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' || env[0] == 'Y');
+    }();
+    return enabled;
 }
 
 static bool ShouldTrackFile(const char* path, int flags) {
     if (!path) return false;
     // Only track read-only opens
-    if ((flags & O_ACCMODE) != O_RDONLY) return false;
+    if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_DIRECT | O_PATH))) return false;
 
     // Check extensions commonly associated with massive streaming chunk reads
     const char* ext = strrchr(path, '.');
@@ -141,7 +140,7 @@ extern "C" void protogoblin_io_cache_flush_stats(void) {
 extern "C" int open(const char* pathname, int flags, ...) {
     EnsureInitialized();
     mode_t mode = 0;
-    if (flags & O_CREAT) {
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args;
         va_start(args, flags);
         mode = va_arg(args, mode_t);
@@ -152,7 +151,7 @@ extern "C" int open(const char* pathname, int flags, ...) {
     if (fd >= 0 && ShouldTrackFile(pathname, flags)) {
         std::lock_guard<std::mutex> lock(g_trackedLock);
         if (g_trackedFiles.find(fd) == g_trackedFiles.end()) {
-            g_trackedFiles[fd] = new FileCacheSlot();
+            g_trackedFiles[fd] = std::make_shared<FileCacheSlot>();
             g_ioTrackedFilesCount.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -162,7 +161,7 @@ extern "C" int open(const char* pathname, int flags, ...) {
 extern "C" int open64(const char* pathname, int flags, ...) {
     EnsureInitialized();
     mode_t mode = 0;
-    if (flags & O_CREAT) {
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
         va_list args;
         va_start(args, flags);
         mode = va_arg(args, mode_t);
@@ -173,7 +172,7 @@ extern "C" int open64(const char* pathname, int flags, ...) {
     if (fd >= 0 && ShouldTrackFile(pathname, flags)) {
         std::lock_guard<std::mutex> lock(g_trackedLock);
         if (g_trackedFiles.find(fd) == g_trackedFiles.end()) {
-            g_trackedFiles[fd] = new FileCacheSlot();
+            g_trackedFiles[fd] = std::make_shared<FileCacheSlot>();
             g_ioTrackedFilesCount.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -184,12 +183,14 @@ extern "C" ssize_t pread64(int fd, void* buf, size_t count, off64_t offset) {
     EnsureInitialized();
     if (!g_real_pread64) return -1;
 
-    FileCacheSlot* slot = nullptr;
+    std::shared_ptr<FileCacheSlot> slot;
+    std::unique_lock<std::mutex> slot_lock;
     {
         std::lock_guard<std::mutex> lock(g_trackedLock);
         auto it = g_trackedFiles.find(fd);
         if (it != g_trackedFiles.end()) {
             slot = it->second;
+            slot_lock = std::unique_lock<std::mutex>(slot->slot_lock);
         }
     }
 
@@ -197,14 +198,32 @@ extern "C" ssize_t pread64(int fd, void* buf, size_t count, off64_t offset) {
         return g_real_pread64(fd, buf, count, offset);
     }
 
+    auto read_real = [&]() {
+        ssize_t result = g_real_pread64(fd, buf, count, offset);
+        if (result > 0) g_ioBytesReadTotal.fetch_add((uint64_t)result, std::memory_order_relaxed);
+        return result;
+    };
     g_ioReadsTotal.fetch_add(1, std::memory_order_relaxed);
-    g_ioBytesReadTotal.fetch_add(count, std::memory_order_relaxed);
-
-    if (!IsIoCacheEnabled() || count > MAX_CACHABLE_READ_SIZE || count == 0) {
-        return g_real_pread64(fd, buf, count, offset);
+    if (!IsIoCacheEnabled() || count > MAX_CACHABLE_READ_SIZE || count == 0 || !buf || offset < 0 ||
+        offset > std::numeric_limits<off64_t>::max() - (off64_t)count) {
+        return read_real();
     }
 
-    std::lock_guard<std::mutex> slot_lock(slot->slot_lock);
+    // A read-only handle does not imply an immutable file. Invalidate cached
+    // bytes when another handle changes the archive (including same-size writes).
+    struct stat current{};
+    if (fstat(fd, &current) != 0 || !S_ISREG(current.st_mode)) {
+        return read_real();
+    }
+    const auto& previous = slot->fingerprint;
+    if (!slot->fingerprint_valid || current.st_size != previous.st_size ||
+        current.st_mtim.tv_sec != previous.st_mtim.tv_sec || current.st_mtim.tv_nsec != previous.st_mtim.tv_nsec ||
+        current.st_ctim.tv_sec != previous.st_ctim.tv_sec || current.st_ctim.tv_nsec != previous.st_ctim.tv_nsec) {
+        slot->window_start = -1;
+        slot->window_size = 0;
+    }
+    slot->fingerprint = current;
+    slot->fingerprint_valid = true;
 
     // 1. Cache hit check
     if (slot->window_start >= 0 &&
@@ -214,6 +233,7 @@ extern "C" ssize_t pread64(int fd, void* buf, size_t count, off64_t offset) {
         std::memcpy(buf, slot->buffer.data() + rel_offset, count);
         g_ioCachedHits.fetch_add(1, std::memory_order_relaxed);
         g_ioBytesSaved.fetch_add(count, std::memory_order_relaxed);
+        g_ioBytesReadTotal.fetch_add(count, std::memory_order_relaxed);
         return (ssize_t)count;
     }
 
@@ -227,7 +247,7 @@ extern "C" ssize_t pread64(int fd, void* buf, size_t count, off64_t offset) {
     if (bytes_fetched <= 0) {
         slot->window_start = -1;
         slot->window_size = 0;
-        return g_real_pread64(fd, buf, count, offset);
+        return read_real();
     }
 
     slot->window_start = chunk_start;
@@ -238,16 +258,12 @@ extern "C" ssize_t pread64(int fd, void* buf, size_t count, off64_t offset) {
         (offset + (off64_t)count) <= (slot->window_start + (off64_t)slot->window_size)) {
         size_t rel_offset = (size_t)(offset - slot->window_start);
         std::memcpy(buf, slot->buffer.data() + rel_offset, count);
+        g_ioBytesReadTotal.fetch_add(count, std::memory_order_relaxed);
         return (ssize_t)count;
-    } else if (offset >= slot->window_start && offset < (slot->window_start + (off64_t)slot->window_size)) {
-        size_t rel_offset = (size_t)(offset - slot->window_start);
-        size_t avail = slot->window_size - rel_offset;
-        size_t to_copy = count < avail ? count : avail;
-        std::memcpy(buf, slot->buffer.data() + rel_offset, to_copy);
-        return (ssize_t)to_copy;
     }
+    // A cache window boundary is not EOF. Let libc satisfy the entire request.
 
-    return g_real_pread64(fd, buf, count, offset);
+    return read_real();
 }
 
 extern "C" ssize_t read(int fd, void* buf, size_t count) {
@@ -262,8 +278,10 @@ extern "C" int close(int fd) {
         std::lock_guard<std::mutex> lock(g_trackedLock);
         auto it = g_trackedFiles.find(fd);
         if (it != g_trackedFiles.end()) {
-            delete it->second;
+            auto slot = it->second;
+            std::lock_guard<std::mutex> slot_lock(slot->slot_lock);
             g_trackedFiles.erase(it);
+            return g_real_close ? g_real_close(fd) : -1;
         }
     }
     return g_real_close ? g_real_close(fd) : -1;

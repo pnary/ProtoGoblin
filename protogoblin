@@ -232,7 +232,7 @@ def cmd_show(args):
         b_class = roi.get("bottleneck_classification", "balanced")
         b_color = red if b_class in ["cpu_bound", "sync_bound"] else yellow if b_class == "gpu_bound" else green
         print(f"  Classification:   {b_color(b_class.replace('_', ' ').upper())}")
-        print(f"  Capture Duration: {roi.get('roi_capture_duration_sec', 0):.2f} seconds")
+        print(f"  Capture Duration: {(roi.get('roi_capture_duration_sec') or 0):.2f} seconds")
 
         fm = roi.get("frame_metrics")
         if fm:
