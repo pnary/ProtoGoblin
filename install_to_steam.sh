@@ -257,6 +257,13 @@ get_outdated_components() {
         fi
     fi
 
+    local db="share/protogoblin/protogoblin.db"
+    if [[ -f "${SCRIPT_DIR}/${db}" ]]; then
+        if [[ ! -f "${TOOL_DIR}/${db}" ]] || ! cmp -s "${SCRIPT_DIR}/${db}" "${TOOL_DIR}/${db}"; then
+            outdated+=("${db}")
+        fi
+    fi
+
     if [[ -d "${SCRIPT_DIR}/tools" ]]; then
         for f in "${SCRIPT_DIR}/tools"/*; do
             if [[ -f "$f" ]]; then
@@ -377,6 +384,9 @@ install_protogoblin_components() {
     mkdir -p "${TOOL_DIR}/share/protogoblin"
     if [[ -f "${SCRIPT_DIR}/share/protogoblin/protogoblin_presets.json" ]]; then
         cp -f "${SCRIPT_DIR}/share/protogoblin/protogoblin_presets.json" "${TOOL_DIR}/share/protogoblin/"
+    fi
+    if [[ -f "${SCRIPT_DIR}/share/protogoblin/protogoblin.db" ]]; then
+        cp -f "${SCRIPT_DIR}/share/protogoblin/protogoblin.db" "${TOOL_DIR}/share/protogoblin/"
     fi
 
     # Install tools
