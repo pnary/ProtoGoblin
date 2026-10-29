@@ -827,6 +827,15 @@ class FixRegistry:
         return matches
 
 
+def _safe_float(val, default=0.0):
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def compute_session_diff(manifest_a, manifest_b):
     """Computes an A/B delta comparison between two ProtoGoblin session manifests.
 
@@ -861,16 +870,16 @@ def compute_session_diff(manifest_a, manifest_b):
     bot_a = roi_a.get("bottleneck_classification", "unknown")
     bot_b = roi_b.get("bottleneck_classification", "unknown")
 
-    cpu_busy_a = float(pacing_a.get("cpu_busy_pct", 0.0))
-    cpu_busy_b = float(pacing_b.get("cpu_busy_pct", 0.0))
-    cpu_wait_a = float(pacing_a.get("cpu_wait_pct", 0.0))
-    cpu_wait_b = float(pacing_b.get("cpu_wait_pct", 0.0))
-    gpu_busy_a = float(pacing_a.get("gpu_busy_pct", 0.0))
-    gpu_busy_b = float(pacing_b.get("gpu_busy_pct", 0.0))
+    cpu_busy_a = _safe_float(pacing_a.get("cpu_busy_pct"))
+    cpu_busy_b = _safe_float(pacing_b.get("cpu_busy_pct"))
+    cpu_wait_a = _safe_float(pacing_a.get("cpu_wait_pct"))
+    cpu_wait_b = _safe_float(pacing_b.get("cpu_wait_pct"))
+    gpu_busy_a = _safe_float(pacing_a.get("gpu_busy_pct"))
+    gpu_busy_b = _safe_float(pacing_b.get("gpu_busy_pct"))
 
     def _delta(a_val, b_val):
-        a_f = float(a_val or 0.0)
-        b_f = float(b_val or 0.0)
+        a_f = _safe_float(a_val)
+        b_f = _safe_float(b_val)
         diff = b_f - a_f
         pct = (diff / a_f * 100.0) if a_f > 0 else 0.0
         return round(diff, 2), round(pct, 1)
@@ -902,11 +911,11 @@ def compute_session_diff(manifest_a, manifest_b):
                 "anti_cheat": manifest_b.get("anti_cheat") or {},
             },
             "metrics": {
-                "fps_avg": {"a": fm_a.get("fps_avg", 0.0), "b": fm_b.get("fps_avg", 0.0), "delta": diff_fps_avg, "pct": pct_fps_avg},
-                "fps_1_pct_low": {"a": fm_a.get("fps_1_pct_low", 0.0), "b": fm_b.get("fps_1_pct_low", 0.0), "delta": diff_fps_1p, "pct": pct_fps_1p},
-                "fps_0_1_pct_low": {"a": fm_a.get("fps_0_1_pct_low", 0.0), "b": fm_b.get("fps_0_1_pct_low", 0.0), "delta": diff_fps_01p, "pct": pct_fps_01p},
-                "frametime_avg_ms": {"a": fm_a.get("frametime_avg_ms", 0.0), "b": fm_b.get("frametime_avg_ms", 0.0), "delta": diff_ft_avg, "pct": pct_ft_avg},
-                "frametime_jitter_ms": {"a": fm_a.get("frametime_jitter_ms", 0.0), "b": fm_b.get("frametime_jitter_ms", 0.0), "delta": diff_jitter, "pct": pct_jitter},
+                "fps_avg": {"a": _safe_float(fm_a.get("fps_avg")), "b": _safe_float(fm_b.get("fps_avg")), "delta": diff_fps_avg, "pct": pct_fps_avg},
+                "fps_1_pct_low": {"a": _safe_float(fm_a.get("fps_1_pct_low")), "b": _safe_float(fm_b.get("fps_1_pct_low")), "delta": diff_fps_1p, "pct": pct_fps_1p},
+                "fps_0_1_pct_low": {"a": _safe_float(fm_a.get("fps_0_1_pct_low")), "b": _safe_float(fm_b.get("fps_0_1_pct_low")), "delta": diff_fps_01p, "pct": pct_fps_01p},
+                "frametime_avg_ms": {"a": _safe_float(fm_a.get("frametime_avg_ms")), "b": _safe_float(fm_b.get("frametime_avg_ms")), "delta": diff_ft_avg, "pct": pct_ft_avg},
+                "frametime_jitter_ms": {"a": _safe_float(fm_a.get("frametime_jitter_ms")), "b": _safe_float(fm_b.get("frametime_jitter_ms")), "delta": diff_jitter, "pct": pct_jitter},
             },
             "bottleneck": {
                 "a": bot_a,
@@ -957,8 +966,8 @@ def compute_session_diff(manifest_a, manifest_b):
             return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Active {p} detected; profiling hooks suppressed"])
         return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, ["One or both sessions missing ROI telemetry"])
 
-    fps_avg_a = float(fm_a.get("fps_avg") or 0.0)
-    fps_avg_b = float(fm_b.get("fps_avg") or 0.0)
+    fps_avg_a = _safe_float(fm_a.get("fps_avg"))
+    fps_avg_b = _safe_float(fm_b.get("fps_avg"))
     if fps_avg_a <= 0.0 or fps_avg_b <= 0.0:
         return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, ["Zero or negative average framerate captured"])
 
@@ -968,8 +977,8 @@ def compute_session_diff(manifest_a, manifest_b):
         return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, ["Zero frames recorded in sample window"])
 
     # 4. Capture Duration Sanity Check
-    dur_a = float(sess_a.get("duration_seconds") or roi_a.get("duration_seconds") or 0.0)
-    dur_b = float(sess_b.get("duration_seconds") or roi_b.get("duration_seconds") or 0.0)
+    dur_a = _safe_float(sess_a.get("duration_seconds") or roi_a.get("duration_seconds"))
+    dur_b = _safe_float(sess_b.get("duration_seconds") or roi_b.get("duration_seconds"))
     if dur_a > 0.0 and dur_b > 0.0:
         if (dur_b < 0.15 * dur_a and dur_a - dur_b > 5.0) or (dur_a < 0.15 * dur_b and dur_b - dur_a > 5.0):
             return _build_result(ExperimentVerdict.INSUFFICIENT_DATA, [f"Non-comparable capture durations ({dur_a:.1f}s vs {dur_b:.1f}s)"])
@@ -980,21 +989,21 @@ def compute_session_diff(manifest_a, manifest_b):
 
     # Check regressions first
     if pct_fps_1p <= -10.0:
-        regressions.append(f"1% lows {pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
+        regressions.append(f"1% lows {pct_fps_1p:.1f}% ({_safe_float(fm_a.get('fps_1_pct_low')):.1f} -> {_safe_float(fm_b.get('fps_1_pct_low')):.1f})")
     if pct_fps_01p <= -15.0:
-        regressions.append(f"0.1% lows {pct_fps_01p:.1f}% ({fm_a.get('fps_0_1_pct_low', 0):.1f} -> {fm_b.get('fps_0_1_pct_low', 0):.1f})")
+        regressions.append(f"0.1% lows {pct_fps_01p:.1f}% ({_safe_float(fm_a.get('fps_0_1_pct_low')):.1f} -> {_safe_float(fm_b.get('fps_0_1_pct_low')):.1f})")
     if pct_fps_avg <= -5.0:
-        regressions.append(f"Average FPS {pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
-    if float(fm_a.get("frametime_jitter_ms", 0.0)) > 3.0 and pct_jitter >= 25.0:
-        regressions.append(f"Frametime jitter +{pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
+        regressions.append(f"Average FPS {pct_fps_avg:.1f}% ({_safe_float(fm_a.get('fps_avg')):.1f} -> {_safe_float(fm_b.get('fps_avg')):.1f})")
+    if _safe_float(fm_a.get("frametime_jitter_ms")) > 3.0 and pct_jitter >= 25.0:
+        regressions.append(f"Frametime jitter +{pct_jitter:.1f}% ({_safe_float(fm_a.get('frametime_jitter_ms')):.2f}ms -> {_safe_float(fm_b.get('frametime_jitter_ms')):.2f}ms)")
 
     # Check improvements
     if pct_fps_avg >= 5.0:
-        improvements.append(f"Average FPS +{pct_fps_avg:.1f}% ({fm_a.get('fps_avg', 0):.1f} -> {fm_b.get('fps_avg', 0):.1f})")
+        improvements.append(f"Average FPS +{pct_fps_avg:.1f}% ({_safe_float(fm_a.get('fps_avg')):.1f} -> {_safe_float(fm_b.get('fps_avg')):.1f})")
     if pct_fps_1p >= 10.0:
-        improvements.append(f"1% lows +{pct_fps_1p:.1f}% ({fm_a.get('fps_1_pct_low', 0):.1f} -> {fm_b.get('fps_1_pct_low', 0):.1f})")
-    if float(fm_a.get("frametime_jitter_ms", 0.0)) > 5.0 and pct_jitter <= -20.0:
-        improvements.append(f"Frametime jitter {pct_jitter:.1f}% ({fm_a.get('frametime_jitter_ms', 0):.2f}ms -> {fm_b.get('frametime_jitter_ms', 0):.2f}ms)")
+        improvements.append(f"1% lows +{pct_fps_1p:.1f}% ({_safe_float(fm_a.get('fps_1_pct_low')):.1f} -> {_safe_float(fm_b.get('fps_1_pct_low')):.1f})")
+    if _safe_float(fm_a.get("frametime_jitter_ms")) > 5.0 and pct_jitter <= -20.0:
+        improvements.append(f"Frametime jitter {pct_jitter:.1f}% ({_safe_float(fm_a.get('frametime_jitter_ms')):.2f}ms -> {_safe_float(fm_b.get('frametime_jitter_ms')):.2f}ms)")
     if bot_a == "sync_bound" and bot_b in ["gpu_bound", "balanced"]:
         improvements.append(f"Sync lockstep stall resolved ({bot_a} -> {bot_b})")
 
@@ -1080,10 +1089,10 @@ def format_diff_report(diff):
     ])
 
     def _fmt_row(title, metric_dict, unit, higher_is_better=True):
-        a_val = float(metric_dict.get("a") or 0.0)
-        b_val = float(metric_dict.get("b") or 0.0)
-        delta = float(metric_dict.get("delta") or 0.0)
-        pct = float(metric_dict.get("pct") or 0.0)
+        a_val = _safe_float(metric_dict.get("a"))
+        b_val = _safe_float(metric_dict.get("b"))
+        delta = _safe_float(metric_dict.get("delta"))
+        pct = _safe_float(metric_dict.get("pct"))
         sign = "+" if delta > 0 else ""
         arrow = "▲" if ((delta > 0 and higher_is_better) or (delta < 0 and not higher_is_better)) else ("▼" if delta != 0 else "=")
         a_str = f"{a_val:.1f} {unit}"
@@ -1109,9 +1118,9 @@ def format_diff_report(diff):
 
     for comp_name, key in [("CPU Busy Utilization:", "cpu_busy_pct"), ("CPU Wait / Blocked:", "cpu_wait_pct"), ("GPU Busy Utilization:", "gpu_busy_pct")]:
         h_data = hw.get(key, {})
-        a_str = f"{float(h_data.get('a', 0.0)):.1f}%"
-        b_str = f"{float(h_data.get('b', 0.0)):.1f}%"
-        delta_val = float(h_data.get('delta', 0.0))
+        a_str = f"{_safe_float(h_data.get('a')):.1f}%"
+        b_str = f"{_safe_float(h_data.get('b')):.1f}%"
+        delta_val = _safe_float(h_data.get('delta'))
         s = "+" if delta_val > 0 else ""
         d_str = f"{s}{delta_val:.1f}%"
         lines.append(f" {comp_name:<28} {a_str:<20} {b_str:<20} {d_str:<14}")

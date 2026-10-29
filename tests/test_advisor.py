@@ -1343,6 +1343,84 @@ class TestSessionComparison(unittest.TestCase):
         self.assertIn("ANTI-CHEAT NOTICE: Active BattlEye detected", report)
         self.assertIn("Profiling hooks and ROI telemetry were automatically suppressed", report)
 
+    def test_session_diff_with_none_pacing_and_metrics(self):
+        """Verifies compute_session_diff handles None in pacing and frame metrics without TypeError."""
+        manifest_a = {
+            "session": {"id": "sess_a", "mode": "profile"},
+            "target": {"steam_appid": "500", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "gpu_bound",
+                "frame_metrics": {
+                    "fps_avg": 60.0,
+                    "fps_1_pct_low": 45.0,
+                    "fps_0_1_pct_low": 30.0,
+                    "frametime_avg_ms": 16.6,
+                    "frametime_jitter_ms": 2.0,
+                },
+                "pacing": {
+                    "cpu_busy_pct": 50.0,
+                    "cpu_wait_pct": None,
+                    "gpu_busy_pct": 90.0,
+                },
+            },
+        }
+        manifest_b = {
+            "session": {"id": "sess_b", "mode": "profile"},
+            "target": {"steam_appid": "500", "target_executable": {"path": "game.exe"}},
+            "roi_telemetry": {
+                "roi_enabled": True,
+                "bottleneck_classification": "gpu_bound",
+                "frame_metrics": {
+                    "fps_avg": 75.0,
+                    "fps_1_pct_low": 55.0,
+                    "fps_0_1_pct_low": 40.0,
+                    "frametime_avg_ms": 13.3,
+                    "frametime_jitter_ms": 1.5,
+                },
+                "pacing": {
+                    "cpu_busy_pct": 55.0,
+                    "cpu_wait_pct": None,
+                    "gpu_busy_pct": 95.0,
+                },
+            },
+        }
+        diff = compute_session_diff(manifest_a, manifest_b)
+        self.assertEqual(diff["verdict"], "IMPROVED")
+        self.assertEqual(diff["hardware"]["cpu_wait_pct"]["a"], 0.0)
+        self.assertEqual(diff["hardware"]["cpu_wait_pct"]["b"], 0.0)
+        self.assertEqual(diff["hardware"]["cpu_wait_pct"]["delta"], 0.0)
+
+        report = format_diff_report(diff)
+        self.assertIn("IMPROVED", report)
+        self.assertIn("0.0%", report)
+
+    def test_diagnostic_advisor_analyze_none_telemetry_fields(self):
+        """Verifies DiagnosticAdvisor.analyze handles None values in nested telemetry safely."""
+        manifest = {
+            "graphics": {
+                "shader_compiles": {"count": None, "total_time_ms": None, "pipeline_cache_hit_rate": None},
+                "d3d11_wrapper_stats": {
+                    "readbacks": {"map_calls": None, "map_time_ms": None, "slow_map_calls": None},
+                    "constant_buffers": {"updates_total": None, "updates_redundant": None, "redundancy_rate_pct": None},
+                    "swapchain": {"resizes_total": None, "resizes_identical": None, "resizes_rapid": None},
+                    "timing": {"sleep_calls_total": None, "overshoot_prevented_calls": None, "overshoot_avoided_ms": None},
+                },
+            },
+            "filesystem": {
+                "io_cache_stats": {
+                    "reads_total": None,
+                    "reads_cached_hits": None,
+                    "hit_rate_pct": None,
+                    "bytes_cached_saved": None,
+                    "estimated_latency_saved_ms": None,
+                    "bytes_read_total": None,
+                },
+            },
+        }
+        suggestions = DiagnosticAdvisor.analyze(manifest)
+        self.assertIsInstance(suggestions, list)
+
 
 class TestSubsystemPruning(unittest.TestCase):
     def test_subsystem_pruning_play_mode_from_prior_session(self):

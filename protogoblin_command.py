@@ -88,9 +88,9 @@ class DiagnosticAdvisor:
 
         # 3. Shader Compilation Stalls
         sh = gfx.get("shader_compiles") or {}
-        count = sh.get("count", 0)
-        time_ms = sh.get("total_time_ms", 0.0)
-        hit_rate = sh.get("pipeline_cache_hit_rate", 1.0)
+        count = sh.get("count") or 0
+        time_ms = sh.get("total_time_ms") or 0.0
+        hit_rate = 1.0 if sh.get("pipeline_cache_hit_rate") is None else sh.get("pipeline_cache_hit_rate")
         if count > 50 and time_ms > 200:
             dxvk_info = gfx.get("dxvk") or {}
             async_supported = bool(dxvk_info.get("async_supported", False))
@@ -241,13 +241,16 @@ class DiagnosticAdvisor:
                     )
 
         readbacks = (gfx.get("d3d11_wrapper_stats") or {}).get("readbacks") or {}
-        if readbacks.get("map_calls", 0) > 0 and readbacks.get("map_time_ms", 0) >= 100:
+        map_calls = readbacks.get("map_calls") or 0
+        map_time_ms = readbacks.get("map_time_ms") or 0.0
+        slow_map_calls = readbacks.get("slow_map_calls") or 0
+        if map_calls > 0 and map_time_ms >= 100:
             suggestions.append({
                 "level": "warning",
                 "title": "Measured D3D11 Readback Waits",
                 "description": (
-                    f"{readbacks['map_calls']:,} read mappings took {readbacks['map_time_ms']:.1f}ms in total; "
-                    f"{readbacks.get('slow_map_calls', 0):,} exceeded 1ms. These are measured API waits, "
+                    f"{map_calls:,} read mappings took {map_time_ms:.1f}ms in total; "
+                    f"{slow_map_calls:,} exceeded 1ms. These are measured API waits, "
                     "not proof that every wait is unnecessary."
                 ),
                 "action": "Correlate slow mappings with copies and frame timings; compare one workaround at a time.",
@@ -257,9 +260,9 @@ class DiagnosticAdvisor:
         w_stats = gfx.get("d3d11_wrapper_stats")
         if w_stats:
             cb = w_stats.get("constant_buffers") or {}
-            cb_total = cb.get("updates_total", 0)
-            cb_redundant = cb.get("updates_redundant", 0)
-            cb_rate = cb.get("redundancy_rate_pct", 0.0)
+            cb_total = cb.get("updates_total") or 0
+            cb_redundant = cb.get("updates_redundant") or 0
+            cb_rate = cb.get("redundancy_rate_pct") or 0.0
             state_active = w_stats.get("state_dedup_active", False)
 
             if cb_total >= 500 and cb_rate >= 35.0:
@@ -291,9 +294,9 @@ class DiagnosticAdvisor:
                     )
 
             sc = w_stats.get("swapchain") or {}
-            sc_total = sc.get("resizes_total", 0)
-            sc_identical = sc.get("resizes_identical", 0)
-            sc_rapid = sc.get("resizes_rapid", 0)
+            sc_total = sc.get("resizes_total") or 0
+            sc_identical = sc.get("resizes_identical") or 0
+            sc_rapid = sc.get("resizes_rapid") or 0
             sc_active = w_stats.get("swapchain_debounce_active", False)
 
             if (sc_identical + sc_rapid) >= 3:
@@ -325,9 +328,9 @@ class DiagnosticAdvisor:
                     )
 
             timing = w_stats.get("timing") or {}
-            sleep_total = timing.get("sleep_calls_total", 0)
-            overshoot_calls = timing.get("overshoot_prevented_calls", 0)
-            overshoot_ms = timing.get("overshoot_avoided_ms", 0.0)
+            sleep_total = timing.get("sleep_calls_total") or 0
+            overshoot_calls = timing.get("overshoot_prevented_calls") or 0
+            overshoot_ms = timing.get("overshoot_avoided_ms") or 0.0
             timers_active = timing.get("high_precision_timers_active", False)
 
             if sleep_total >= 500:
@@ -363,11 +366,11 @@ class DiagnosticAdvisor:
         fs = manifest.get("filesystem") or {}
         io_stats = fs.get("io_cache_stats")
         if io_stats:
-            reads_total = io_stats.get("reads_total", 0)
-            hits = io_stats.get("reads_cached_hits", 0)
-            hit_rate = io_stats.get("hit_rate_pct", 0.0)
-            saved_mb = io_stats.get("bytes_cached_saved", 0) / (1024 * 1024)
-            saved_ms = io_stats.get("estimated_latency_saved_ms", 0.0)
+            reads_total = io_stats.get("reads_total") or 0
+            hits = io_stats.get("reads_cached_hits") or 0
+            hit_rate = io_stats.get("hit_rate_pct") or 0.0
+            saved_mb = (io_stats.get("bytes_cached_saved") or 0) / (1024 * 1024)
+            saved_ms = io_stats.get("estimated_latency_saved_ms") or 0.0
             io_active = io_stats.get("io_cache_active", False)
 
             if reads_total >= 1000:
@@ -377,7 +380,7 @@ class DiagnosticAdvisor:
                             "level": "warning",
                             "title": f"Synchronous Traversal File I/O Overhead ({reads_total:,} Reads)",
                             "description": (
-                                f"The game issued {reads_total:,} synchronous asset streaming reads ({io_stats.get('bytes_read_total', 0) / (1024*1024):.1f} MB), "
+                                f"The game issued {reads_total:,} synchronous asset streaming reads ({((io_stats.get('bytes_read_total') or 0) / (1024*1024)):.1f} MB), "
                                 "triggering repeated Wine/kernel boundary crossings during traversal. This is a primary driver of zone traversal micro-stutter."
                             ),
                             "action": "Enable Adaptive Traversal File I/O Cache in profile.toml [filesystem.io_cache].",
@@ -1608,8 +1611,11 @@ class ProtoGoblinCommandApp:
             self.diff_text.insert(tk.END, "Failed to load one or both session manifests.\n")
             return
 
-        diff_data = compute_session_diff(manifest_a, manifest_b)
-        report = format_diff_report(diff_data)
+        try:
+            diff_data = compute_session_diff(manifest_a, manifest_b)
+            report = format_diff_report(diff_data)
+        except Exception as e:
+            report = f"Failed to compute session diff: {e}\n"
         self.diff_text.delete("1.0", tk.END)
         self.diff_text.insert(tk.END, report)
 
