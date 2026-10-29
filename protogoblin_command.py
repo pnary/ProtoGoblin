@@ -27,6 +27,7 @@ from protogoblin import (
     ExperimentStatus,
     ExperimentVerdict,
     ExperimentalValidationEngine,
+    SystemProbe,
 )
 
 
@@ -125,16 +126,20 @@ class DiagnosticAdvisor:
             b_class = roi.get("bottleneck_classification")
             fm = roi.get("frame_metrics") or {}
             pacing = roi.get("pacing") or {}
-            cores = (env.get("cpu") or {}).get("logical_cores") or 1
+            cpu_info = (env.get("cpu") if isinstance(env.get("cpu"), dict) else None) or SystemProbe.get_cpu_info()
+            cores = cpu_info.get("logical_cores") or 1
+            is_vcache = cpu_info.get("is_vcache") or False
 
             if b_class == "cpu_bound":
-                if cores >= 12:
+                if cores >= 12 or is_vcache:
                     suggestions.append(
                         {
-                            "level": "info",
-                            "title": "CPU-Bound Workload on High-Core CPU",
-                            "description": f"Session CPU load reached {pacing.get('cpu_busy_pct', 0)}% while GPU was underutilized. On multi-CCD processors (e.g. AMD Ryzen 9 / X3D), cross-CCD cache latency degrades performance.",
-                            "action": "Pin game threads to the high-cache CCD using PROTON_CPU_TOPOLOGY or taskset in your game profile.",
+                            "level": "warning",
+                            "title": "CPU-Bound Workload on Multi-Core / Multi-CCD CPU",
+                            "description": f"Session CPU load reached {pacing.get('cpu_busy_pct', 0)}% while GPU was underutilized ({pacing.get('gpu_busy_pct', 0)}%). On multi-CCD processors (e.g. AMD Ryzen 9 / X3D) and hybrid CPUs, thread migration across dies induces cache thrashing and inter-core latency penalty.",
+                            "action": "Pin game threads to high-performance/V-Cache cores in profile.toml [cpu.pin_performance_cores].",
+                            "fix_id": "pin_performance_cores",
+                            "fix_button_text": "⚡ Pin Threads to Performance/V-Cache Cores",
                         }
                     )
                 else:
@@ -146,6 +151,19 @@ class DiagnosticAdvisor:
                             "action": "Ensure Linux CPU governor is set to 'performance'.",
                         }
                     )
+                suggestions.append(
+                    {
+                        "level": "info",
+                        "title": "High-Concurrency Heap Allocator (mimalloc)",
+                        "description": (
+                            "Entity simulation and pathfinding loops generate heavy small-object heap allocation churn. "
+                            "Preloading Microsoft mimalloc replaces glibc/Wine heap locking with lock-free page allocators."
+                        ),
+                        "action": "Enable mimalloc heap allocator in profile.toml [memory.allocator].",
+                        "fix_id": "enable_mimalloc",
+                        "fix_button_text": "⚡ Preload mimalloc Allocator",
+                    }
+                )
                 suggestions.append(
                     {
                         "level": "info",
@@ -444,6 +462,20 @@ class DiagnosticAdvisor:
                     "title": f"Unity Engine Detected ({backend})",
                     "description": f"Game runs on Unity ({backend}). Prefix boot.config can be tuned to enable native graphics jobs and bypass unused runtime debugger checks.",
                     "action": "Ensure gfx-enable-native-gfx-jobs=1 is configured in prefix boot.config.",
+                }
+            )
+            suggestions.append(
+                {
+                    "level": "warning" if (isinstance(roi, dict) and roi.get("bottleneck_classification") == "cpu_bound") else "info",
+                    "title": "⚡ Optimize Unity Mono GC Nursery Sizing",
+                    "description": (
+                        "Unity Mono runtime defaults to a small 4MB generational nursery, inducing recurring "
+                        "stop-the-world GC pauses during entity simulation cycles. Expanding nursery sizing to 64MB "
+                        "reduces GC collection frequency by up to 75%."
+                    ),
+                    "action": "Configure MONO_GC_PARAMS=nursery-size=64m in profile.toml [engine.unity.mono_gc_tuning].",
+                    "fix_id": "unity_mono_gc_tuning",
+                    "fix_button_text": "⚡ Enable 64MB Unity GC Nursery",
                 }
             )
         elif eng_name == "godot":
@@ -1206,6 +1238,7 @@ class ProtoGoblinCommandApp:
         self.var_unity_native_jobs = tk.BooleanVar(value=True)
         self.var_unity_disable_vr = tk.BooleanVar(value=True)
         self.var_unity_vulkan = tk.BooleanVar(value=False)
+        self.var_unity_mono_gc = tk.BooleanVar(value=False)
         self.var_godot_vsync = tk.BooleanVar(value=True)
         self.var_godot_vulkan = tk.BooleanVar(value=True)
 
@@ -1213,6 +1246,7 @@ class ProtoGoblinCommandApp:
             ("Unity: Force Native Gfx Jobs (gfx-enable-native-gfx-jobs=1 in boot.config)", self.var_unity_native_jobs),
             ("Unity: Disable Unused VR Subsystem (vr-enabled=0 in boot.config)", self.var_unity_disable_vr),
             ("Unity: Force Vulkan Backend (-force-vulkan)", self.var_unity_vulkan),
+            ("Unity: Mono 64MB Generational GC Nursery (MONO_GC_PARAMS=nursery-size=64m)", self.var_unity_mono_gc),
             ("Godot: Disable VSync (window/vsync/vsync_mode=0 in override.cfg)", self.var_godot_vsync),
             ("Godot: Force Vulkan Forward+ Renderer (--rendering-driver vulkan)", self.var_godot_vulkan),
         ]
@@ -1323,7 +1357,39 @@ class ProtoGoblinCommandApp:
         )
         cb_fs.pack(anchor=tk.W, pady=2)
 
-        # 5. Compatibility & Native Microsoft DLL Overrides Card
+        # 5. CPU Topology & High-Concurrency Memory Card
+        self.cpu_mem_frame = tk.LabelFrame(
+            container,
+            text=" CPU Core Affinity & High-Concurrency Memory Subsystem ",
+            bg="#161b22",
+            fg="#58a6ff",
+            font=("Segoe UI", 10, "bold"),
+            padx=12,
+            pady=10,
+        )
+        self.cpu_mem_frame.pack(fill=tk.X, pady=6)
+
+        self.var_cpu_pin_cores = tk.BooleanVar(value=False)
+        self.var_mem_mimalloc = tk.BooleanVar(value=False)
+
+        cpu_mem_checks = [
+            ("Pin Threads to Primary Performance / 3D V-Cache Cores (taskset / WINE_CPU_TOPOLOGY)", self.var_cpu_pin_cores),
+            ("Preload High-Concurrency mimalloc Allocator (Eliminates heap lock contention)", self.var_mem_mimalloc),
+        ]
+        for text, var in cpu_mem_checks:
+            cb = tk.Checkbutton(
+                self.cpu_mem_frame,
+                text=text,
+                variable=var,
+                bg="#161b22",
+                fg="#c9d1d9",
+                selectcolor="#0d1117",
+                activebackground="#161b22",
+                activeforeground="#58a6ff",
+            )
+            cb.pack(anchor=tk.W, pady=2)
+
+        # 6. Compatibility & Native Microsoft DLL Overrides Card
         self.compat_frame = tk.LabelFrame(
             container,
             text=" Compatibility & Native Microsoft DLL Overrides (Winetricks-style) ",
@@ -2972,9 +3038,13 @@ class ProtoGoblinCommandApp:
         self.var_unity_native_jobs.set(False)
         self.var_unity_disable_vr.set(False)
         self.var_unity_vulkan.set(False)
+        self.var_unity_mono_gc.set(False)
 
         self.var_godot_vsync.set(False)
         self.var_godot_vulkan.set(False)
+
+        self.var_cpu_pin_cores.set(False)
+        self.var_mem_mimalloc.set(False)
 
         self.var_gfx_vsync_off.set(False)
         self.var_gfx_async_shader.set(False)
@@ -3093,6 +3163,18 @@ class ProtoGoblinCommandApp:
         vkd3d = gfx.get("vkd3d", {})
         compat = prof_data.get("compatibility", {})
         dlls = compat.get("dll_overrides", {})
+        cpu = prof_data.get("cpu", {})
+        mem = prof_data.get("memory", {})
+        unity = prof_data.get("engine", {}).get("unity", {})
+
+        if "pin_performance_cores" in cpu:
+            self.var_cpu_pin_cores.set(bool(cpu["pin_performance_cores"]))
+        if "allocator" in mem:
+            self.var_mem_mimalloc.set(str(mem["allocator"]).lower() == "mimalloc")
+        elif "mimalloc" in mem:
+            self.var_mem_mimalloc.set(bool(mem["mimalloc"]))
+        if "mono_gc_tuning" in unity:
+            self.var_unity_mono_gc.set(bool(unity["mono_gc_tuning"]))
 
         if "descriptor_buffer" in gfx:
             self.var_gfx_descriptor_buffer.set(bool(gfx["descriptor_buffer"]))
@@ -3158,6 +3240,12 @@ class ProtoGoblinCommandApp:
             return bool(self.var_ue_optimize_lumen.get() and self.var_ue_optimize_vsm.get())
         elif fid == "vkd3d_single_queue":
             return bool(self.var_vkd3d_single_queue.get())
+        elif fid == "pin_performance_cores":
+            return bool(self.var_cpu_pin_cores.get())
+        elif fid == "unity_mono_gc_tuning":
+            return bool(self.var_unity_mono_gc.get())
+        elif fid == "enable_mimalloc":
+            return bool(self.var_mem_mimalloc.get())
         elif fid.startswith("snag_dll_"):
             remedy = s.get("remedy") or {}
             verb = remedy.get("verb", fid.replace("snag_dll_", ""))
@@ -3208,6 +3296,12 @@ class ProtoGoblinCommandApp:
                 self.var_gfx_descriptor_buffer.set(True)
         elif fid == "vkd3d_single_queue":
             self.var_vkd3d_single_queue.set(enabled)
+        elif fid == "pin_performance_cores":
+            self.var_cpu_pin_cores.set(enabled)
+        elif fid == "unity_mono_gc_tuning":
+            self.var_unity_mono_gc.set(enabled)
+        elif fid == "enable_mimalloc":
+            self.var_mem_mimalloc.set(enabled)
         elif fid.startswith("snag_dll_"):
             remedy = s.get("remedy") or {}
             verb = remedy.get("verb", fid.replace("snag_dll_", ""))
@@ -3607,6 +3701,12 @@ class ProtoGoblinCommandApp:
                     **({"d3dx9_43": "n,b"} if getattr(self, "var_compat_d3dx9", tk.BooleanVar(value=False)).get() else {}),
                 }
             },
+            "cpu": {
+                "pin_performance_cores": self.var_cpu_pin_cores.get(),
+            },
+            "memory": {
+                "allocator": "mimalloc" if self.var_mem_mimalloc.get() else "default",
+            },
         }
 
         if eng_name in ["unreal_4", "unreal_5", "unreal"]:
@@ -3629,6 +3729,7 @@ class ProtoGoblinCommandApp:
                 "native_gfx_jobs": self.var_unity_native_jobs.get(),
                 "disable_vr": self.var_unity_disable_vr.get(),
                 "force_vulkan": self.var_unity_vulkan.get(),
+                "mono_gc_tuning": self.var_unity_mono_gc.get(),
             }
         elif eng_name in ["godot", "godot_3", "godot_4"]:
             user_tweaks["godot"] = {

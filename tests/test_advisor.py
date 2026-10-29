@@ -11,6 +11,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -2925,6 +2926,150 @@ class TestExperimentalValidationLifecycleAndBugFixes(unittest.TestCase):
         )
         self.assertEqual(res["status"], ExperimentStatus.REJECTED)
         self.assertEqual(res["verdict"], ExperimentVerdict.REGRESSED)
+
+
+class TestSimulationAndCpuOptimizations(unittest.TestCase):
+    """Tests for multi-CCD CPU core pinning, Unity Mono GC nursery tuning, and mimalloc heap allocator."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.profile_path = os.path.join(self.temp_dir, "test_game.toml")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_cpu_probe_vcache_and_affinity_detection(self):
+        """Validates detection of AMD X3D / multi-CCD CPUs and recommended affinity masks."""
+        with mock.patch("os.path.isfile", side_effect=lambda p: p == "/proc/cpuinfo"):
+            fake_proc_cpuinfo = "model name : AMD Ryzen 9 7950X3D 16-Core Processor\n" * 32
+            with mock.patch("builtins.open", mock.mock_open(read_data=fake_proc_cpuinfo)):
+                with mock.patch("os.cpu_count", return_value=32):
+                    info = SystemProbe.get_cpu_info()
+                    self.assertTrue(info["is_vcache"])
+                    self.assertTrue(info["is_multi_ccd"])
+                    self.assertEqual(info["recommended_affinity"], "0-15")
+
+    def test_apply_tweaks_pin_performance_cores(self):
+        """Verifies core pinning via taskset and WINE_CPU_TOPOLOGY."""
+        profile = {
+            "cpu": {
+                "pin_performance_cores": True,
+                "affinity_mask": "0-7",
+            }
+        }
+        env = {}
+        argv = ["game.exe"]
+        with mock.patch("shutil.which", return_value="/usr/bin/taskset"):
+            new_argv = EngineTweakManager.apply_tweaks(profile, {}, argv, env)
+            self.assertEqual(env.get("PROTOGOBLIN_CPU_AFFINITY"), "0-7")
+            self.assertEqual(env.get("WINE_CPU_TOPOLOGY"), "8:0,1,2,3,4,5,6,7")
+            self.assertEqual(new_argv[:3], ["taskset", "-c", "0-7"])
+            self.assertEqual(new_argv[3:], ["game.exe"])
+
+    def test_apply_tweaks_unity_mono_gc_tuning(self):
+        """Verifies MONO_GC_PARAMS expansion to 64MB for Unity simulations."""
+        profile = {
+            "engine": {
+                "unity": {
+                    "mono_gc_tuning": True,
+                    "mono_nursery_size_mb": 64,
+                }
+            }
+        }
+        env = {"MONO_GC_PARAMS": "soft-heap-limit=2g"}
+        EngineTweakManager.apply_tweaks(profile, {"engine": "unity"}, ["UnityGame.exe"], env)
+        self.assertEqual(env.get("PROTOGOBLIN_MONO_GC_TUNING"), "1")
+        self.assertEqual(env.get("MONO_GC_PARAMS"), "soft-heap-limit=2g,nursery-size=64m")
+
+    def test_apply_tweaks_enable_mimalloc(self):
+        """Verifies mimalloc preloading and large OS page environment settings."""
+        profile = {
+            "memory": {
+                "allocator": "mimalloc",
+            }
+        }
+        env = {}
+        with mock.patch("os.path.exists", return_value=True):
+            EngineTweakManager.apply_tweaks(profile, {}, ["SimGame.exe"], env)
+            self.assertEqual(env.get("PROTOGOBLIN_ALLOCATOR"), "mimalloc")
+            self.assertEqual(env.get("MIMALLOC_LARGE_OS_PAGES"), "1")
+            self.assertEqual(env.get("MIMALLOC_PAGE_RESET"), "0")
+            self.assertIn("libmimalloc.so", env.get("LD_PRELOAD", ""))
+
+    def test_advisor_emits_simulation_and_affinity_recommendations(self):
+        """Verifies advisor flags CPU-bound simulation workloads for affinity, mimalloc, and Mono GC."""
+        roi = {
+            "roi_enabled": True,
+            "sample_count": 300,
+            "bottleneck_classification": "cpu_bound",
+            "pacing_metrics": {
+                "cpu_busy_pct": 94.0,
+                "gpu_busy_pct": 32.0,
+            },
+            "frame_metrics": {
+                "fps_avg": 55.0,
+            },
+        }
+        with mock.patch.object(SystemProbe, "get_cpu_info", return_value={"logical_cores": 16, "model": "AMD Ryzen 9 5950X", "is_multi_ccd": True, "recommended_affinity": "0-7"}):
+            # Test 1: CPU-bound generic game -> pin_performance_cores + enable_mimalloc
+            manifest_generic = {
+                "roi_telemetry": roi,
+                "target": {"engine": {"engine": "custom"}},
+            }
+            suggestions = DiagnosticAdvisor.analyze(manifest_generic)
+            fix_ids = [s.get("fix_id") for s in suggestions if s.get("fix_id")]
+            self.assertIn("pin_performance_cores", fix_ids)
+            self.assertIn("enable_mimalloc", fix_ids)
+
+            # Test 2: Unity simulation title -> unity_mono_gc_tuning
+            manifest_unity = {
+                "roi_telemetry": roi,
+                "target": {"engine": {"engine": "unity"}},
+            }
+            unity_suggestions = DiagnosticAdvisor.analyze(manifest_unity)
+            unity_fix_ids = [s.get("fix_id") for s in unity_suggestions if s.get("fix_id")]
+            self.assertIn("unity_mono_gc_tuning", unity_fix_ids)
+
+    def test_experimental_validation_lifecycle_for_new_fixes(self):
+        """Verifies that all three new fixes integrate cleanly with the A/B validation engine."""
+        new_fixes = ["pin_performance_cores", "unity_mono_gc_tuning", "enable_mimalloc"]
+        for fix_id in new_fixes:
+            init_toml = EngineTweakManager.generate_profile_toml(
+                game_id="800",
+                app_id="800",
+                target_exe="game.exe",
+            )
+            with open(self.profile_path, "w", encoding="utf-8") as f:
+                f.write(init_toml)
+
+            # Start experiment
+            exp_info = ExperimentalValidationEngine.start_experiment(
+                profile_path=self.profile_path,
+                fix_id=fix_id,
+                baseline_session_id="base_sess",
+                required_runs=1,
+            )
+            self.assertEqual(exp_info["status"], ExperimentStatus.APPLIED)
+            self.assertEqual(ExperimentalValidationEngine.get_experiment_status(self.profile_path, fix_id), ExperimentStatus.APPLIED)
+
+            # Evaluate with improvement
+            manifest_base = {
+                "session": {"id": "base_sess", "mode": "profile", "duration_seconds": 60, "exit_code": 0, "clean_shutdown": True},
+                "target": {"steam_appid": "800", "target_executable": {"path": "game.exe"}},
+                "roi_telemetry": {"roi_enabled": True, "sample_count": 500, "frame_metrics": {"fps_avg": 50.0, "fps_1_pct_low": 30.0}},
+            }
+            manifest_bench = {
+                "session": {"id": f"bench_{fix_id}", "mode": "profile", "duration_seconds": 60, "exit_code": 0, "clean_shutdown": True},
+                "target": {"steam_appid": "800", "target_executable": {"path": "game.exe"}},
+                "roi_telemetry": {"roi_enabled": True, "sample_count": 500, "frame_metrics": {"fps_avg": 62.0, "fps_1_pct_low": 42.0}},
+            }
+            res = ExperimentalValidationEngine.evaluate_experiment(
+                profile_path=self.profile_path,
+                session_manifest=manifest_bench,
+                baseline_manifest=manifest_base,
+            )
+            self.assertEqual(res["status"], ExperimentStatus.VALIDATED)
+            self.assertEqual(res["verdict"], ExperimentVerdict.IMPROVED)
 
 
 if __name__ == "__main__":

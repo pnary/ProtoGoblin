@@ -605,6 +605,9 @@ class FixRegistry:
         "enable_io_cache": "io_cache",
         "enable_descriptor_buffer": "descriptor_buffer",
         "dxvk_async": "async_shader_compile",
+        "cpu_affinity": "pin_performance_cores",
+        "mono_gc_tuning": "unity_mono_gc_tuning",
+        "mimalloc": "enable_mimalloc",
     }
 
     _REGISTRY = {
@@ -710,6 +713,33 @@ class FixRegistry:
                 (("engine", "unreal", "disable_virtual_shadows"), True),
             ],
             description="Downsamples Lumen screen probes and throttles virtual shadow ray samples under VKD3D-Proton.",
+        ),
+        "pin_performance_cores": FixDefinition(
+            fix_id="pin_performance_cores",
+            title="CPU Core Affinity & Performance Core Pinning",
+            constituent_features=["pin_performance_cores", "cpu_affinity"],
+            profile_targets=[
+                (("cpu", "pin_performance_cores"), True),
+            ],
+            description="Constrains execution to primary performance or 3D V-Cache cores, eliminating multi-CCD cache latency.",
+        ),
+        "unity_mono_gc_tuning": FixDefinition(
+            fix_id="unity_mono_gc_tuning",
+            title="Unity Mono GC Generational Nursery Tuning",
+            constituent_features=["unity_mono_gc_tuning"],
+            profile_targets=[
+                (("engine", "unity", "mono_gc_tuning"), True),
+            ],
+            description="Expands Mono generational nursery to 64MB to eliminate stop-the-world garbage collection pauses in simulation loops.",
+        ),
+        "enable_mimalloc": FixDefinition(
+            fix_id="enable_mimalloc",
+            title="Preload High-Concurrency mimalloc Allocator",
+            constituent_features=["enable_mimalloc", "mimalloc"],
+            profile_targets=[
+                (("memory", "allocator"), "mimalloc"),
+            ],
+            description="Replaces standard glibc/Wine heap allocators with Microsoft mimalloc to eliminate memory lock contention.",
         ),
     }
 
@@ -1355,6 +1385,14 @@ class EngineTweakManager:
             "native_gfx_jobs": True,
             "disable_vr": True,
             "force_vulkan": False,
+            "mono_gc_tuning": False,
+            "mono_nursery_size_mb": 64,
+        },
+        "cpu": {
+            "pin_performance_cores": False,
+        },
+        "memory": {
+            "allocator": "default",
         },
         "godot": {
             "rendering_driver": "vulkan",
@@ -1607,6 +1645,8 @@ class EngineTweakManager:
                 f'native_gfx_jobs = {"true" if unity_cfg.get("native_gfx_jobs", True) else "false"}',
                 f'disable_vr = {"true" if unity_cfg.get("disable_vr", True) else "false"}',
                 f'force_vulkan = {"true" if unity_cfg.get("force_vulkan", False) else "false"}',
+                f'mono_gc_tuning = {"true" if unity_cfg.get("mono_gc_tuning", False) else "false"}',
+                f'mono_nursery_size_mb = {unity_cfg.get("mono_nursery_size_mb", 64)}',
             ])
 
         effective_deck = is_deck if is_deck is not None else (tweaks.get("is_deck") or tweaks.get("steam_deck") or SystemProbe.is_steam_deck())
@@ -1745,6 +1785,25 @@ class EngineTweakManager:
                 elif f_data.get("runs_json"):
                     raw_runs = str(f_data["runs_json"]).replace('\\', '\\\\').replace('"', '\\"')
                     lines.append(f'runs_json = "{raw_runs}"')
+
+        cpu_sec = tweaks.get("cpu", {})
+        if cls.is_feature_enabled(cpu_sec.get("pin_performance_cores")):
+            lines.extend([
+                "",
+                "[cpu]",
+                "pin_performance_cores = true",
+            ])
+            if cpu_sec.get("affinity_mask"):
+                lines.append(f'affinity_mask = "{cpu_sec["affinity_mask"]}"')
+
+        mem_sec = tweaks.get("memory", {})
+        alloc_to_write = mem_sec.get("allocator") or ("mimalloc" if cls.is_feature_enabled(mem_sec.get("mimalloc")) else None)
+        if alloc_to_write and alloc_to_write != "default":
+            lines.extend([
+                "",
+                "[memory]",
+                f'allocator = "{alloc_to_write}"',
+            ])
 
         hotkey = tweaks.get("hotkey") or tweaks.get("profiling", {}).get("hotkey")
         if hotkey:
@@ -2021,6 +2080,71 @@ class EngineTweakManager:
                     limit_val = int(deck_limit)
                     dxvk_items.append(f"dxgi.maxFrameRate = {limit_val}")
                     env["VKD3D_FRAME_RATE"] = str(limit_val)
+
+        # 10. Unity Mono Generational GC Nursery Tuning
+        if eng_name == "unity":
+            unity_cfg = engine_sec.get("unity", {}) or profile.get("unity", {})
+            mono_gc_enabled = cls.is_feature_enabled(unity_cfg.get("mono_gc_tuning"))
+            mono_gc_enabled = _filter_by_experiment("unity_mono_gc_tuning", mono_gc_enabled)
+            if mono_gc_enabled:
+                nursery_mb = unity_cfg.get("mono_nursery_size_mb", 64)
+                env["PROTOGOBLIN_MONO_GC_TUNING"] = "1"
+                cur_mono = env.get("MONO_GC_PARAMS", "")
+                param = f"nursery-size={nursery_mb}m"
+                if "nursery-size=" not in cur_mono:
+                    env["MONO_GC_PARAMS"] = f"{cur_mono},{param}" if cur_mono else param
+
+        # 11. High-Concurrency Heap Allocator (mimalloc)
+        mem_sec = profile.get("memory", {})
+        alloc_val = mem_sec.get("allocator")
+        is_mimalloc = (str(alloc_val).lower().strip() == "mimalloc") or cls.is_feature_enabled(mem_sec.get("mimalloc"))
+        is_mimalloc = _filter_by_experiment("enable_mimalloc", is_mimalloc)
+        if is_mimalloc:
+            env["PROTOGOBLIN_ALLOCATOR"] = "mimalloc"
+            env["MIMALLOC_LARGE_OS_PAGES"] = "1"
+            env["MIMALLOC_PAGE_RESET"] = "0"
+            p_dir = proton_dir or os.environ.get("PROTOGOBLIN_DIR") or os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(p_dir, "share", "protogoblin", "lib64", "libmimalloc.so"),
+                os.path.join(p_dir, "lib64", "libmimalloc.so"),
+                "/usr/lib64/libmimalloc.so",
+                "/usr/lib/x86_64-linux-gnu/libmimalloc.so",
+                "/usr/local/lib/libmimalloc.so",
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    cur_ld = env.get("LD_PRELOAD", "")
+                    env["LD_PRELOAD"] = f"{c}:{cur_ld}" if cur_ld else c
+                    break
+
+        # 12. CPU Topology & Performance / V-Cache Core Pinning
+        cpu_sec = profile.get("cpu", {})
+        pin_perf = cls.is_feature_enabled(cpu_sec.get("pin_performance_cores"))
+        pin_perf = _filter_by_experiment("pin_performance_cores", pin_perf)
+        if pin_perf:
+            affinity_mask = cpu_sec.get("affinity_mask")
+            if not affinity_mask:
+                cpu_info = SystemProbe.get_cpu_info()
+                affinity_mask = cpu_info.get("recommended_affinity")
+                if not affinity_mask and (os.cpu_count() or 1) >= 8:
+                    half = (os.cpu_count() or 1) // 2
+                    affinity_mask = f"0-{half - 1}"
+
+            if affinity_mask:
+                env["PROTOGOBLIN_CPU_AFFINITY"] = str(affinity_mask)
+                try:
+                    if "-" in str(affinity_mask):
+                        start_c, end_c = [int(x.strip()) for x in str(affinity_mask).split("-", 1)]
+                        cores_list = list(range(start_c, end_c + 1))
+                    else:
+                        cores_list = [int(x.strip()) for x in str(affinity_mask).split(",") if x.strip().isdigit()]
+                    if cores_list:
+                        env["WINE_CPU_TOPOLOGY"] = f"{len(cores_list)}:{','.join(str(c) for c in cores_list)}"
+                except Exception:
+                    pass
+
+                if shutil.which("taskset") and not (new_argv and new_argv[0] == "taskset"):
+                    new_argv = ["taskset", "-c", str(affinity_mask)] + new_argv
 
         return new_argv
 
@@ -3107,7 +3231,19 @@ class SystemProbe:
                             break
             except OSError:
                 pass
-        return {"model": model, "logical_cores": logical_cores}
+        is_vcache = bool(re.search(r"X3D|3D\s*V-?Cache", model, re.IGNORECASE))
+        is_multi_ccd = logical_cores >= 12 or is_vcache
+        pinned_cores = None
+        if logical_cores >= 12:
+            half = logical_cores // 2
+            pinned_cores = f"0-{half - 1}"
+        return {
+            "model": model,
+            "logical_cores": logical_cores,
+            "is_vcache": is_vcache,
+            "is_multi_ccd": is_multi_ccd,
+            "recommended_affinity": pinned_cores,
+        }
 
     @staticmethod
     def get_gpu_info():
